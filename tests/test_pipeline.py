@@ -138,3 +138,50 @@ class CountingVerifier(Verifier):
     def verify(self, email):
         CountingVerifier.calls.append(email)
         return VerificationResult(email=email, status="valid", provider="counting")
+
+
+def test_bounced_colleague_does_not_block_company_forever(make_ctx, tmp_path):
+    """A bounce is a dead address, not a 'no': after the cooldown a colleague may be tried."""
+    from datetime import timedelta
+    pb = _playbook(tmp_path)
+    pb["outbound"]["company_cooldown_days"] = 30
+    ctx = make_ctx(**pb)
+    res = Pipeline(ctx, out_dir=tmp_path / "out").run()
+    jane = next(ld for ld in res.leads if ld.contact and ld.contact.email == "jane@acme-t.com")
+    ctx.store.set_stage(jane.id, Stage.LOST, note="reply: bounce")
+    ctx.store.suppress("jane@acme-t.com", "email", "bounced")
+    eng = ctx.store.company_engagement("acme-t.com", "test")
+    assert "lost_bounce" in eng["stages"] and Stage.LOST not in eng["stages"]
+    # 40 days later the cooldown has passed: Sam (next buyer) is handed over
+    ctx.today = ctx.today + timedelta(days=40)
+    import leadgen.store as store_mod
+    real = store_mod.datetime
+
+    class Shifted(real):  # exported_at is stamped with utcnow(); shift "now" back instead
+        @classmethod
+        def fromisoformat(cls, s):
+            return real.fromisoformat(s) - timedelta(days=40)
+    store_mod.datetime = Shifted
+    try:
+        res2 = Pipeline(ctx, out_dir=tmp_path / "out").run()
+    finally:
+        store_mod.datetime = real
+    handed = {ld.contact.email for ld in res2.leads if ld.stage == Stage.EXPORTED and ld.contact}
+    assert "sam@acme-t.com" in handed
+
+
+def test_require_email_false_writes_and_hands_over_without_email(make_ctx, tmp_path):
+    pb = _playbook(tmp_path)
+    contacts = tmp_path / "noemail.csv"
+    with open(contacts, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Company", "Domain", "First Name", "Last Name", "Title", "LinkedIn URL"])
+        w.writerow(["Beta Freight", "beta-t.com", "Lee", "Chan", "CFO", "https://linkedin.com/in/leechan"])
+    pb["enrichment"]["finders"] = [{"type": "csv", "path": str(contacts)}]
+    pb["enrichment"]["verifier"] = None
+    pb["outbound"] = {"exporters": [{"type": "json"}], "require_email": False}
+    pb["scoring"]["tiers"] = {"hot": 40, "normal": 10}
+    ctx = make_ctx(**pb)
+    res = Pipeline(ctx, out_dir=tmp_path / "out").run()
+    lee = next(ld for ld in res.leads if ld.contact and ld.contact.first_name == "Lee")
+    assert lee.messages and not lee.contact.email

@@ -54,6 +54,9 @@ signals:
   require: true
   match_keywords: [business development, sales, account executive, sales development, sdr, bdr,
                    new business, partnerships, growth, account manager, sales manager]
+  # The JOB TITLE must contain one of the words above. (Allowing the description
+  # too would count an "Office Manager" post that mentions "our sales team".)
+  match_description: false
   exclude_keywords: [intern, internship, apprentice, retail, store, cashier, commission only]
   max_age_days: 45
   stale_after_days: 21

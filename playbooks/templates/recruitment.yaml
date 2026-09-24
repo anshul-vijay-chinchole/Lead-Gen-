@@ -56,6 +56,9 @@ signals:
   match_keywords: [accountant, accounting, controller, financial analyst, finance manager,
                    finance director, head of finance, fp&a, accounts payable, accounts receivable,
                    payroll, bookkeeper, tax manager, treasury, credit controller]
+  # The JOB TITLE must name one of those roles: a post whose description merely
+  # mentions "accounting" is not a role you can fill (and the email would quote it).
+  match_description: false
   exclude_keywords: [intern, internship, apprentice, graduate scheme, volunteer]
   max_age_days: 45
   stale_after_days: 21          # still open after 3 weeks = hard to fill = good for an agency
@@ -80,7 +83,9 @@ sources:
     limit: 25                   # jobs per page - TheirStack charges per job
     max_pages: 2
   - type: adzuna
-    countries: [us]             # Adzuna searches one country at a time: us, gb, ca, au, de, fr, ...
+    # Adzuna searches one country per request: list the codes of the markets you
+    # recruit in (us, gb, ca, au, de, fr, in, ...). Required: the source stops with a clear error if it is missing.
+    countries: [us]
     queries: [accountant, financial controller, finance manager]
     what_exclude: [intern, internship]
     max_days_old: 14

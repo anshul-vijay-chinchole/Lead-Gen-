@@ -1,9 +1,10 @@
 """Base class for exporters (files) and senders (API pushes).
 
 ``export(leads, out_dir)`` receives leads according to ``scope`` (see below)
-and returns an ``ExportResult``. ``is_send`` = True means
-the exporter actually hands leads to a sending tool (the pipeline then marks
-them EXPORTED and records them for dedupe); file exporters leave it False.
+and returns an ``ExportResult``. The pipeline decides hand-over by ``scope``:
+every ``scope = "outbound"`` exporter (API pushes AND upload files such as
+instantly_csv) marks what it exported as handed over, so nobody is sent the
+sequence twice. ``is_send`` is informational (True = talks to a sending API).
 In ``ctx.dry_run`` senders must not call the network.
 """
 from __future__ import annotations

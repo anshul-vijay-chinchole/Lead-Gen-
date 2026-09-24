@@ -57,6 +57,9 @@ signals:
   require: true
   match_keywords: [business development, sales, account executive, sales development, sdr, bdr,
                    new business, partnerships, growth, account manager, sales manager]
+  # The JOB TITLE must contain one of the words above. (Allowing the description
+  # too would count an "Office Manager" post that mentions "our sales team".)
+  match_description: false
   exclude_keywords: [intern, internship, apprentice, retail, store, cashier, commission only]
   max_age_days: 45
   stale_after_days: 21
@@ -81,16 +84,22 @@ sources:
     max_employees: 250
     limit: 25                   # jobs per page (TheirStack credits)
     max_pages: 2
+    # TheirStack filters are passed through as-is. This keeps the search to service
+    # firms (remove it if your plan rejects the field):
     filters:
       company_description_pattern_or: [agency, recruitment, staffing, consultancy, consulting,
                                        managed services, it services, marketing services]
-  # A list of prospects you already have (e.g. an Apollo / Clay export) - switch on
-  # and point it at your file. Rows without a date get the default signal below.
+  # Job posts you found yourself (a spreadsheet, a Clay / Apify export) - switch on
+  # and point it at your file. Columns such as "Company", "Website", "Job Title" and
+  # "Date Posted" are recognised automatically; each job title becomes a hiring
+  # signal that must pass the signal rules above. Rows without a job title have no
+  # "why now" and are rejected (see rejected.csv) - this playbook only writes to
+  # companies that are hiring for sales right now.
   - type: csv
     enabled: false
     label: my-list
     path: data/my_prospects.csv
-    default_signal: {type: custom, title: "On my target list"}
+    # mapping: {name: "Company Name", signal_title: "Role", signal_date: "Posted"}
 
 enrichment:
   finders:

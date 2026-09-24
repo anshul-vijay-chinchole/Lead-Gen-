@@ -351,17 +351,26 @@ class Store:
 
         Returns ``{"stages": set of lead stages, "last_exported": date|None}``,
         ignoring leads that only belong to ``exclude_run_id`` (the current run).
+        A lead lost because its address bounced is reported as ``"lost_bounce"``.
         """
-        q = "SELECT stage, exported_at, run_id FROM leads WHERE company_key=? AND playbook=?"
+        q = "SELECT id, stage, exported_at, run_id FROM leads WHERE company_key=? AND playbook=?"
         stages, last = set(), None
-        for r in self.conn.execute(q, (company_key, playbook)):
+        for r in self.conn.execute(q, (company_key, playbook)).fetchall():
             if exclude_run_id and r["run_id"] == exclude_run_id and not r["exported_at"]:
                 continue
-            stages.add(r["stage"])
+            stage = r["stage"]
+            if stage == Stage.LOST and self._lost_by_bounce(r["id"]):
+                stage = "lost_bounce"  # a dead address, not a "no": colleagues stay reachable (cooldown applies)
+            stages.add(stage)
             if r["exported_at"]:
                 d = datetime.fromisoformat(r["exported_at"]).date()
                 last = d if last is None or d > last else last
         return {"stages": stages, "last_exported": last}
+
+    def _lost_by_bounce(self, lead_id: str) -> bool:
+        row = self.conn.execute("SELECT note FROM events WHERE lead_id=? AND stage=? ORDER BY id DESC LIMIT 1",
+                                (lead_id, Stage.LOST)).fetchone()
+        return bool(row and "bounce" in (row["note"] or "").lower())
 
     def was_exported(self, lead_id: str) -> bool:
         row = self.conn.execute("SELECT exported_at FROM leads WHERE id=?", (lead_id,)).fetchone()

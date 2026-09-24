@@ -1551,6 +1551,7 @@ def detect_mapping(headers: Sequence[Any]) -> Tuple[Dict[str, List[str]], Dict[s
 
     # signals
     pick("signal_type", _H_SIGNAL_TYPE)
+    job_signal = mode == "jobs"
     if mode == "jobs":
         pick("signal_title", _H_SIGNAL_TITLE_ONLY[:1] + _H_AMBIG_TITLE + _H_SIGNAL_TITLE_ONLY[1:])
         pick("signal_url", _H_SIGNAL_URL + ["url", "link"])
@@ -1560,7 +1561,14 @@ def detect_mapping(headers: Sequence[Any]) -> Tuple[Dict[str, List[str]], Dict[s
         if not pick("signal_location", _H_SIGNAL_LOCATION + _H_PLAIN_LOCATION) and mapping.get("location"):
             mapping["signal_location"] = list(mapping["location"])  # the job's location = the company's
     else:
-        pick("signal_title", _H_SIGNAL_TITLE_ONLY)
+        if not pick("signal_title", _H_SIGNAL_TITLE_ONLY) and mode == "people":
+            # a person list with BOTH 'Title' (the person's) and 'Job Title' / 'Role' / 'Position'
+            # (the opening): the leftover ambiguous column is the hiring signal
+            leftover = [h for h in present(_H_AMBIG_TITLE) if h not in used]
+            if leftover:
+                mapping["signal_title"] = leftover[:1]
+                used.update(leftover[:1])
+                job_signal = True
         pick("signal_url", _H_SIGNAL_URL)
         pick("signal_date", _H_SIGNAL_DATE)
         pick("signal_description", _H_SIGNAL_DESCRIPTION)
@@ -1575,7 +1583,7 @@ def detect_mapping(headers: Sequence[Any]) -> Tuple[Dict[str, List[str]], Dict[s
     pick("funding_total", _H_FUNDING_TOTAL)
 
     mapped = {h for paths in mapping.values() for h in paths}
-    info = {"mode": mode, "signal_type": SignalType.JOB_POSTING if mode == "jobs" else None,
+    info = {"mode": mode, "signal_type": SignalType.JOB_POSTING if job_signal else None,
             "unmapped": [h for h in by_norm.values() if h not in mapped]}
     return mapping, info
 

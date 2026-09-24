@@ -20,6 +20,8 @@ def notify(ctx: Any, event: str, title: str, text: str,
         return 0
     sent = 0
     for ch in cfg.get("channels") or []:
+        if not isinstance(ch, dict) or ch.get("enabled") is False:
+            continue
         try:
             registry.create("notifier", ch, ctx).send(event, title, text, data or {})
             sent += 1

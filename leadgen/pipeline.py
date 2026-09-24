@@ -275,9 +275,10 @@ class Pipeline:
                     lead.notes.append(f"email {ct.email_status}")
                 else:
                     lead.notes.append("no email found")
-                if ct.email and store.recently_contacted(ct.email, dedupe_days, ctx.today,
-                                                         exclude_lead_id=lead.id):
-                    lead.notes.append(f"contacted in the last {dedupe_days} days")
+                note = f"contacted in the last {dedupe_days} days"
+                if ct.email and note not in lead.notes and store.recently_contacted(
+                        ct.email, dedupe_days, ctx.today, exclude_lead_id=lead.id):
+                    lead.notes.append(note)
             else:
                 lead.notes.append("no decision-maker found")
         leads.sort(key=lambda ld: ld.score, reverse=True)
@@ -295,17 +296,21 @@ class Pipeline:
         for lead in leads:
             if written >= max_write:
                 break
-            if lead.tier not in w_tiers or not self.email_ok(lead.contact):
+            if lead.tier not in w_tiers or not lead.contact:
+                continue
+            if pb.outbound.get("require_email", True) and not self.email_ok(lead.contact):
                 continue
             reason = self.block_reason(lead, write_state)
             if reason:  # would never be handed over: don't spend the writer (LLM) on it
-                lead.notes.append(reason)
+                if reason not in lead.notes:
+                    lead.notes.append(reason)
                 continue
-            em = lead.contact.email.strip().lower()
-            if em in written_emails:  # same person under two company records: keep the best-scored
+            em = (lead.contact.email or "").strip().lower()
+            if em and em in written_emails:  # same person under two company records: keep the best-scored
                 lead.notes.append("same email as a higher-scored lead in this run")
                 continue
-            written_emails.add(em)
+            if em:
+                written_emails.add(em)
             try:
                 out = writer.write(lead)
             except Exception as e:  # noqa: BLE001

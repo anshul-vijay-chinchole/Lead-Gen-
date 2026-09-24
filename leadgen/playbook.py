@@ -136,7 +136,7 @@ DEFAULTS: Dict[str, Any] = {
         "templates": {},
         "max_tokens": 4000,       # per-call output budget for the AI writer (reasoning models think inside it)
         "max_llm_failures": 3,    # consecutive LLM failures before the AI writer switches to templates
-        "acronyms": [],           # extra ALL-CAPS words the guardrails accept (e.g. SOC2, HIPAA)
+        "acronyms": [],           # extra ALL-CAPS words (5+ letters) the guardrails accept (e.g. MEDDIC, SCORM)
         "llm": {},                # extra client options: timeout, reasoning_effort, effort, extra_body, ...
         "fallback_to_template": True,
         "max_leads": 500,
@@ -146,7 +146,9 @@ DEFAULTS: Dict[str, Any] = {
         "exporters": [{"type": "csv"}],
         "tiers": ["hot", "normal"],
         "require_email": True,
-        "dedupe_days": 90,        # don't export the same person again within N days
+        # the same lead (playbook + company + person) is never handed over twice; this also
+        # blocks the same email arriving via another playbook / company record for N days
+        "dedupe_days": 90,
         # don't email a colleague at a company that was contacted in the last N days
         # (0 = off). Companies that replied, unsubscribed or said no are always skipped.
         "company_cooldown_days": 30,
@@ -155,6 +157,7 @@ DEFAULTS: Dict[str, Any] = {
         "classifier": "auto",     # auto (ai if configured else rules) | rules | ai
         "timing_default_days": 30,
         "ooo_default_days": 7,
+        "max_tokens": 0,          # AI classifier output budget (0 = use writer.max_tokens)
     },
     "notify": {
         "channels": [{"type": "console"}],

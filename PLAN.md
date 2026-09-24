@@ -1,154 +1,105 @@
-# Lead-Gen Engine — Build Plan (v1)
+# Lead-Gen Engine - Plan
 
-A **niche-agnostic** lead-generation pipeline for US / UK / Tier-1 markets.
-One engine, many niches: each niche is a **playbook** (a settings file), not new code.
+A **niche-agnostic, signal-led** lead-generation engine. One engine, many niches:
+each niche (or client) is a **playbook** - a settings file - not new code.
 
----
-
-## 1. The idea in plain English
-
-Think of it as a **factory line**. Raw material goes in one end (companies on the internet),
-each station does one job, and out the other end come **people who want to talk**.
-
-| # | Station | What it does, in plain words |
-|---|---|---|
-| 1 | **Find** | Pull in companies that have a *reason to buy right now* (hiring, raised money, expanding, new boss, etc.). |
-| 2 | **Filter** | Throw away anything that isn't the client's ideal customer (wrong country, size, industry, competitors, existing clients). |
-| 3 | **Find the person** | Work out *who* at that company makes the decision (e.g. VP Finance, Founder, Head of Ops). |
-| 4 | **Get + check email** | Find their work email and verify it, so emails don't bounce and hurt our sending reputation. |
-| 5 | **Score** | Give every lead a 0–100 score: how hot is the reason, how well do they fit, can we reach them. |
-| 6 | **Write** | AI writes a short, specific email + 3 follow-ups that mention *why this company, why now*. |
-| 7 | **Send** | Load the leads into a sending tool (Instantly / Smartlead) that sends slowly from warmed-up inboxes. |
-| 8 | **Read replies** | AI sorts replies: interested / wrong person / not now / not interested / out-of-office / unsubscribe. |
-| 9 | **Hand off** | Interested replies get pushed to Slack/email with a booking link. A human takes the call. |
-| 10 | **Report** | Weekly numbers: found → verified → sent → replied → interested → booked. |
-
-**The playbook** is the "recipe card" for a niche: which signals to look for, who the ideal
-customer is, which job titles to contact, and what the angle of the email is.
-New niche = new recipe card. No code changes.
+It works anywhere. No country or legal rules are built in: you choose where you
+sell and which rules apply to you (the playbook has a footer line for an opt-out
+sentence, and a do-not-contact list).
 
 ---
 
-## 2. What gets built now (v1)
+## 1. The idea: a factory line
 
-### Built in code (this is the part we own — the "brain")
-- **Playbook system** — YAML file per niche/client.
-- **Source adapters** — pluggable "inputs":
-  - CSV import (works with *any* export: Apollo, Clay, Sales Navigator, Apify, spreadsheets)
-  - Apollo API (company + people search)
-  - Job-postings source (hiring signals)
-- **Filter** — country allow-list, size, industry, keywords, competitor + suppression lists.
-- **Contact + email waterfall** — try provider A, then B (Apollo → Hunter), keep the best-titled decision-maker.
-- **Email verification** — MillionVerifier / ZeroBounce: `valid`, `risky (catch-all)`, `invalid`.
-- **Scoring engine** — 0–100, weights set in the playbook; tiers `hot` / `normal` / `skip`.
-- **AI writer** — OpenAI or Claude API, with guardrails (length, no clichés, must reference the signal),
-  plus a no-API template fallback so the engine runs at $0.
-- **Exports** — Google-Sheet-ready CSV + Instantly/Smartlead upload CSV.
-- **Reply classifier** — sorts replies, extracts referrals / return dates, alerts Slack on interested ones.
-- **Memory (SQLite)** — never email the same person twice, suppression list, run history, funnel stats.
-- **Demo report generator** — "5 live opportunities for *your* business" one-pager: the sales asset used to win clients.
-- **Two starter playbooks**
-  1. `my-agency.yaml` — finds clients **for you** (outreach to agencies / B2B service firms).
-  2. `recruitment-clients.yaml` — example client playbook (companies actively hiring → hiring managers).
+Companies go in one end; people worth talking to come out the other. Every
+station below is **built** and runs today (offline demo:
+`leadgen run -p playbooks/demo-offline.yaml`, no keys needed).
 
-### Rented tools (commodities — never build these)
-| Job | Tool (pick one) | Approx. cost* |
-|---|---|---|
-| Company/people data | Apollo (free tier to start) | $0 – $99/mo |
-| Email finder fallback | Hunter / Prospeo | $0 – $49/mo |
-| Email verification | MillionVerifier | ~$37 per 10k |
-| AI writing | OpenAI API or Claude API (**not** a ChatGPT subscription — that has no API) | ~$2–10 per 1k leads |
-| Sending + warm-up | Instantly or Smartlead | ~$37/mo |
-| Sending inboxes | 3 spare domains + 6–9 Google Workspace / Outlook inboxes | ~$40–70/mo |
-| Booking | Cal.com / Calendly | $0 |
-| Alerts | Slack webhook | $0 |
+| # | Station | What it does | Tools it can use |
+|---|---|---|---|
+| 1 | **Find** | Companies with a reason to buy *now*: hiring, funding, growth, reviews, ... | Your own CSV/JSON files, TheirStack, Adzuna, Apollo, Apify (e.g. Google Maps), Greenhouse / Lever / Ashby job boards |
+| 2 | **Filter** | Drop the wrong place, size or industry, competitors, existing clients, the do-not-contact list | - |
+| 3 | **Find the person** | The decision-maker, from your list of job titles (best first) | Your own CSV, Apollo, Hunter, free email-pattern guessing |
+| 4 | **Check the email** | Verify before sending so emails don't bounce; guessed addresses must come back "valid" | MillionVerifier, ZeroBounce, NeverBounce, Hunter, free syntax check |
+| 5 | **Score** | 0-100: how strong the reason is, how well they fit, can we reach them -> hot / normal / skip | - |
+| 6 | **Write** | A short email + 3 follow-ups about *why them, why now*, with copy checks | Claude or OpenAI (or any compatible API); free templates as fallback |
+| 7 | **Hand over** | Ready leads go to your sending tool (the engine never sends email itself); every lead also lands in a review sheet | Instantly / Smartlead (upload CSV or API), webhook (Zapier / Make / n8n); review sheet as CSV or Google Sheets |
+| 8 | **Read replies** | Sort replies: interested, question, referral, not now, out-of-office, no, unsubscribe, bounce - and act on each | CSV import or a webhook server; rules or AI |
+| 9 | **Alert** | Interested replies arrive with a draft answer and your booking link | Slack, webhook, terminal |
+| 10 | **Report** | Funnel numbers, plus a one-page "live opportunities" report to win clients | `leadgen stats`, `leadgen demo` |
 
-*Check current pricing — ballpark only. Realistic starting spend: **~$100–200/month**.
+**Playbooks shipped:** `demo-offline.yaml` (try it), `my-agency.yaml` (finds
+clients for *your* agency) and templates in `playbooks/templates/`
+(generic, recruitment, saas-funding, local-business, agency-outreach).
+Start a new one with `leadgen init my-niche --template generic`.
 
-### Deliberately NOT built now
-Dashboard, CRM, our own email sender, LinkedIn automation, AI voice calling, phone dialers, SaaS login.
-All of these come **after** paying clients prove what's needed.
+## 2. Safety rules already built in
 
----
+- Nobody is handed over twice by the same playbook, and the same address is not
+  handed over again from another playbook within `dedupe_days` (90 by default).
+- No colleague at a company contacted in the last 30 days
+  (`company_cooldown_days`). Once anyone at a company replies, says no,
+  unsubscribes or bounces, that playbook never contacts the company again
+  (out-of-office auto-replies don't count).
+- "No", unsubscribe and bounce replies go on the do-not-contact list
+  automatically; add your own with `leadgen suppress add`.
+- Guessed addresses (first.last@...) need a real "valid" from a verifier.
+- No AI money is spent on leads that could not be handed over anyway, and the
+  AI switches itself off after repeated failures (templates take over).
+- `--dry-run` is a free rehearsal: no paid calls, upload files are written as
+  `*.dry-run.csv`, and nothing is recorded as sent.
+- API keys and tokens are masked in logs and error messages.
 
-## 3. How the pieces connect
+## 3. Still to do
+
+| What | Why / notes |
+|---|---|
+| **Live check with real API keys** | Every paid connector (TheirStack, Adzuna, Apollo, Apify, Hunter, the verifiers, Instantly, Smartlead, Google Sheets, Slack, Claude / OpenAI) was built from the provider's documentation and tested against sample responses - never against the live service. When you get each key: `leadgen validate`, then a small `leadgen run --limit 10`, and fix whatever the real service does differently. |
+| **LinkedIn channel** | Not built. Email only for now. |
+| **Dashboard** | Not built. Today: the command line, CSV files and Google Sheets. |
+| **Scheduling** | Runs start when you type the command. For a daily run, use cron (Mac/Linux) or Task Scheduler (Windows). |
+| Later, only if clients need it | Direct CRM sync (beyond the webhook), our own email sender, phone / voice, a multi-user web app. |
+
+## 4. Your setup checklist
+
+Do these in parallel - new inboxes need 2-3 weeks of warm-up before real sending.
+
+1. Buy 2-3 look-alike domains. Never send cold email from your main domain.
+2. Create 2-3 inboxes per domain and set up SPF, DKIM and DMARC.
+3. Connect them to Instantly or Smartlead and switch on warm-up.
+4. Get API keys as you need them (most tools have a free tier or trial - check
+   current pricing). For AI writing you need an **API account** from Anthropic
+   or OpenAI; a Claude.ai or ChatGPT chat subscription does not include API access.
+5. Copy `.env.example` to `.env` and fill in only what your playbook uses.
+6. `leadgen validate -p playbooks/my-agency.yaml` -> `leadgen run ... --dry-run`
+   -> `leadgen run ... --limit 10` -> review `opportunities.csv` before importing anything.
+7. Check the cold-email rules for the places you sell into - that is your call,
+   not the engine's.
+
+## 5. Everyday commands
 
 ```
- playbook.yaml ─────────────────────────────────────────────────────────┐
-                                                                         ▼
- [CSV / Apollo / Jobs] → Filter → Contact waterfall → Verify → Score → AI write
-                                                                         │
-                          ┌──────────────────────────────────────────────┘
-                          ▼
-        opportunities.csv (Google Sheet)   +   outbound.csv (Instantly/Smartlead)
-                                                        │  sends day 1 / 3 / 7 / 12
-                                                        ▼
-                                       replies.csv / webhook → AI classify
-                                                        │
-                                  interested → Slack alert + booking link → call
-                                                        │
-                                              SQLite memory + funnel stats
+leadgen run       -p playbooks/X.yaml [--dry-run] [--limit N]   # find -> ... -> write -> hand over
+leadgen leads     -p playbooks/X.yaml                           # the leads of the last run
+leadgen demo      -p playbooks/X.yaml --prospect "Acme"         # one-page sales report
+leadgen replies   -p playbooks/X.yaml --file replies.csv        # sort + act on replies
+leadgen serve     -p playbooks/X.yaml --token <secret>          # receive replies by webhook
+leadgen stats     -p playbooks/X.yaml                           # funnel numbers
+leadgen followups -p playbooks/X.yaml                           # who to get back to today
+leadgen mark      --email jane@acme.com --stage booked          # record a booked call / a win
 ```
 
-Commands (v1):
-```
-leadgen run      --playbook playbooks/X.yaml     # find → … → write → export
-leadgen demo     --playbook playbooks/X.yaml     # 1-page "live opportunities" sales report
-leadgen replies  --playbook playbooks/X.yaml --file replies.csv
-leadgen stats    --playbook playbooks/X.yaml     # funnel numbers
-```
+## 6. Numbers to watch
 
----
+Rough targets for well-targeted outbound (they vary a lot by niche):
+bounce rate under 2%, reply rate 3-8%, positive replies 1-3% of emails sent,
+more than 70% of booked calls actually happen. `leadgen stats` shows the funnel
+and replies by category.
 
-## 4. Compliance (US / UK / Tier-1) — built into the engine
+## 7. What you sell
 
-| Country | Rule of thumb for cold B2B email | Engine behaviour |
-|---|---|---|
-| US | CAN-SPAM: allowed, needs opt-out + real postal address + honest subject | Adds opt-out + address footer |
-| UK | PECR/GDPR: OK to **corporate** addresses with opt-out + legitimate interest; not sole traders | Flags/filters sole traders & personal domains (gmail etc.) |
-| EU (DE, FR, NL…) | Stricter; Germany especially | Off by default |
-| Canada | CASL: needs (implied) consent — risky | Off by default |
-| Australia | Spam Act: needs (inferred) consent | Off by default |
-
-Start with **US + UK**. Other countries are a playbook switch once you've decided the risk is acceptable.
-(Not legal advice.)
-
----
-
-## 5. Timeline
-
-**Do these today, in parallel with the build — inbox warm-up takes 2–3 weeks:**
-1. Buy 3 look-alike domains (e.g. `getyourbrand.com`, `tryyourbrand.com`). Never send cold from your main domain.
-2. 2–3 inboxes per domain (Google Workspace or Outlook), set SPF/DKIM/DMARC.
-3. Connect them to Instantly/Smartlead and switch on warm-up.
-4. Create accounts/keys: Apollo (free), OpenAI or Anthropic API, MillionVerifier, Slack webhook.
-
-| Milestone | Build | Result for you |
-|---|---|---|
-| **M1** | Core engine, playbooks, CSV input, filter, scoring, AI writer, exports, memory | Run it on an Apollo CSV export → get ready-to-send campaigns |
-| **M2** | Apollo API, jobs source, email waterfall, verification | Fully automatic lists, no manual exports |
-| **M3** | Reply classifier, Slack alerts, stats, demo report | Close the loop + sales asset for winning clients |
-
-**Week 3–4 (you, selling):** run `my-agency.yaml`, build demo reports for the best 20 prospects,
-send 20–30 personal outreaches/day. Target: first paid pilot.
-
----
-
-## 6. Success numbers to track
-
-Rough targets for well-targeted outbound (varies a lot by niche):
-- Bounce rate **< 2%** (verification working)
-- Reply rate **3–8%**
-- Positive replies **1–3%** of sent
-- Show-up rate on booked calls **> 70%**
-
-Every lead carries its stage so these come straight out of `leadgen stats`.
-
----
-
-## 7. What you sell (engine is generic, pitch stays specific)
-
-Engine = any niche. **Pitch** = one niche at a time ("I get <niche> companies conversations with
-<buyers> who are showing <signal> right now"). Starting offer: **30-day pilot, $500–750**, then
-$1,000–1,500/mo once you have results. Guarantee conversations, not revenue, and define
-"qualified" in writing.
+The engine fits any niche; your **pitch** should be one niche at a time ("I get
+<niche> companies conversations with <buyers> who are showing <signal> right
+now"). Start with a short paid pilot, then a monthly retainer once there are
+results. Promise conversations, not revenue, and agree in writing what counts
+as "qualified".

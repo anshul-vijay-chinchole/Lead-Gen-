@@ -540,8 +540,9 @@ def validate_playbook(ctx: Context) -> List[Check]:
         checks.append(Check("warn", "verifier", "none configured - emails are not checked before sending"))
     w = pb.writer
     if w.get("type") == "ai":
-        llm_cfg = {"type": w.get("provider"), "model": w.get("model"), "base_url": w.get("base_url"),
-                   "temperature": w.get("temperature")}
+        llm_cfg = dict(w.get("llm") or {})  # same construction as llm.build_llm
+        llm_cfg.update({"type": w.get("provider"), "model": w.get("model"), "base_url": w.get("base_url"),
+                        "temperature": w.get("temperature")})
         if w.get("api_key_env"):
             llm_cfg["api_key_env"] = w["api_key_env"]
         c = check_adapter("llm", llm_cfg, ctx)
@@ -683,7 +684,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         if active and failed >= active and not result.counts.get("sourced"):
             sys.stderr.write(f"error: every source failed ({failed} of {active}) - see the errors above\n")
             return EXIT_PROBLEM
-        if not active:
+        configured = [s for s in pb.sources if isinstance(s, dict) and s.get("enabled") is not False]
+        if not configured:
             sys.stderr.write("warning: the playbook has no sources configured - nothing was found\n")
         return EXIT_OK
     finally:
@@ -727,7 +729,7 @@ def _lead_row(ld: Lead) -> List[Any]:
             who = f"{who} ({ct.title})" if who else ct.title
     email = f"{ct.email} [{ct.email_status}]" if ct and ct.email else "-"
     sig = ld.top_signal
-    return [ld.score, ld.tier, ld.stage, ld.company.name, who or "-", email, sig.title if sig else "-"]
+    return [ld.id, ld.score, ld.tier, ld.stage, ld.company.name, who or "-", email, sig.title if sig else "-"]
 
 
 def cmd_leads(args: argparse.Namespace) -> int:
@@ -750,7 +752,7 @@ def cmd_leads(args: argparse.Namespace) -> int:
         _out(f"Leads in {where}" + (f" (tier {args.tier})" if args.tier else "")
              + f": showing {len(leads)} of {total}")
         _out("")
-        _out(format_table(["score", "tier", "stage", "company", "contact", "email", "top signal"],
+        _out(format_table(["id", "score", "tier", "stage", "company", "contact", "email", "top signal"],
                           [_lead_row(ld) for ld in leads],
                           widths={"company": 28, "contact": 38, "email": 46, "top signal": 40},
                           right=("score",)))
@@ -1148,6 +1150,8 @@ def cmd_adapters(args: argparse.Namespace) -> int:
             creds = CREDENTIALS.get((kind, name))
             if creds:
                 env = ", ".join(e for _, e in creds)
+            if (kind, name) == ("llm", "openai_compatible"):
+                env = "writer.api_key_env"  # never OPENAI_API_KEY: that key only goes to api.openai.com
             rows.append(["  " + name, where, env or "-", doc])
         _out(format_table(["type", "runs", "credential", "description"], rows,
                           widths={"description": 70}))

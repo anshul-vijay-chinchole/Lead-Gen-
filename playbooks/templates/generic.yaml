@@ -14,9 +14,17 @@
 #  * Lines starting with "#" are comments. The engine ignores them.
 #  * "key: value" sets a setting. Indentation (2 spaces) groups settings.
 #  * [a, b, c] is a list. {min: 10, max: 50} is a small group of settings.
-#  * Leave a setting out and its default is used; every default is shown here.
+#  * Leave a setting out and its default is used. Every playbook setting is
+#    listed here with its default value. Where this file uses an example value
+#    instead, the comment says "Default: ...". (Each source / finder / exporter
+#    type also has its own options - see the examples below and
+#    `leadgen adapters`.)
 #  * ${NAME} is replaced by the environment variable NAME (e.g. from your .env
 #    file); ${NAME:-something} uses "something" when NAME is not set.
+#
+#  The engine has no country-specific or legal rules built in. You decide
+#  where you sell and which rules apply to you (offer.footer below can carry
+#  an opt-out line, for example).
 #
 #  As shipped, this template runs fully offline on the sample data in
 #  examples/data/, so you can try it before you have any API keys. The paid
@@ -104,6 +112,11 @@ signals:
   # A PRIMARY signal only counts if its title (or description) contains one of
   # these, e.g. the job titles you recruit for. Empty = every title counts.
   match_keywords: []
+  # true = when the title has none of the match_keywords, the signal's
+  # description is searched too. false = the title itself must contain one
+  # (stricter: a "Sales Manager" post that only mentions "accountant" in its
+  # text no longer counts for an accounting niche).
+  match_description: true
   # Drop any signal whose title contains one of these.
   exclude_keywords: []
   # Ignore signals older than this many days (null = no age limit).
@@ -120,6 +133,7 @@ signals:
 buyers:
   # Job titles to look for, BEST FIRST. Abbreviations are understood
   # (VP = Vice President, CFO = Chief Financial Officer, ...).
+  # Default: [] = any person counts as the decision-maker (validate warns).
   titles: [Founder, CEO, Head of Operations]
   # Never email people whose title contains one of these.
   exclude_titles: [intern, assistant, student, trainee]
@@ -135,9 +149,11 @@ buyers:
 
 # -----------------------------------------------------------------------------
 # SOURCES - where companies and their signals come from. Add as many as you
-# like; the same company from two sources is merged. Every source accepts
-# "label" (a name for reports), "limit" (max companies, 0 = all) and
-# "enabled: false" (keep the settings but skip it).
+# like; the same company from two sources is merged. Default: none (validate
+# fails without one). Every source accepts "label" (a name for reports),
+# "limit" (max companies, 0 = all - except theirstack, where "limit" is jobs
+# per page and "max_companies" is the cap) and "enabled: false" (keep the
+# settings but skip it). With --dry-run only csv / json sources run.
 #   csv / json   your own files or any export (Apollo, Clay, Sales Navigator, Apify)
 #   theirstack   job postings (key: THEIRSTACK_API_KEY)
 #   adzuna       job postings (keys: ADZUNA_APP_ID + ADZUNA_APP_KEY)
@@ -170,7 +186,8 @@ sources:
 # -----------------------------------------------------------------------------
 enrichment:
   # Contact finders run in order until a decision-maker with an email is found
-  # (so paid lookups stop as soon as they are no longer needed).
+  # (so paid lookups stop as soon as they are no longer needed). Default: none
+  # (only people supplied by the sources are used). "enabled: false" skips one.
   finders:
     - type: csv                           # people you already have in a file
       path: examples/data/demo_contacts.csv
@@ -182,13 +199,24 @@ enrichment:
       enabled: false
     - type: pattern                       # free: guesses first.last@domain etc.
   # Email checker: basic (free, syntax only), millionverifier, zerobounce,
-  # neverbounce or hunter.
+  # neverbounce or hunter. Results (except "unknown") are remembered for 30
+  # days, so the same address is not paid for twice. With --dry-run the basic
+  # checker is used instead.
   verifier:
     type: basic
-  # Which verification results may be emailed. With a real verifier keep
-  # [valid, risky]. "unknown" is only here because the free "basic" checker
-  # can never confirm an address; remove it once you use a real verifier.
+  # Which checker results may be emailed: valid, risky (a "catch-all" domain
+  # that accepts every address), unknown, invalid.
+  # Default: [valid, risky] - use that as soon as you have a real verifier.
+  # "unknown" is only here so this offline sample has something to hand over:
+  # the free "basic" checker can never confirm an address. Remove it for real use.
   accept_statuses: [valid, risky, unknown]
+  # Stricter rule for GUESSED addresses (first.last@company.com built by the
+  # pattern finder rather than supplied by a data provider or your own file).
+  # A guess must also have one of these results. Guesses on catch-all domains
+  # ("risky") bounce often, so the default is a confirmed "valid" only. That
+  # also means guesses are never handed over with the basic checker - you
+  # need a real verifier for them.
+  accept_guessed_statuses: [valid]
   # Credit guard: only enrich the best N companies per run.
   max_companies: 200
   # Skip enrichment for companies whose pre-score (without a contact) is below this.
@@ -224,13 +252,41 @@ scoring:
 writer:
   # "template" = free, offline, from built-in niche-neutral copy.
   # "ai" = written by an AI model (falls back to the template if the AI fails).
+  # With --dry-run the template writer is always used (no AI calls).
   type: template
   # For type ai: provider anthropic | openai | openai_compatible, plus a model.
+  # Whenever a provider is set (even with type: template), the same model also
+  # sorts replies when replies.classifier is ai or auto.
   provider: ""          # e.g. anthropic (key: ANTHROPIC_API_KEY) or openai (OPENAI_API_KEY)
-  model: ""             # e.g. claude-sonnet-5 (or claude-opus-5-5 / claude-haiku-4-5) or gpt-5-mini
+  # Empty = the provider's default: claude-sonnet-5 (anthropic) or gpt-5-mini
+  # (openai). Other Claude models: claude-opus-5-5 (best, costs more) or
+  # claude-haiku-4-5 (cheapest). openai_compatible needs a model name.
+  model: ""
   base_url: ""          # only for openai_compatible, e.g. https://openrouter.ai/api/v1
-  api_key_env: ""       # env var holding the key, when not the provider's default
-  temperature: null     # leave empty; many current models ignore or reject it
+  # Name of the env var holding the key, when it is not the provider's default.
+  # openai_compatible always needs it (e.g. OPENROUTER_API_KEY): your OpenAI
+  # key is only ever sent to api.openai.com.
+  api_key_env: ""
+  # Leave empty (null). Current models such as claude-sonnet-5 and gpt-5-mini
+  # reject a custom temperature; if you set one and the model refuses it, the
+  # engine retries once without it.
+  temperature: null
+  # Extra settings for the AI connection (optional). Useful ones:
+  #   anthropic: {effort: low}   less thinking = cheaper copy (not for claude-haiku-4-5)
+  #   openai:    {reasoning_effort: low}
+  #   any:       {timeout: 120}  seconds to wait for an answer (default 120)
+  #   local server without a key (openai_compatible): {api_key_required: false}
+  # Also: extra_body, extra_headers (passed to the provider as-is).
+  llm: {}
+  # Max length of one AI answer, in tokens (roughly 3/4 of a word each). The
+  # whole sequence comes back in one answer, and newer models "think" inside
+  # this budget too. A cut-off answer is retried once with double the budget.
+  max_tokens: 4000
+  # After this many AI failures IN A ROW (errors, refusals, unreadable
+  # answers) the AI is switched off for the rest of the run and the template
+  # writer takes over, so a misbehaving model does not fail lead after lead.
+  # A missing or rejected key switches it off straight away.
+  max_llm_failures: 3
   tone: friendly, direct, peer-to-peer; no hype
   # Max words in the body of each email (signature not counted).
   max_words: 90
@@ -244,6 +300,12 @@ writer:
   banned_phrases: [I hope this email finds you well, leading provider, world-class, synergy,
                    revolutionize, game-changer, cutting-edge, I wanted to reach out, touch base,
                    circle back]
+  # The copy checker flags SHOUTED words (5+ capital letters in a row, e.g.
+  # "AMAZING"); AI copy with problems is rewritten once, then replaced by the
+  # template. Common acronyms and anything written that way in the company,
+  # signal or offer text are already allowed; list extra ones your niche uses
+  # here, e.g. [MEDDIC, SCORM].
+  acronyms: []
   # Extra instructions for the AI writer.
   extra_instructions: ""
   # Template writer overrides (optional). Placeholders: {first_name}, {company},
@@ -257,17 +319,26 @@ writer:
   fallback_to_template: true
   # Max sequences written per run (AI cost guard).
   max_leads: 500
-  # Only write for these tiers.
+  # Only write for these tiers. Leads that could not be handed over anyway
+  # (no deliverable email, suppressed, already contacted, company on cooldown -
+  # see OUTBOUND) are skipped, so no AI money is spent on them.
   tiers: [hot, normal]
 
 # -----------------------------------------------------------------------------
 # OUTBOUND - where finished leads go. Files land in output/<name>/<run id>/.
-#   csv              opportunities.csv - every lead (review / Google Sheets)
+# Review files (every lead):
+#   csv              opportunities.csv - every lead, with score and reasons (review / Google Sheets)
 #   json             leads.json - everything
+#   gsheets          write a Google Sheet (pip install gspread; service account)
+# Hand-over (only leads that may be emailed - see the rules below):
 #   instantly_csv    instantly_upload.csv   |  instantly  push via API (INSTANTLY_API_KEY + campaign_id)
 #   smartlead_csv    smartlead_upload.csv   |  smartlead  push via API (SMARTLEAD_API_KEY + campaign_id)
-#   gsheets          write a Google Sheet (pip install gspread; service account)
-#   webhook          POST the leads to Zapier / Make / n8n / your CRM
+#   webhook          POST the leads to Zapier / Make / n8n / your CRM (LEADGEN_EXPORT_WEBHOOK_URL)
+# Everyone in a hand-over file or push is recorded as contacted (even if you
+# never import the file), so the next run does not hand them over again.
+# With --dry-run nothing is recorded: the upload files are written as
+# *.dry-run.csv rehearsals (do not import those) and nothing is pushed.
+# Default exporters: [{type: csv}].
 # -----------------------------------------------------------------------------
 outbound:
   exporters:
@@ -278,10 +349,21 @@ outbound:
       campaign_id: ${INSTANTLY_CAMPAIGN_ID:-}
   # Only these tiers are handed to sending tools.
   tiers: [hot, normal]
-  # Only hand over leads with an accepted email.
+  # Only hand over leads whose email passed enrichment.accept_statuses
+  # (and accept_guessed_statuses for guesses).
   require_email: true
-  # Never hand the same person over again within this many days.
+  # Rules that always apply to a hand-over: nobody on the suppression list
+  # (unsubscribed, said no, bounced, or added with `leadgen suppress`), nobody
+  # at an excluded domain, and one lead per email address per run.
+  # A person is only ever handed over once per playbook. dedupe_days also
+  # blocks the same email address coming in through another playbook or
+  # company record within this many days (0 = off).
   dedupe_days: 90
+  # Don't email a colleague at a company this playbook already handed over
+  # within this many days (0 = off). Separately, once anyone at a company has
+  # replied (or unsubscribed, said no or was marked lost), nobody else there is
+  # ever handed over again by this playbook. A bounce only blocks that address.
+  company_cooldown_days: 30
 
 # -----------------------------------------------------------------------------
 # REPLIES - how replies are sorted (leadgen replies / leadgen serve).
@@ -292,6 +374,9 @@ replies:
   classifier: auto
   # "Not now" replies without a date get a follow-up after this many days.
   timing_default_days: 30
+  # Out-of-office replies without a return date get a follow-up after this
+  # many days (with a date: the day after they are back).
+  ooo_default_days: 7
 
 # -----------------------------------------------------------------------------
 # NOTIFY - alerts. Channels: console, slack (SLACK_WEBHOOK_URL), webhook
@@ -299,11 +384,16 @@ replies:
 # negative, unsubscribe, ooo, bounce, other, run_summary.
 # -----------------------------------------------------------------------------
 notify:
+  # A channel may add "events: [...]" to receive only some of the events below
+  # (e.g. keep run summaries out of Slack). To switch a channel off, add
+  # "enabled: false" to it (or comment it out).
   channels:
     - type: console
     # - type: slack
-  # Which events alert. Keep the quotes around "on": unquoted, YAML reads the
-  # key as true/false and the list would be ignored.
+    #   events: [positive, referral, question]
+  # Which events alert. The quotes around "on" are a good habit: plain YAML
+  # reads a bare on/off as true/false (the engine corrects it for you, other
+  # YAML tools may not).
   "on": [positive, referral, question, run_summary]
 
 # -----------------------------------------------------------------------------

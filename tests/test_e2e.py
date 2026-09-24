@@ -21,6 +21,7 @@ from leadgen.cli import main
 from leadgen.models import ReplyCategory, Stage
 from leadgen.playbook import load_playbook
 from leadgen.store import Store
+from tests.conftest import SHIPPED_PLAYBOOKS
 
 REPO = Path(__file__).resolve().parent.parent
 DEMO = "playbooks/demo-offline.yaml"
@@ -259,7 +260,7 @@ def test_same_person_under_two_company_records_is_handed_over_once(ws, capsys):
 
 
 def test_every_playbook_loads():
-    files = sorted((REPO / "playbooks").glob("*.yaml")) + sorted((REPO / "playbooks" / "templates").glob("*.yaml"))
+    files = list(SHIPPED_PLAYBOOKS)
     names = set()
     for f in files:
         pb = load_playbook(str(f), env={})
@@ -286,7 +287,7 @@ def test_every_playbook_loads():
 def test_every_playbook_notify_on_is_read_from_the_file(tmp_path):
     """YAML 1.1 reads an unquoted ``on:`` key as boolean True, which silently drops the event
     list (the defaults were used instead). Shipped playbooks + templates quote it."""
-    files = sorted((REPO / "playbooks").glob("*.yaml")) + sorted((REPO / "playbooks" / "templates").glob("*.yaml"))
+    files = list(SHIPPED_PLAYBOOKS)
     for f in files:
         text = f.read_text(encoding="utf-8")
         raw = yaml.safe_load(text)["notify"]
@@ -302,7 +303,7 @@ def test_every_playbook_notify_on_is_read_from_the_file(tmp_path):
 
 
 def test_every_playbook_path_resolves_from_repo_root():
-    for f in list((REPO / "playbooks").glob("*.yaml")) + list((REPO / "playbooks" / "templates").glob("*.yaml")):
+    for f in list(SHIPPED_PLAYBOOKS):
         pb = load_playbook(str(f.relative_to(REPO)), env={})
         for cfg in list(pb.sources) + list(pb.enrichment.get("finders") or []):
             if cfg.get("path") and cfg.get("enabled") is not False:

@@ -28,7 +28,9 @@ Playbook keys read (section ``icp``):
     spellings equivalent: ``United States`` ~ ``US`` ~ ``USA`` ~ ``U.S.``;
     ``United Kingdom`` ~ ``UK`` ~ ``GB`` ~ ``Great Britain`` (and
     ``England`` / ``Scotland`` / ``Wales`` / ``Northern Ireland`` count as
-    UK, not the other way round); US state names <-> 2-letter codes (a code
+    UK, not the other way round); full region names of other common markets
+    (``British Columbia``, ``Queensland``, ``Maharashtra``, ``Bavaria`` ...)
+    count as their country; US state names <-> 2-letter codes (a code
     is recognised in upper case after a comma - ``Austin, TX`` - or as the
     whole value) and states count as United States; a ``country`` field that
     is an ISO code (``DE``, ``GBR``) is read as that country. ``CA``, ``DE``,
@@ -135,6 +137,21 @@ _PARTS: Dict[str, str] = {
     "washington dc": "united states",
 }
 _PARTS.update({name: "united states" for name in _US_STATES.values()})
+# Full region names of other common markets (names only - their 2-letter codes
+# collide with US states - and only names that are not also well-known US places).
+_OTHER_REGIONS: Dict[str, Tuple[str, ...]] = {
+    "canada": ("british columbia", "alberta", "saskatchewan", "manitoba", "quebec", "nova scotia",
+               "newfoundland", "newfoundland and labrador", "prince edward island", "yukon",
+               "northwest territories", "nunavut"),
+    "australia": ("queensland", "tasmania", "western australia", "south australia",
+                  "northern territory", "australian capital territory"),
+    "india": ("maharashtra", "karnataka", "tamil nadu", "telangana", "gujarat", "uttar pradesh",
+              "west bengal", "kerala", "haryana", "rajasthan", "andhra pradesh"),
+    "germany": ("bavaria", "bayern", "baden wurttemberg", "baden wuerttemberg", "north rhine westphalia",
+                "nordrhein westfalen", "hesse", "hessen", "lower saxony", "niedersachsen", "saxony"),
+}
+for _country, _names in _OTHER_REGIONS.items():
+    _PARTS.update({n: _country for n in _names})
 
 # regions -> (aliases, member countries)
 _REGIONS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {

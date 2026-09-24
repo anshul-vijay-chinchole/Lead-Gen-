@@ -66,7 +66,9 @@ sources:
     actor: compass/crawler-google-places
     preset: google_maps         # maps name, website, address, rating, reviews ...
     input:
-      searchStringsArray: ["dentist in Austin, TX"]   # one search per string: "<business> in <city>"
+      # One search per string: "<business> in <city>". Replace the example with
+      # the cities you sell into (any country works).
+      searchStringsArray: ["dentist in Austin, TX"]
       maxCrawledPlacesPerSearch: 50
       language: en
     max_items: 100

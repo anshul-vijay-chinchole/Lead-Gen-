@@ -15,6 +15,7 @@ from leadgen.cli import main, parse_env_text
 from leadgen.models import Stage
 from leadgen.playbook import load_playbook
 from leadgen.store import Store
+from tests.conftest import SHIPPED_PLAYBOOKS
 
 REPO = Path(__file__).resolve().parent.parent
 DEMO = "playbooks/demo-offline.yaml"
@@ -323,7 +324,7 @@ def test_validate_skips_disabled_and_flags_empty_sources(tmp_path, g, capsys):
 
 
 def test_validate_every_shipped_playbook_runs(g, capsys):
-    files = sorted((REPO / "playbooks").glob("*.yaml")) + sorted((REPO / "playbooks" / "templates").glob("*.yaml"))
+    files = list(SHIPPED_PLAYBOOKS)
     assert len(files) >= 7
     for f in files:
         code = main(["validate", "-p", str(f.relative_to(REPO)), *g])

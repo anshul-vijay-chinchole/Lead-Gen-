@@ -1549,7 +1549,14 @@ def classify_ai(reply: Reply, ctx: Any) -> Reply:
     text = clean_reply_text(reply.body)
     today = _today(ctx)
     try:
-        out = llm.complete_json(AI_SYSTEM_PROMPT, _ai_user_prompt(reply, text, ctx), max_tokens=700)
+        budget = int(ctx.playbook.replies.get("max_tokens") or ctx.playbook.writer.get("max_tokens") or 2000)
+        prompt = _ai_user_prompt(reply, text, ctx)
+        try:
+            out = llm.complete_json(AI_SYSTEM_PROMPT, prompt, max_tokens=budget)
+        except Exception as first:  # noqa: BLE001
+            if not getattr(first, "truncated", False):
+                raise
+            out = llm.complete_json(AI_SYSTEM_PROMPT, prompt, max_tokens=budget * 2)  # reasoning ate the budget
         if not isinstance(out, dict):
             raise ValueError(f"expected a JSON object, got {type(out).__name__}")
         category = _ai_category(out.get("category"))

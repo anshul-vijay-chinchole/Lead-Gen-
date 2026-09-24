@@ -626,8 +626,16 @@ def test_adzuna_errors(make_ctx, caplog):
     assert [c.name for c in src.fetch()] == ["Good Co"]
 
 
-def test_adzuna_defaults_and_malformed_payloads(make_ctx):
+def test_adzuna_requires_countries(make_ctx):
+    """No hidden country default: the engine is country-agnostic."""
     src, ctx = adzuna(make_ctx)
+    with pytest.raises(ValueError, match="countries"):
+        src.fetch()
+    assert ctx.http.calls == []
+
+
+def test_adzuna_defaults_and_malformed_payloads(make_ctx):
+    src, ctx = adzuna(make_ctx, countries=["us"])
     ctx.http.add("GET", re.compile(r"/jobs/us/search/1$"),
                  json={"results": [None, "junk", {"title": "x"}, {"company": {"display_name": "Solo LLC"}}]})
     [c] = src.fetch()
@@ -639,14 +647,14 @@ def test_adzuna_defaults_and_malformed_payloads(make_ctx):
 
 
 def test_adzuna_credentials(make_ctx):
-    src, ctx = adzuna(make_ctx, env={"ADZUNA_APP_ID": "only-id"})
+    src, ctx = adzuna(make_ctx, env={"ADZUNA_APP_ID": "only-id"}, countries=["us"])
     with pytest.raises(MissingCredentialError, match="ADZUNA_APP_KEY"):
         src.fetch()
-    src, ctx = adzuna(make_ctx, env={}, app_id="cfg-id", app_key="cfg-key", max_pages=1)
+    src, ctx = adzuna(make_ctx, env={}, app_id="cfg-id", app_key="cfg-key", max_pages=1, countries=["us"])
     ctx.http.add("GET", re.compile(r"/search/1$"), json=adzuna_page([]))
     src.fetch()
     assert ctx.http.calls[0]["params"]["app_id"] == "cfg-id" and ctx.http.calls[0]["params"]["app_key"] == "cfg-key"
-    src, ctx = adzuna(make_ctx, dry_run=True)
+    src, ctx = adzuna(make_ctx, dry_run=True, countries=["us"])
     assert src.fetch() == [] and ctx.http.calls == []
 
 

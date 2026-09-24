@@ -96,7 +96,10 @@ class AdzunaSource(Source):
 
     @property
     def countries(self) -> List[str]:
-        raw = self.config.get("countries") or self.config.get("country") or ["us"]
+        raw = self.config.get("countries") or self.config.get("country")
+        if not raw:
+            raise ValueError("adzuna: set 'countries' (Adzuna searches one country per request, "
+                             "e.g. countries: [us] or [gb, ca])")
         out = []
         for c in _as_list(raw):
             code = _COUNTRY_ALIASES.get(c.lower(), c.lower())

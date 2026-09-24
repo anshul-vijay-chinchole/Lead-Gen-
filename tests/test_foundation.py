@@ -257,3 +257,41 @@ def test_sibling_postings_in_one_batch_are_not_reposts():
     d = Signal(type="job_posting", title="Accountant", external_id="2")
     s.observe_signals("acme.com", [c, d], TODAY + timedelta(days=10))
     assert c.reposted
+
+
+def test_notify_skips_disabled_channels(make_ctx, capsys):
+    from leadgen.notify import notify
+    ctx = make_ctx(notify={"channels": [{"type": "console", "enabled": False}], "on": ["positive"]})
+    assert notify(ctx, "positive", "t", "x") == 0
+    assert "t" not in capsys.readouterr().out
+
+
+def test_region_names_of_other_countries():
+    from leadgen.filters import place_ids
+    assert "canada" in place_ids("Vancouver, British Columbia")
+    assert "australia" in place_ids("Brisbane, Queensland")
+    assert "india" in place_ids("Pune, Maharashtra")
+    assert "germany" in place_ids("Munich, Bavaria")
+    assert "united states" in place_ids("Austin, TX") and not place_ids("Houston")
+
+
+def test_people_csv_with_separate_job_title_column_keeps_the_signal(make_ctx, tmp_path):
+    from leadgen.sources.csv_source import CsvSource
+    p = tmp_path / "p.csv"
+    p.write_text("First Name,Last Name,Title,Email,Company,Website,Job Title,Date Posted\n"
+                 "Jane,Doe,Founder,jane@acme.com,Acme Agency,acme.com,Business Development Manager,2 days ago\n",
+                 encoding="utf-8")
+    [c] = CsvSource({"type": "csv", "path": str(p)}, make_ctx()).fetch()
+    assert [(s.type, s.title) for s in c.signals] == [("job_posting", "Business Development Manager")]
+    assert c.contacts[0].title == "Founder"
+
+
+def test_ai_reply_classifier_retries_truncated_output(make_ctx):
+    from leadgen.llm.base import LLMTruncatedError
+    from leadgen.replies import classify_ai
+    from tests.fakes import FakeLLM
+    ctx = make_ctx()
+    ctx.llm = FakeLLM(LLMTruncatedError("cut"), {"category": "positive", "confidence": 0.9, "summary": "yes"})
+    r = classify_ai(Reply(from_email="a@b.com", body="Sounds great, send details"), ctx)
+    assert r.category == "positive" and r.classifier == "ai"
+    assert ctx.llm.calls[1]["max_tokens"] == 2 * ctx.llm.calls[0]["max_tokens"]
