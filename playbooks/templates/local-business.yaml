@@ -1,0 +1,113 @@
+# =============================================================================
+#  LOCAL-BUSINESS - local businesses found on Google Maps
+# =============================================================================
+#  Who it is for: services sold to local businesses (websites, booking systems,
+#  review management, AI receptionists, marketing, bookkeeping, ...).
+#  The signal:    the business's Google rating and review count (a "review"
+#                 signal) - e.g. a clinic rated 3.9 from 40 reviews has a visible
+#                 reputation problem. The example niche is dental practices.
+#  Who we email:  the owner / practice manager. Small businesses often only
+#                 publish info@ addresses, so shared mailboxes are allowed here.
+#
+#  API keys (put them in .env - see .env.example):
+#    APIFY_TOKEN               runs the Google Maps scraper (Apify actor)
+#    HUNTER_API_KEY            finds people + emails on the business's domain
+#    MILLIONVERIFIER_API_KEY   email verification
+#    ANTHROPIC_API_KEY         AI-written emails (optional - template works too)
+# =============================================================================
+
+name: local-business
+description: Local businesses from Google Maps (review signals) -> owners and managers.
+
+offer:
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_title: ${SENDER_TITLE:-Founder}
+  sender_company: ${SENDER_COMPANY:-Your Company}
+  sender_website: ${SENDER_WEBSITE:-https://your-company.example}
+  service: review follow-up and online booking for dental practices
+  # Completes "We help teams like <company> ..."
+  value_prop: turn happy patients into Google reviews and fill last-minute cancellations automatically
+  proof: ""
+  cta: Open to a 10-minute look at how it works?
+  booking_link: ${BOOKING_LINK:-}
+  footer: ""
+
+# --- Ideal customer --------------------------------------------------------------
+icp:
+  locations: []                 # the search below already targets a city
+  employees: {min: null, max: 200}   # Google Maps rarely has head-counts; unknown passes
+  industries: [dentist, dental, orthodontist, dental clinic]
+  exclude_keywords: [hospital, university, franchise headquarters]
+  exclude_company_patterns: ["(?i)\\b(smile direct|aspen dental)\\b"]   # chains you don't sell to
+  require_domain: true          # no website = no email address to find
+  unknown_passes: true
+
+# --- Signals: Google rating / reviews ----------------------------------------------------------
+signals:
+  types: [review]
+  primary: [review]
+  require: true
+  match_keywords: []            # every rated business counts; the score decides who is hot
+  exclude_keywords: []
+  max_age_days: null            # map listings have no date - never drop them for age
+  stale_after_days: 21
+
+buyers:
+  titles: [Owner, Practice Owner, Principal Dentist, Practice Manager, Office Manager,
+           Managing Director, General Manager, Founder]
+  exclude_titles: [intern, student, trainee]
+  max_contacts_per_company: 1
+  # Many small businesses only publish info@ / hello@ addresses.
+  allow_generic_emails: true
+
+# --- Sources: Google Maps via Apify ---------------------------------------------------------------
+sources:
+  - type: apify
+    actor: compass/crawler-google-places
+    preset: google_maps         # maps name, website, address, rating, reviews ...
+    input:
+      searchStringsArray: ["dentist in Austin, TX"]   # one search per string: "<business> in <city>"
+      maxCrawledPlacesPerSearch: 50
+      language: en
+    max_items: 100
+    limit: 100
+    # The signal title for each place (placeholders are Apify fields):
+    signal_title_template: "Rated {totalScore} from {reviewsCount} Google reviews"
+
+enrichment:
+  finders:
+    - type: hunter              # people + emails on the business's domain
+    - type: pattern
+  verifier:
+    type: millionverifier
+  accept_statuses: [valid, risky]
+  max_companies: 100
+
+scoring:
+  # Map listings carry no date, so "fit" and "reachability" matter more here.
+  weights: {intent: 25, fit: 35, reachability: 30, extra: 10}
+  tiers: {hot: 75, normal: 55}
+
+writer:
+  type: template                # switch to ai (provider + model) for tailored emails
+  provider: ""
+  model: ""
+  max_words: 80
+
+outbound:
+  exporters:
+    - type: csv
+    - type: instantly_csv
+  tiers: [hot, normal]
+  dedupe_days: 120
+
+replies:
+  classifier: rules
+
+notify:
+  channels:
+    - type: console
+  on: [positive, referral, question, run_summary]
+
+storage:
+  path: data/leadgen.db

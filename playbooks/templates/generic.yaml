@@ -1,0 +1,312 @@
+# =============================================================================
+#  GENERIC PLAYBOOK - the full reference, every setting explained
+# =============================================================================
+#  A playbook is the "recipe card" for one niche or one client. The engine has
+#  no niche built in: everything that changes between niches lives in this file
+#  - which signals count, who the ideal customer is, which job titles to email,
+#  what the email says and which tools to use.
+#
+#  Create your own copy with:   leadgen init my-niche --template generic
+#  Check it with:               leadgen validate -p playbooks/my-niche.yaml
+#  Rehearse (no paid calls):    leadgen run -p playbooks/my-niche.yaml --dry-run
+#
+#  How to read this file
+#  * Lines starting with "#" are comments. The engine ignores them.
+#  * "key: value" sets a setting. Indentation (2 spaces) groups settings.
+#  * [a, b, c] is a list. {min: 10, max: 50} is a small group of settings.
+#  * Leave a setting out and its default is used; every default is shown here.
+#  * ${NAME} is replaced by the environment variable NAME (e.g. from your .env
+#    file); ${NAME:-something} uses "something" when NAME is not set.
+#
+#  As shipped, this template runs fully offline on the sample data in
+#  examples/data/, so you can try it before you have any API keys. The paid
+#  tools are listed below with "enabled: false" - switch them on one by one.
+# =============================================================================
+
+# A short name: letters, digits, "-", "_" and "." only. Used to tag everything
+# this playbook stores, and as the output folder name.
+name: generic
+description: Reference playbook - copy it and replace the example values.
+
+# -----------------------------------------------------------------------------
+# OFFER - who you are and what you sell. Used in every email and in the demo report.
+# -----------------------------------------------------------------------------
+offer:
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_title: ${SENDER_TITLE:-Founder}
+  sender_company: ${SENDER_COMPANY:-Your Company}
+  sender_website: ${SENDER_WEBSITE:-https://your-company.example}
+  # What you do, as a short noun phrase: "finance recruitment", "bookkeeping".
+  service: your service in a few words
+  # The outcome you deliver. It completes the sentence "We help teams like
+  # <company> ...", e.g. "close their books in 5 days instead of 15".
+  # (A full sentence starting with "We" or ending with "." also works.)
+  value_prop: get the result they care about, faster
+  # One believable proof line: a result, a number, a type of client.
+  proof: ""
+  # The ask at the end of the first email. Keep it low-pressure.
+  cta: Worth a quick chat?
+  # Calendly / Cal.com link. Shown in later emails and in replies to interested people.
+  booking_link: ${BOOKING_LINK:-}
+  # Custom sign-off. Empty = "<sender_name>\n<sender_title>, <sender_company>".
+  signature: ""
+  # Optional line added under every email (e.g. how to opt out). Empty = none.
+  footer: ""
+  # Language the AI writer uses.
+  language: English
+
+# -----------------------------------------------------------------------------
+# ICP - your Ideal Customer Profile. Companies that fail these checks are
+# rejected (with the reason written to rejected.csv).
+# -----------------------------------------------------------------------------
+icp:
+  # Places to keep (any match in the company's location/country or where it is
+  # hiring). Examples: [United States, Canada], [London, Manchester], [Europe].
+  # Empty = anywhere.
+  locations: []
+  exclude_locations: []
+  # Company size (number of employees). null = no limit.
+  employees: {min: null, max: null}
+  # Industries to keep (matched in industry, keywords and description). Empty = any.
+  industries: []
+  # Industries to reject, e.g. your competitors' industry.
+  exclude_industries: []
+  # At least one of these must appear in the company name/description/keywords
+  # or a signal title. Empty = no requirement.
+  keywords: []
+  # Reject a company when one of these appears in its name/industry/description.
+  exclude_keywords: []
+  # Never contact these domains (existing clients, partners, competitors).
+  # A domain also covers its sub-domains.
+  exclude_domains: []
+  # Regular expressions tested against the company name, e.g. ["(?i)\\bholding\\b"].
+  exclude_company_patterns: []
+  # Reject companies without a website/domain (you cannot find emails without one).
+  require_domain: false
+  # When size / industry / location data is missing: true = let it through
+  # (it scores a bit lower), false = reject it.
+  unknown_passes: true
+
+# -----------------------------------------------------------------------------
+# SIGNALS - the "why now". A company is only a lead while it shows a signal.
+# Signal types: job_posting, funding, leadership_change, expansion,
+# headcount_growth, tech_adoption, news, review, ad_activity, website_change,
+# event, custom (or any word you like).
+# -----------------------------------------------------------------------------
+signals:
+  # Signal types to accept. Empty = all.
+  types: []
+  # Types that drive the "intent" part of the score. Other accepted types add
+  # a small bonus ("extra").
+  primary: [job_posting]
+  # Drop companies that have no accepted signal left.
+  require: true
+  # A PRIMARY signal only counts if its title (or description) contains one of
+  # these, e.g. the job titles you recruit for. Empty = every title counts.
+  match_keywords: []
+  # Drop any signal whose title contains one of these.
+  exclude_keywords: []
+  # Ignore signals older than this many days (null = no age limit).
+  max_age_days: 60
+  # Words that mean "they need it now" (earn urgency points).
+  urgency_keywords: [urgent, immediate, immediately, asap, start now, quick start]
+  # A signal still open after this many days (or re-posted) = a hard-to-fill,
+  # persistent need. Earns points.
+  stale_after_days: 21
+
+# -----------------------------------------------------------------------------
+# BUYERS - who to email at each company.
+# -----------------------------------------------------------------------------
+buyers:
+  # Job titles to look for, BEST FIRST. Abbreviations are understood
+  # (VP = Vice President, CFO = Chief Financial Officer, ...).
+  titles: [Founder, CEO, Head of Operations]
+  # Never email people whose title contains one of these.
+  exclude_titles: [intern, assistant, student, trainee]
+  # Hints for data providers (Apollo seniorities: owner, founder, c_suite,
+  # partner, vp, head, director, manager, senior, entry).
+  seniorities: []
+  # Hints for data providers, e.g. [finance, engineering, human resources].
+  departments: []
+  # How many people to email per company.
+  max_contacts_per_company: 1
+  # Allow shared mailboxes such as info@, hr@, jobs@ (usually a bad idea).
+  allow_generic_emails: false
+
+# -----------------------------------------------------------------------------
+# SOURCES - where companies and their signals come from. Add as many as you
+# like; the same company from two sources is merged. Every source accepts
+# "label" (a name for reports), "limit" (max companies, 0 = all) and
+# "enabled: false" (keep the settings but skip it).
+#   csv / json   your own files or any export (Apollo, Clay, Sales Navigator, Apify)
+#   theirstack   job postings (key: THEIRSTACK_API_KEY)
+#   adzuna       job postings (keys: ADZUNA_APP_ID + ADZUNA_APP_KEY)
+#   apollo       company search with funding / growth signals (key: APOLLO_API_KEY)
+#   apify        any Apify scraper, e.g. Google Maps (key: APIFY_TOKEN)
+#   greenhouse / lever / ashby   open jobs of a watchlist of companies (no key)
+# Run `leadgen adapters` to see them all.
+# -----------------------------------------------------------------------------
+sources:
+  - type: csv
+    label: sample-signals
+    path: examples/data/demo_signals.csv
+    # Column names are detected automatically. If yours differ, map them:
+    # mapping: {name: "Company Name", signal_title: "Job Title", signal_date: "Posted"}
+
+  - type: theirstack
+    enabled: false
+    job_titles: [operations manager]      # titles you care about
+    max_age_days: 30
+    limit: 25                             # jobs per page (credits!)
+    max_pages: 2
+
+  - type: greenhouse
+    enabled: false
+    companies:
+      - {name: Example Co, board: exampleco, domain: example-co.com}
+
+# -----------------------------------------------------------------------------
+# ENRICHMENT - find the decision-maker, then check the email.
+# -----------------------------------------------------------------------------
+enrichment:
+  # Contact finders run in order until a decision-maker with an email is found
+  # (so paid lookups stop as soon as they are no longer needed).
+  finders:
+    - type: csv                           # people you already have in a file
+      path: examples/data/demo_contacts.csv
+    - type: apollo                        # people search + email reveal (APOLLO_API_KEY)
+      enabled: false
+      per_page: 10
+      reveal_limit: 2                     # max email reveals per company (credits!)
+    - type: hunter                        # domain search + email finder (HUNTER_API_KEY)
+      enabled: false
+    - type: pattern                       # free: guesses first.last@domain etc.
+  # Email checker: basic (free, syntax only), millionverifier, zerobounce,
+  # neverbounce or hunter.
+  verifier:
+    type: basic
+  # Which verification results may be emailed. With a real verifier keep
+  # [valid, risky]. "unknown" is only here because the free "basic" checker
+  # can never confirm an address; remove it once you use a real verifier.
+  accept_statuses: [valid, risky, unknown]
+  # Credit guard: only enrich the best N companies per run.
+  max_companies: 200
+  # Skip enrichment for companies whose pre-score (without a contact) is below this.
+  min_prescore: 0
+  # Don't look people up when the source already supplied a decision-maker with an email.
+  skip_if_contact_present: true
+
+# -----------------------------------------------------------------------------
+# SCORING - every lead gets 0-100. The four weights add up to 100.
+# -----------------------------------------------------------------------------
+scoring:
+  weights:
+    intent: 40          # how fresh / strong / urgent the primary signal is
+    fit: 30             # location, size and industry match
+    reachability: 20    # right person + deliverable email
+    extra: 10           # bonus signals (funding, expansion, ...)
+  # hot >= 80, normal >= 60, everything else is "skip".
+  tiers: {hot: 80, normal: 60}
+  # How the intent points are split.
+  intent: {fresh: 15, volume: 10, persistence: 10, urgency: 5}
+  # Freshness bands in days: within 3 days full points, 7 = 3/4, 14 = 1/2, 30 = 1/4.
+  freshness_days: [3, 7, 14, 30]
+  # This many matching signals = full "volume" points.
+  volume_full_at: 3
+  # Points per bonus signal type.
+  extra_per_signal: 5
+  # Share of the fit points given when a company's data is missing (0.5 = half).
+  unknown_credit: 0.5
+
+# -----------------------------------------------------------------------------
+# WRITER - the email sequence.
+# -----------------------------------------------------------------------------
+writer:
+  # "template" = free, offline, from built-in niche-neutral copy.
+  # "ai" = written by an AI model (falls back to the template if the AI fails).
+  type: template
+  # For type ai: provider anthropic | openai | openai_compatible, plus a model.
+  provider: ""          # e.g. anthropic (key: ANTHROPIC_API_KEY) or openai (OPENAI_API_KEY)
+  model: ""             # e.g. claude-opus-5 (claude-sonnet-5 costs less) / gpt-5-mini
+  base_url: ""          # only for openai_compatible, e.g. https://openrouter.ai/api/v1
+  api_key_env: ""       # env var holding the key, when not the provider's default
+  temperature: null     # leave empty; many current models ignore or reject it
+  tone: friendly, direct, peer-to-peer; no hype
+  # Max words in the body of each email (signature not counted).
+  max_words: 90
+  # One email per step. "day" = days after the first email.
+  sequence:
+    - {day: 1, purpose: "opener: why them, why now, soft CTA"}
+    - {day: 3, purpose: "short bump adding one new angle or proof point"}
+    - {day: 7, purpose: "value add: a relevant insight or offer"}
+    - {day: 12, purpose: "polite breakup, easy yes/no"}
+  # Phrases the emails must never contain.
+  banned_phrases: [I hope this email finds you well, leading provider, world-class, synergy,
+                   revolutionize, game-changer, cutting-edge, I wanted to reach out, touch base,
+                   circle back]
+  # Extra instructions for the AI writer.
+  extra_instructions: ""
+  # Template writer overrides (optional). Placeholders: {first_name}, {company},
+  # {signal_title}, {signal_phrase}, {hypothesis}, {value_line}, {cta}, ...
+  # templates:
+  #   subject: "{signal_title_lc} at {company}"
+  #   steps:
+  #     - "Hi {first_name},\n\n{opener}\n\n{hypothesis} {value_line}\n\n{cta}"
+  templates: {}
+  # If the AI fails, use the template writer instead of skipping the lead.
+  fallback_to_template: true
+  # Max sequences written per run (AI cost guard).
+  max_leads: 500
+  # Only write for these tiers.
+  tiers: [hot, normal]
+
+# -----------------------------------------------------------------------------
+# OUTBOUND - where finished leads go. Files land in output/<name>/<run id>/.
+#   csv              opportunities.csv - every lead (review / Google Sheets)
+#   json             leads.json - everything
+#   instantly_csv    instantly_upload.csv   |  instantly  push via API (INSTANTLY_API_KEY + campaign_id)
+#   smartlead_csv    smartlead_upload.csv   |  smartlead  push via API (SMARTLEAD_API_KEY + campaign_id)
+#   gsheets          write a Google Sheet (pip install gspread; service account)
+#   webhook          POST the leads to Zapier / Make / n8n / your CRM
+# -----------------------------------------------------------------------------
+outbound:
+  exporters:
+    - type: csv
+    - type: instantly_csv
+    - type: instantly
+      enabled: false
+      campaign_id: ${INSTANTLY_CAMPAIGN_ID:-}
+  # Only these tiers are handed to sending tools.
+  tiers: [hot, normal]
+  # Only hand over leads with an accepted email.
+  require_email: true
+  # Never hand the same person over again within this many days.
+  dedupe_days: 90
+
+# -----------------------------------------------------------------------------
+# REPLIES - how replies are sorted (leadgen replies / leadgen serve).
+# -----------------------------------------------------------------------------
+replies:
+  # rules = free keyword rules; ai = the writer's AI model; auto = AI when
+  # configured, rules otherwise (bounces / out-of-office always use the rules).
+  classifier: auto
+  # "Not now" replies without a date get a follow-up after this many days.
+  timing_default_days: 30
+
+# -----------------------------------------------------------------------------
+# NOTIFY - alerts. Channels: console, slack (SLACK_WEBHOOK_URL), webhook
+# (LEADGEN_WEBHOOK_URL). Events: positive, referral, question, timing,
+# negative, unsubscribe, ooo, bounce, other, run_summary.
+# -----------------------------------------------------------------------------
+notify:
+  channels:
+    - type: console
+    # - type: slack
+  on: [positive, referral, question, run_summary]
+
+# -----------------------------------------------------------------------------
+# STORAGE - the engine's memory (a single SQLite file, created automatically).
+# Several playbooks can share one file.
+# -----------------------------------------------------------------------------
+storage:
+  path: data/leadgen.db

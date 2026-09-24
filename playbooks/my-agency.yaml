@@ -1,0 +1,143 @@
+# =============================================================================
+#  MY-AGENCY - find clients for YOUR lead-generation / AI-automation agency
+# =============================================================================
+#  This is the agency-outreach template, set up for you. It looks for B2B
+#  service firms (recruitment, marketing, IT services, consultancies) that are
+#  hiring sales / business-development people - they have just said out loud
+#  that they need more pipeline - and writes to their founder / MD.
+#
+#  1. Put your details and keys in .env (copy .env.example to .env):
+#       SENDER_NAME, SENDER_TITLE, SENDER_COMPANY, SENDER_WEBSITE, BOOKING_LINK
+#       THEIRSTACK_API_KEY, APOLLO_API_KEY, HUNTER_API_KEY,
+#       MILLIONVERIFIER_API_KEY, ANTHROPIC_API_KEY (optional: SLACK_WEBHOOK_URL)
+#  2. leadgen validate -p playbooks/my-agency.yaml
+#  3. leadgen run -p playbooks/my-agency.yaml --dry-run      (free rehearsal)
+#  4. leadgen run -p playbooks/my-agency.yaml --limit 10     (small paid test)
+#  5. leadgen demo -p playbooks/my-agency.yaml --prospect "Acme Recruitment"
+#     -> a one-page "live opportunities" report to send a prospect.
+#
+#  The ${NAME:-default} values below come from your .env file; the text after
+#  ":-" is used until you set them.
+# =============================================================================
+
+name: my-agency
+description: My agency's own outbound - B2B service firms hiring sales/BD -> founders and MDs.
+
+offer:
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_title: ${SENDER_TITLE:-Founder}
+  sender_company: ${SENDER_COMPANY:-Your Agency}
+  sender_website: ${SENDER_WEBSITE:-https://your-agency.example}
+  service: outbound lead generation and AI automation for B2B service firms
+  # Completes "We help teams like <company> ..."
+  value_prop: book qualified sales meetings with companies that are showing buying signals right now, so a new sales hire starts with a full calendar
+  # Add one real, specific result as soon as you have it - it is the strongest line you have.
+  proof: ""
+  cta: Worth a quick chat?
+  booking_link: ${BOOKING_LINK:-}
+  footer: ""
+
+# --- Ideal customer: B2B service firms ----------------------------------------------
+icp:
+  locations: []                 # e.g. [United States, United Kingdom]; empty = anywhere
+  employees: {min: 5, max: 250}
+  industries: [staffing, recruiting, recruitment, marketing, advertising, digital agency,
+               information technology, it services, managed services, consulting,
+               management consulting, software development, design, public relations]
+  # Other lead-gen agencies are competitors, not clients.
+  exclude_keywords: [lead generation agency, appointment setting, sdr agency]
+  exclude_domains: []           # add your clients and anyone you already talk to
+  require_domain: true
+  unknown_passes: true
+
+# --- Signals: they are hiring sales / BD people --------------------------------------
+signals:
+  types: [job_posting, funding, expansion, leadership_change, headcount_growth]
+  primary: [job_posting]
+  require: true
+  match_keywords: [business development, sales, account executive, sales development, sdr, bdr,
+                   new business, partnerships, growth, account manager, sales manager]
+  exclude_keywords: [intern, internship, apprentice, retail, store, cashier, commission only]
+  max_age_days: 45
+  stale_after_days: 21
+
+buyers:
+  titles: [Founder, Co-founder, CEO, Managing Director, Owner, Managing Partner,
+           Head of Business Development, Director of Business Development, Head of Sales,
+           Sales Director, COO]
+  exclude_titles: [intern, assistant, student, trainee]
+  seniorities: [founder, owner, c_suite, partner, head, director]
+  max_contacts_per_company: 1
+
+# --- Sources ---------------------------------------------------------------------------
+sources:
+  - type: theirstack
+    job_titles: [business development manager, business development representative,
+                 sales development representative, account executive, new business manager,
+                 head of business development, sales manager]
+    exclude_job_titles: [intern, retail, store]
+    countries: []               # ISO codes, e.g. [US, GB]; empty = worldwide
+    max_age_days: 21
+    max_employees: 250
+    limit: 25                   # jobs per page (TheirStack credits)
+    max_pages: 2
+    filters:
+      company_description_pattern_or: [agency, recruitment, staffing, consultancy, consulting,
+                                       managed services, it services, marketing services]
+  # A list of prospects you already have (e.g. an Apollo / Clay export) - switch on
+  # and point it at your file. Rows without a date get the default signal below.
+  - type: csv
+    enabled: false
+    label: my-list
+    path: data/my_prospects.csv
+    default_signal: {type: custom, title: "On my target list"}
+
+enrichment:
+  finders:
+    - type: apollo
+      per_page: 10
+      reveal_limit: 2           # email reveals per company (Apollo credits)
+    - type: hunter
+    - type: pattern
+  verifier:
+    type: millionverifier
+  accept_statuses: [valid, risky]
+  max_companies: 100
+
+scoring:
+  weights: {intent: 40, fit: 30, reachability: 20, extra: 10}
+  tiers: {hot: 80, normal: 60}
+
+writer:
+  type: ai
+  provider: anthropic           # or: openai (model gpt-5-mini, key OPENAI_API_KEY)
+  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  max_words: 85
+  extra_instructions: >-
+    The job post is the reason for writing: they are hiring for sales / business development,
+    which means they want more pipeline. Suggest that the new hire could start with meetings
+    already booked. Peer-to-peer, one founder to another. No hype, no guarantees.
+  fallback_to_template: true
+
+outbound:
+  exporters:
+    - type: csv                 # opportunities.csv - review before anything is sent
+    - type: instantly_csv       # instantly_upload.csv
+    # Push straight into an Instantly campaign once you trust the output:
+    # - type: instantly
+    #   campaign_id: ${INSTANTLY_CAMPAIGN_ID}
+  tiers: [hot, normal]
+  dedupe_days: 90
+
+replies:
+  classifier: auto
+
+notify:
+  channels:
+    - type: console
+    # - type: slack             # needs SLACK_WEBHOOK_URL in .env
+    #   events: [positive, referral, question]
+  on: [positive, referral, question, run_summary]
+
+storage:
+  path: data/leadgen.db

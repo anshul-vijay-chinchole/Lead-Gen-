@@ -1,0 +1,18 @@
+company,domain,first_name,last_name,title,email,email_status
+Brightwave Analytics,brightwave-demo.com,Maya,Okafor,VP of Finance,maya.okafor@brightwave-demo.com,valid
+Brightwave Analytics,brightwave-demo.com,Daniel,Reyes,Head of Talent Acquisition,daniel.reyes@brightwave-demo.com,valid
+Harborline Logistics,harborline-demo.com,Sanne,Vermeer,Finance Director,s.vermeer@harborline-demo.com,catch-all
+Harborline Logistics,harborline-demo.com,,,,info@harborline-demo.com,valid
+Kestrel Health,kestrel-demo.com,Priya,Natarajan,Chief Technology Officer,,
+Kestrel Health,kestrel-demo.com,,,,jobs@kestrel-demo.com,valid
+Lumen Ledger,lumenledger-demo.com,Tom,Aldridge,CEO & Co-founder,tom@lumenledger-demo.com,valid
+Northpeak Outdoor,northpeak-demo.com,Rachel,Kimura,CFO,rachel.kimura@northpeak-demo.com,valid
+Quillstone Software,quillstone-demo.com,Lena,Fischer,Office Assistant,lena.fischer@quillstone-demo.com,valid
+Quillstone Software,quillstone-demo.com,Jonas,Weber,CTO,,
+Redfern Manufacturing,redfern-demo.com,Graham,Holt,Finance Director,graham.holt@redfern-demo.com,
+Tidewater Clinics,tidewater-demo.com,Olivia,Chen,Chief Financial Officer,,
+Vantage Robotics,vantage-robotics-demo.com,Marcus,Bell,VP Engineering,marcus.bell@vantage-robotics-demo.com,valid
+Vantage Robotics,vantage-robotics-demo.com,Sofia,Ramos,Engineering Manager,sofia.ramos@vantage-robotics-demo.com,valid
+Meridian Foods,meridian-demo.com,,,,info@meridian-demo.com,valid
+Staffwise Recruiting,staffwise-demo.com,Paul,Hendry,Managing Director,paul@staffwise-demo.com,valid
+Summit Freight,summitfreight-demo.com,Erin,Walsh,CFO,erin.walsh@summitfreight-demo.com,valid

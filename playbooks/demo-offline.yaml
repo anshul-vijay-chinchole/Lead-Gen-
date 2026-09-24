@@ -1,0 +1,134 @@
+# =============================================================================
+#  demo-offline - try the whole engine with ZERO API keys and zero cost
+# =============================================================================
+#  Run it from the repository root:
+#
+#      leadgen run  -p playbooks/demo-offline.yaml
+#      leadgen demo -p playbooks/demo-offline.yaml
+#
+#  Everything here is offline: companies and their "why now" signals come from
+#  a CSV file, decision-makers from a second CSV (plus email-pattern guessing),
+#  emails are only syntax-checked, and the emails are written from templates.
+#
+#  The pretend business: "Northbeam Talent", a recruitment agency that places
+#  finance and engineering people. It looks for companies that are hiring for
+#  those roles right now and writes to the person who owns the hire.
+#  All companies, people and domains in the sample data are made up.
+#
+#  Lines starting with "#" are comments - they are ignored by the engine.
+# =============================================================================
+
+name: demo-offline
+description: Offline demo - a recruitment agency finding companies hiring finance + engineering roles.
+
+# --- Who we are and what we offer (used in every email) ----------------------
+offer:
+  sender_name: Alex Morgan
+  sender_title: Partner
+  sender_company: Northbeam Talent
+  sender_website: https://northbeam-demo.com
+  service: finance and engineering recruitment
+  # Completes the sentence "We help teams like <company> ..."
+  value_prop: fill finance and engineering roles in about three weeks, with every candidate interviewed by a specialist first
+  proof: Last quarter we filled 14 finance and engineering roles for growing software, logistics and healthcare companies.
+  cta: Worth a quick chat this week?
+  booking_link: https://northbeam-demo.com/book
+  # Optional line added under every email.
+  footer: "If this isn't relevant, just reply \"no\" and I won't follow up."
+
+# --- Ideal customer: which companies are worth contacting --------------------
+icp:
+  # No location filter: the demo is country-agnostic. Add places here to limit it,
+  # e.g. [United States, Canada].
+  locations: []
+  employees: {min: 20, max: 1000}          # too small or too big = rejected
+  industries: [software, fintech, financial services, healthcare, logistics,
+               manufacturing, robotics, e-commerce]
+  # Other recruiters are competitors, not customers.
+  exclude_industries: [staffing, recruiting, recruitment]
+  exclude_keywords: [staffing agency, recruitment agency]
+  # Existing clients - never cold-email them.
+  exclude_domains: [summitfreight-demo.com]
+  unknown_passes: true                     # missing size/industry data is not a reason to reject
+
+# --- Signals: the "why now" -------------------------------------------------
+signals:
+  types: [job_posting, funding, expansion, leadership_change]
+  primary: [job_posting]                   # job posts drive the score; the rest are a bonus
+  require: true                            # no live signal = not a lead
+  # A job post only counts when its title mentions one of these (the roles we fill).
+  match_keywords: [accountant, controller, financial analyst, finance manager, head of finance,
+                   finance director, accounts payable, accounts receivable, payroll,
+                   software engineer, backend engineer, frontend engineer, full stack engineer,
+                   data engineer, devops engineer, platform engineer]
+  exclude_keywords: [intern, internship, apprentice]
+  max_age_days: 60                         # older signals are ignored
+  stale_after_days: 21                     # a role open this long = hard to fill (scores higher)
+
+# --- Buyers: who to email, best first ----------------------------------------
+buyers:
+  titles: [CFO, VP Finance, Finance Director, Head of Finance, Controller,
+           CTO, VP Engineering, Head of Engineering, Engineering Manager,
+           Head of Talent Acquisition, Head of People, CEO, Founder]
+  exclude_titles: [intern, assistant, student, trainee]
+  max_contacts_per_company: 1
+  allow_generic_emails: false              # never email info@ / jobs@ mailboxes
+
+# --- Sources: where companies + signals come from ----------------------------
+sources:
+  - type: csv
+    label: demo-signals
+    path: examples/data/demo_signals.csv
+
+# --- Enrichment: find the person, then check the email ------------------------
+enrichment:
+  finders:
+    - type: csv                            # people we already know (a CRM / list export)
+      path: examples/data/demo_contacts.csv
+    - type: pattern                        # guess first.last@domain etc. when there is no email
+  verifier:
+    type: basic                            # offline syntax + disposable-domain check only
+  # "unknown" is accepted ONLY because there is no real verifier offline: the basic
+  # checker can never say "valid". With a real verifier (millionverifier,
+  # zerobounce, ...) use [valid, risky] so guessed emails never get sent unchecked.
+  accept_statuses: [valid, risky, unknown]
+  max_companies: 50
+
+# --- Scoring: 0-100, hot >= 80, normal >= 60, the rest are skipped -------------
+scoring:
+  weights: {intent: 40, fit: 30, reachability: 20, extra: 10}
+  tiers: {hot: 80, normal: 60}
+
+# --- Writing: free template writer (no AI key needed) -------------------------
+writer:
+  type: template
+  max_words: 90
+  sequence:
+    - {day: 1, purpose: "opener: why them, why now, soft CTA"}
+    - {day: 3, purpose: "short bump adding one new angle or proof point"}
+    - {day: 7, purpose: "value add: a relevant insight or offer"}
+    - {day: 12, purpose: "polite breakup, easy yes/no"}
+
+# --- Outbound: files to review and to upload into a sending tool ---------------
+outbound:
+  exporters:
+    - type: csv              # opportunities.csv - every lead, for review / Google Sheets
+    - type: json             # leads.json - everything, for other tools
+    - type: instantly_csv    # instantly_upload.csv - ready to import into Instantly
+    - type: smartlead_csv    # smartlead_upload.csv - ready to import into Smartlead
+  tiers: [hot, normal]
+  dedupe_days: 90            # never hand the same person over twice within 90 days
+
+# --- Replies -------------------------------------------------------------------
+replies:
+  classifier: rules          # offline keyword rules (no AI)
+
+# --- Alerts --------------------------------------------------------------------
+notify:
+  channels:
+    - type: console          # print alerts in the terminal
+  on: [positive, referral, question, run_summary]
+
+# --- Memory (SQLite file; created automatically) ---------------------------------
+storage:
+  path: data/demo.db

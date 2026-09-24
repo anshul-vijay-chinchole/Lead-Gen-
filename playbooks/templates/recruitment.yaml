@@ -1,0 +1,140 @@
+# =============================================================================
+#  RECRUITMENT - companies actively hiring the roles your agency fills
+# =============================================================================
+#  Who it is for: a recruitment / staffing agency (or a client of yours that is one).
+#  The signal:    a company has posted a job you could fill - fresh posts, several
+#                 posts, re-posted or long-open posts and "urgent" wording score higher.
+#  Who we email:  the hiring manager for that role (finance leader for finance
+#                 roles, etc.), then talent acquisition.
+#
+#  Example niche below: finance and accounting roles. To change the niche, edit
+#  the job titles in THREE places: sources (what to search for),
+#  signals.match_keywords (what counts) and buyers.titles (who to email).
+#
+#  API keys (put them in .env - see .env.example):
+#    THEIRSTACK_API_KEY, ADZUNA_APP_ID + ADZUNA_APP_KEY   job postings
+#    APOLLO_API_KEY, HUNTER_API_KEY                       people + emails
+#    MILLIONVERIFIER_API_KEY                              email verification
+#    ANTHROPIC_API_KEY (or OPENAI_API_KEY)                AI-written emails
+#  Missing keys are reported by `leadgen validate`; `--dry-run` works without any.
+# =============================================================================
+
+name: recruitment
+description: Companies hiring finance and accounting roles -> hiring managers (recruitment agency).
+
+# --- Who we are ------------------------------------------------------------------
+offer:
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_title: ${SENDER_TITLE:-Director}
+  sender_company: ${SENDER_COMPANY:-Your Recruitment Agency}
+  sender_website: ${SENDER_WEBSITE:-https://your-agency.example}
+  service: finance and accounting recruitment
+  # Completes "We help teams like <company> ..."
+  value_prop: fill finance and accounting roles with pre-screened candidates, usually within three weeks
+  proof: ""                     # e.g. "We placed 40 accountants in logistics companies last year."
+  cta: Worth a quick chat about the role?
+  booking_link: ${BOOKING_LINK:-}
+  footer: ""
+
+# --- Ideal customer --------------------------------------------------------------
+icp:
+  locations: []                 # e.g. [United States] or [London, Manchester]; empty = anywhere
+  employees: {min: 20, max: 2000}
+  industries: []                # empty = any industry
+  # Other agencies are competitors - they hire recruiters, not your candidates.
+  exclude_industries: [staffing, recruiting, recruitment]
+  exclude_keywords: [staffing agency, recruitment agency, executive search]
+  exclude_domains: []           # your current clients
+  require_domain: true          # no website = no email
+  unknown_passes: true
+
+# --- Signals: job posts for the roles you fill -----------------------------------------
+signals:
+  types: [job_posting, funding, expansion, leadership_change, headcount_growth]
+  primary: [job_posting]
+  require: true
+  match_keywords: [accountant, accounting, controller, financial analyst, finance manager,
+                   finance director, head of finance, fp&a, accounts payable, accounts receivable,
+                   payroll, bookkeeper, tax manager, treasury, credit controller]
+  exclude_keywords: [intern, internship, apprentice, graduate scheme, volunteer]
+  max_age_days: 45
+  stale_after_days: 21          # still open after 3 weeks = hard to fill = good for an agency
+
+# --- Who to email (best first) -----------------------------------------------------------
+buyers:
+  titles: [CFO, VP Finance, Finance Director, Head of Finance, Financial Controller, Controller,
+           Head of Talent Acquisition, Talent Acquisition Manager, HR Director, Head of People]
+  exclude_titles: [intern, assistant, student, trainee, recruiter]
+  seniorities: [c_suite, vp, head, director]
+  departments: [finance, human resources]
+  max_contacts_per_company: 1
+
+# --- Sources: job postings -------------------------------------------------------------------
+sources:
+  - type: theirstack
+    job_titles: [accountant, financial controller, financial analyst, finance manager,
+                 head of finance, payroll manager]
+    exclude_job_titles: [intern, internship]
+    countries: []               # ISO codes, e.g. [US, CA]; empty = worldwide
+    max_age_days: 14
+    limit: 25                   # jobs per page - TheirStack charges per job
+    max_pages: 2
+  - type: adzuna
+    countries: [us]             # Adzuna searches one country at a time: us, gb, ca, au, de, fr, ...
+    queries: [accountant, financial controller, finance manager]
+    what_exclude: [intern, internship]
+    max_days_old: 14
+    max_pages: 2
+
+# --- Find the person + check the email -------------------------------------------------------
+enrichment:
+  finders:
+    - type: apollo
+      per_page: 10
+      reveal_limit: 2           # email reveals per company (Apollo credits)
+    - type: hunter
+    - type: pattern             # free: first.last@ guesses, checked by the verifier
+  verifier:
+    type: millionverifier
+  accept_statuses: [valid, risky]
+  max_companies: 100            # enrich at most this many companies per run (credit guard)
+
+# --- Scoring -------------------------------------------------------------------------------------
+scoring:
+  weights: {intent: 45, fit: 25, reachability: 20, extra: 10}
+  tiers: {hot: 80, normal: 60}
+
+# --- Writing -------------------------------------------------------------------------------------
+writer:
+  type: ai
+  provider: anthropic           # or: openai (then model: gpt-5-mini, key OPENAI_API_KEY)
+  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  tone: friendly, direct, peer-to-peer; no hype
+  max_words: 90
+  extra_instructions: >-
+    Mention the specific role they are hiring for. If a role has been open for weeks or was
+    re-posted, acknowledge that it seems hard to fill. Never claim to have a specific candidate.
+  fallback_to_template: true
+
+# --- Where leads go -------------------------------------------------------------------------------
+outbound:
+  exporters:
+    - type: csv
+    - type: instantly_csv
+    # Push straight into an Instantly campaign instead of uploading the CSV:
+    # - type: instantly
+    #   campaign_id: ${INSTANTLY_CAMPAIGN_ID}
+  tiers: [hot, normal]
+  dedupe_days: 90
+
+replies:
+  classifier: auto
+
+notify:
+  channels:
+    - type: console
+    # - type: slack             # needs SLACK_WEBHOOK_URL
+  on: [positive, referral, question, run_summary]
+
+storage:
+  path: data/leadgen.db

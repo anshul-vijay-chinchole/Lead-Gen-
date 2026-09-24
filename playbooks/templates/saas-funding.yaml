@@ -1,0 +1,120 @@
+# =============================================================================
+#  SAAS-FUNDING - recently funded B2B software companies
+# =============================================================================
+#  Who it is for: anyone selling to startups that just raised money (growth /
+#  demand-gen agencies, dev shops, recruiters, fractional executives, tools).
+#  The signal:    a fresh funding round (and bonus points for hiring or fast
+#                 headcount growth) - new money has to be spent on growth.
+#  Who we email:  founders / CEO, then the heads of growth, marketing and sales.
+#
+#  API keys (put them in .env - see .env.example):
+#    APOLLO_API_KEY            company search (funding data) + people + emails
+#    HUNTER_API_KEY            email fallback
+#    MILLIONVERIFIER_API_KEY   email verification
+#    ANTHROPIC_API_KEY         AI-written emails (or switch to openai)
+# =============================================================================
+
+name: saas-funding
+description: Recently funded B2B SaaS companies -> founders and heads of growth.
+
+offer:
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_title: ${SENDER_TITLE:-Founder}
+  sender_company: ${SENDER_COMPANY:-Your Company}
+  sender_website: ${SENDER_WEBSITE:-https://your-company.example}
+  service: outbound pipeline for B2B software companies
+  # Completes "We help teams like <company> ..."
+  value_prop: turn a new round into qualified pipeline in the first 90 days
+  proof: ""                     # e.g. "Two of our clients doubled demo volume within a quarter."
+  cta: Worth comparing notes on the growth plan?
+  booking_link: ${BOOKING_LINK:-}
+  footer: ""
+
+# --- Ideal customer --------------------------------------------------------------
+icp:
+  locations: []                 # empty = anywhere
+  employees: {min: 10, max: 300}
+  industries: [software, saas, internet, information technology, fintech, computer software]
+  exclude_keywords: [consulting, agency, outsourcing]
+  exclude_domains: []
+  require_domain: true
+  unknown_passes: true
+
+# --- Signals: the funding round is the reason to write ---------------------------------
+signals:
+  types: [funding, job_posting, headcount_growth]
+  primary: [funding]            # the round drives the score; hiring + growth are bonuses
+  require: true
+  match_keywords: []            # any funding round counts
+  exclude_keywords: []
+  max_age_days: 120             # rounds announced in the last ~4 months
+  stale_after_days: 60
+
+buyers:
+  titles: [Founder, Co-founder, CEO, Head of Growth, VP Marketing, Head of Marketing,
+           VP Sales, Head of Sales, CRO, CMO]
+  exclude_titles: [intern, assistant, student, trainee]
+  seniorities: [founder, owner, c_suite, vp, head]
+  departments: [marketing, sales]
+  max_contacts_per_company: 1
+
+# --- Sources ----------------------------------------------------------------------------
+sources:
+  - type: apollo
+    keywords: [saas, b2b, software]
+    employee_ranges: ["11,50", "51,200", "201,300"]
+    locations: []               # empty = use icp.locations (empty = anywhere)
+    headcount_growth_min: 0.15  # also flag companies that grew 15%+ in 6 months
+    job_postings: false         # true = also fetch their open jobs (extra Apollo credits)
+    per_page: 25
+    max_pages: 2
+    # Extra Apollo search filters are passed through as-is (see Apollo's API docs), e.g.
+    # filters: {organization_ids: [...]}
+
+enrichment:
+  finders:
+    - type: apollo
+      per_page: 10
+      reveal_limit: 2
+    - type: hunter
+    - type: pattern
+  verifier:
+    type: millionverifier
+  accept_statuses: [valid, risky]
+  max_companies: 100
+
+scoring:
+  # Funding news is less time-critical than a job post, so the freshness bands are wider.
+  weights: {intent: 40, fit: 30, reachability: 20, extra: 10}
+  tiers: {hot: 80, normal: 60}
+  freshness_days: [14, 30, 60, 120]
+
+writer:
+  type: ai
+  provider: anthropic
+  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  max_words: 80
+  extra_instructions: >-
+    Congratulate them on the round in a few words, then connect it to the growth plan the round
+    is meant to fund. Do not guess what they will spend the money on; ask instead.
+  fallback_to_template: true
+
+outbound:
+  exporters:
+    - type: csv
+    - type: smartlead_csv
+    # - type: smartlead
+    #   campaign_id: ${SMARTLEAD_CAMPAIGN_ID}
+  tiers: [hot, normal]
+  dedupe_days: 120
+
+replies:
+  classifier: auto
+
+notify:
+  channels:
+    - type: console
+  on: [positive, referral, question, run_summary]
+
+storage:
+  path: data/leadgen.db

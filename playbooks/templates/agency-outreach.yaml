@@ -1,0 +1,133 @@
+# =============================================================================
+#  AGENCY-OUTREACH - clients for a lead-generation / AI-automation agency
+# =============================================================================
+#  Who it is for: you, if you sell outbound lead generation or AI automation to
+#                 B2B service businesses.
+#  The idea:      B2B service firms (recruitment, marketing, IT services,
+#                 consultancies) that are HIRING SALES / BUSINESS-DEVELOPMENT
+#                 people have just told the world they need more pipeline. That
+#                 job post is your reason to write: you can fill the pipeline the
+#                 new hire needs from day one.
+#  Who we email:  the founder / CEO / managing director, then the head of
+#                 business development.
+#
+#  API keys (put them in .env - see .env.example):
+#    THEIRSTACK_API_KEY        job postings (the signal)
+#    APOLLO_API_KEY            people + emails
+#    HUNTER_API_KEY            email fallback
+#    MILLIONVERIFIER_API_KEY   email verification
+#    ANTHROPIC_API_KEY         AI-written emails (or switch to openai)
+# =============================================================================
+
+name: agency-outreach
+description: B2B service agencies hiring sales/BD roles -> founders and MDs (lead-gen agency outreach).
+
+offer:
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_title: ${SENDER_TITLE:-Founder}
+  sender_company: ${SENDER_COMPANY:-Your Agency}
+  sender_website: ${SENDER_WEBSITE:-https://your-agency.example}
+  service: outbound lead generation for B2B service firms
+  # Completes "We help teams like <company> ..."
+  value_prop: book qualified sales meetings with companies that are showing buying signals right now, so a new sales hire starts with a full calendar
+  proof: ""                     # add a real result as soon as you have one
+  cta: Worth a quick chat?
+  booking_link: ${BOOKING_LINK:-}
+  footer: ""
+
+# --- Ideal customer: B2B service firms ----------------------------------------------
+icp:
+  locations: []                 # empty = anywhere
+  employees: {min: 5, max: 250}
+  industries: [staffing, recruiting, recruitment, marketing, advertising, digital agency,
+               information technology, it services, managed services, consulting,
+               management consulting, software development, design, public relations]
+  exclude_keywords: [lead generation agency, appointment setting, sdr agency]   # competitors
+  exclude_domains: []           # your clients
+  require_domain: true
+  unknown_passes: true
+
+# --- Signals: they are hiring sales / BD people --------------------------------------
+signals:
+  types: [job_posting, funding, expansion, leadership_change, headcount_growth]
+  primary: [job_posting]
+  require: true
+  match_keywords: [business development, sales, account executive, sales development, sdr, bdr,
+                   new business, partnerships, growth, account manager, sales manager]
+  exclude_keywords: [intern, internship, apprentice, retail, store, cashier, commission only]
+  max_age_days: 45
+  stale_after_days: 21
+
+buyers:
+  titles: [Founder, Co-founder, CEO, Managing Director, Owner, Managing Partner,
+           Head of Business Development, Director of Business Development, Head of Sales,
+           Sales Director, COO]
+  exclude_titles: [intern, assistant, student, trainee]
+  seniorities: [founder, owner, c_suite, partner, head, director]
+  max_contacts_per_company: 1
+
+# --- Sources: job posts for sales / BD roles ---------------------------------------------
+sources:
+  - type: theirstack
+    job_titles: [business development manager, business development representative,
+                 sales development representative, account executive, new business manager,
+                 head of business development, sales manager]
+    exclude_job_titles: [intern, retail, store]
+    countries: []               # ISO codes, e.g. [US, GB]; empty = worldwide
+    max_age_days: 21
+    max_employees: 250
+    limit: 25
+    max_pages: 2
+    # TheirStack filters are passed through as-is. This keeps the search to service
+    # firms (remove it if your plan rejects the field):
+    filters:
+      company_description_pattern_or: [agency, recruitment, staffing, consultancy, consulting,
+                                       managed services, it services, marketing services]
+
+enrichment:
+  finders:
+    - type: apollo
+      per_page: 10
+      reveal_limit: 2
+    - type: hunter
+    - type: pattern
+  verifier:
+    type: millionverifier
+  accept_statuses: [valid, risky]
+  max_companies: 100
+
+scoring:
+  weights: {intent: 40, fit: 30, reachability: 20, extra: 10}
+  tiers: {hot: 80, normal: 60}
+
+writer:
+  type: ai
+  provider: anthropic           # or: openai (model gpt-5-mini, key OPENAI_API_KEY)
+  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  max_words: 85
+  extra_instructions: >-
+    The job post is the reason for writing: they are hiring for sales / business development,
+    which means they want more pipeline. Suggest that the new hire could start with meetings
+    already booked. Peer-to-peer, one founder to another. No hype, no guarantees.
+  fallback_to_template: true
+
+outbound:
+  exporters:
+    - type: csv
+    - type: instantly_csv
+    # - type: instantly
+    #   campaign_id: ${INSTANTLY_CAMPAIGN_ID}
+  tiers: [hot, normal]
+  dedupe_days: 90
+
+replies:
+  classifier: auto
+
+notify:
+  channels:
+    - type: console
+    # - type: slack
+  on: [positive, referral, question, run_summary]
+
+storage:
+  path: data/leadgen.db
