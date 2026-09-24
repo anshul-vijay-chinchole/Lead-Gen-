@@ -1,0 +1,46 @@
+"""Shared fixtures.
+
+``make_ctx(**playbook_overrides)`` builds a Context with a validated playbook,
+a FakeHttp, an in-memory Store, an explicit env dict and a fixed ``today``.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import date
+from typing import Any, Dict, Optional
+
+import pytest
+
+from leadgen.context import Context
+from leadgen.playbook import from_dict
+from leadgen.store import Store
+from tests.fakes import FakeHttp
+
+TODAY = date(2026, 9, 24)
+
+
+def build_ctx(env: Optional[Dict[str, str]] = None, dry_run: bool = False, **overrides: Any) -> Context:
+    data: Dict[str, Any] = {"name": "test"}
+    data.update(overrides)
+    pb = from_dict(data, env=env or {})
+    return Context(playbook=pb, http=FakeHttp(), store=Store(":memory:"), env=dict(env or {}),
+                   today=TODAY, log=logging.getLogger("leadgen.test"), dry_run=dry_run)
+
+
+@pytest.fixture
+def make_ctx():
+    created = []
+
+    def _make(env: Optional[Dict[str, str]] = None, dry_run: bool = False, **overrides: Any) -> Context:
+        ctx = build_ctx(env=env, dry_run=dry_run, **overrides)
+        created.append(ctx)
+        return ctx
+
+    yield _make
+    for c in created:
+        c.store.close()
+
+
+@pytest.fixture
+def today() -> date:
+    return TODAY
