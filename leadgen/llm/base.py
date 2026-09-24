@@ -12,6 +12,18 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMConfigError(LLMError):
+    """The client is misconfigured (missing base_url/model, ...). Retrying will not help."""
+
+    permanent = True
+
+
+class LLMTruncatedError(LLMError):
+    """The model hit the output-token limit before finishing its answer."""
+
+    truncated = True
+
+
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 

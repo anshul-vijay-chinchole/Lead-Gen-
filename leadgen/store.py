@@ -187,7 +187,7 @@ class Store:
             if earliest:
                 s.first_seen = date.fromisoformat(earliest)
             elif s.first_seen is None:
-                s.first_seen = today
+                s.first_seen = min(s.posted_at, today) if s.posted_at else today
             # same title previously posted under a different (real) id => re-posted
             if ext and any(o for o in other_ids if o):
                 s.reposted = True
@@ -225,8 +225,13 @@ class Store:
         existing = self.conn.execute("SELECT stage, created_at, exported_at FROM leads WHERE id=?",
                                      (lead.id,)).fetchone()
         stage = lead.stage
-        if existing and _STAGE_RANK.get(existing["stage"], -1) > _STAGE_RANK.get(stage, -1):
-            stage = existing["stage"]
+        if existing:
+            old = existing["stage"]
+            if _STAGE_RANK.get(old, -1) > _STAGE_RANK.get(stage, -1):
+                stage = old
+            # LOST is sticky: a later pipeline run (stage <= exported) must not revive it
+            if old == Stage.LOST and _STAGE_RANK.get(stage, -1) < _STAGE_RANK[Stage.REPLIED]:
+                stage = old
             lead.stage = stage
         email = lead.contact.email if lead.contact else ""
         payload = json.dumps(lead.to_dict())
@@ -328,6 +333,23 @@ class Store:
             "AND id != ? LIMIT 1", (email.lower(), cutoff.isoformat(), exclude_lead_id)).fetchone()
         return row is not None
 
+    def company_engagement(self, company_key: str, playbook: str, exclude_run_id: str = "") -> Dict[str, Any]:
+        """What already happened with this company in this playbook.
+
+        Returns ``{"stages": set of lead stages, "last_exported": date|None}``,
+        ignoring leads that only belong to ``exclude_run_id`` (the current run).
+        """
+        q = "SELECT stage, exported_at, run_id FROM leads WHERE company_key=? AND playbook=?"
+        stages, last = set(), None
+        for r in self.conn.execute(q, (company_key, playbook)):
+            if exclude_run_id and r["run_id"] == exclude_run_id and not r["exported_at"]:
+                continue
+            stages.add(r["stage"])
+            if r["exported_at"]:
+                d = datetime.fromisoformat(r["exported_at"]).date()
+                last = d if last is None or d > last else last
+        return {"stages": stages, "last_exported": last}
+
     def was_exported(self, lead_id: str) -> bool:
         row = self.conn.execute("SELECT exported_at FROM leads WHERE id=?", (lead_id,)).fetchone()
         return bool(row and row["exported_at"])
@@ -375,6 +397,17 @@ class Store:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    def find_reply(self, playbook: str, from_email: str, received_at: str) -> List[Reply]:
+        """Replies already stored for this sender + timestamp (for de-duplication)."""
+        rows = self.conn.execute(
+            "SELECT payload FROM replies WHERE playbook=? AND from_email=? AND received_at=?",
+            (playbook, from_email.strip().lower(), received_at)).fetchall()
+        out = []
+        for r in rows:
+            d = json.loads(r["payload"])
+            out.append(Reply(**{k: v for k, v in d.items() if k in Reply.__dataclass_fields__}))
+        return out
+
     def list_replies(self, playbook: Optional[str] = None, category: Optional[str] = None) -> List[Reply]:
         q, args = "SELECT payload FROM replies WHERE 1=1", []
         if playbook:
@@ -383,7 +416,8 @@ class Store:
         if category:
             q += " AND category=?"
             args.append(category)
-        return [Reply(**json.loads(r["payload"])) for r in self.conn.execute(q + " ORDER BY id", args)]
+        return [Reply(**{k: v for k, v in json.loads(r["payload"]).items() if k in Reply.__dataclass_fields__})
+                for r in self.conn.execute(q + " ORDER BY id", args)]
 
     def schedule_followup(self, due: date, reason: str, lead_id: str = "", email: str = "",
                           playbook: str = "") -> int:

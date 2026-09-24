@@ -174,7 +174,9 @@ class Pipeline:
 
     def run(self) -> RunResult:
         ctx, pb, store = self.ctx, self.pb, self.ctx.store
-        run_id = store.start_run(pb.name, {"dry_run": ctx.dry_run, "limit": self.limit})
+        run_id = store.start_run(pb.name, {"dry_run": ctx.dry_run, "limit": self.limit,
+                                           "out_dir": str(self.base_out)})
+        self.run_id = run_id
         out_dir = self.base_out / run_id
         out_dir.mkdir(parents=True, exist_ok=True)
         counts: Dict[str, int] = {}
@@ -289,21 +291,34 @@ class Pipeline:
         for lead in leads:
             store.save_lead(lead)
 
-        # 9. EXPORT / SEND
+        # 9. EXPORT / SEND - hand-over exporters first, so review sheets written
+        # afterwards show the final stage of every lead.
         outbound = self.outbound_leads(leads)
         exports: List[ExportResult] = []
         handed: set = set()
+        built = []
         for cfg in pb.outbound.get("exporters") or []:
             if cfg.get("enabled") is False:
                 continue
             try:
                 exp = self._make("exporter", cfg)
-                if exp is None:
-                    continue
-                batch = outbound if getattr(exp, "scope", "all") == "outbound" else leads
+            except Exception as e:  # noqa: BLE001
+                self._err(f"exporter {cfg.get('type')}", e)
+                continue
+            if exp is not None:
+                built.append((cfg, exp))
+        built.sort(key=lambda t: 0 if getattr(t[1], "scope", "all") == "outbound" else 1)
+        for cfg, exp in built:
+            is_outbound = getattr(exp, "scope", "all") == "outbound"
+            if not is_outbound and handed:
+                for lead in leads:
+                    if lead.id in handed:
+                        lead.stage = Stage.EXPORTED
+            try:
+                batch = outbound if is_outbound else leads
                 res = exp.export(batch, out_dir)
                 exports.append(res)
-                if getattr(exp, "scope", "all") == "outbound" and not ctx.dry_run:
+                if is_outbound and not ctx.dry_run:
                     ids = res.exported_ids or ([ld.id for ld in batch] if res.count == len(batch) else [])
                     for lid in ids:
                         if lid not in handed:
@@ -331,10 +346,25 @@ class Pipeline:
         tiers = set(pb.outbound.get("tiers") or [Tier.HOT, Tier.NORMAL])
         accept = set(pb.enrichment.get("accept_statuses") or [])
         dedupe_days = int(pb.outbound.get("dedupe_days") or 0)
+        cooldown = int(pb.outbound.get("company_cooldown_days") or 0)
+        engaged_stages = {Stage.REPLIED, Stage.POSITIVE, Stage.BOOKED, Stage.WON, Stage.LOST}
+        run_id = getattr(self, "run_id", "")
+        company_state: Dict[str, Dict[str, Any]] = {}
         out = []
         for lead in leads:
             ct = lead.contact
             if lead.tier not in tiers or not lead.messages:
+                continue
+            key = lead.company.key
+            if key not in company_state:
+                company_state[key] = store.company_engagement(key, pb.name, exclude_run_id=run_id)
+            eng = company_state[key]
+            if eng["stages"] & engaged_stages:
+                lead.notes.append("company already engaged (replied / lost) - not re-contacted")
+                continue
+            last = eng["last_exported"]
+            if cooldown and last and (ctx.today - last).days < cooldown and not store.was_exported(lead.id):
+                lead.notes.append(f"company contacted {(ctx.today - last).days}d ago (cooldown {cooldown}d)")
                 continue
             if pb.outbound.get("require_email", True):
                 if not ct or not ct.email or ct.email_status not in accept:

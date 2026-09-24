@@ -88,7 +88,6 @@ from __future__ import annotations
 import copy
 import csv
 import html
-import json
 import re
 from dataclasses import fields, replace
 from datetime import date, datetime, timedelta, timezone
@@ -1499,23 +1498,13 @@ def _find_duplicate(reply: Reply, body: str, ctx: Any) -> Optional[Reply]:
     """A reply already saved for this playbook with the same sender, time and body."""
     if not reply.received_at or not reply.from_email:
         return None
-    conn = getattr(ctx.store, "conn", None)
-    if conn is None:
-        return None
     try:
-        rows = conn.execute(
-            "SELECT payload FROM replies WHERE playbook=? AND from_email=? AND received_at=?",
-            (ctx.playbook.name, reply.from_email, reply.received_at)).fetchall()
+        previous = ctx.store.find_reply(ctx.playbook.name, reply.from_email, reply.received_at)
     except Exception:  # noqa: BLE001 - dedupe is best effort
         return None
-    names = {f.name for f in fields(Reply)}
-    for row in rows:
-        try:
-            d = json.loads(row[0])
-        except (TypeError, ValueError):
-            continue
-        if isinstance(d, dict) and (d.get("body") or "") == body:
-            return Reply(**{k: v for k, v in d.items() if k in names})
+    for prev in previous:
+        if (prev.body or "") == body:
+            return prev
     return None
 
 
@@ -1670,6 +1659,8 @@ def handle_reply(reply: Reply, ctx: Any) -> Reply:
     reply.body = body
     cat = reply.category
     target = _bounce_target(reply, raw, ctx) if cat == RC.BOUNCE else reply.from_email
+    if cat == RC.BOUNCE and target:
+        reply.data["bounced_email"] = target
     lead = _link_lead(reply, target, ctx)
     if lead:
         reply.lead_id = lead.id

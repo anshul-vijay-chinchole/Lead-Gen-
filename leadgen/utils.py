@@ -26,7 +26,8 @@ PERSONAL_EMAIL_DOMAINS = frozenset({
 })
 
 EMAIL_RE = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
-EMAIL_FIND_RE = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# bounded + anchored so scanning long untrusted text stays linear
+EMAIL_FIND_RE = re.compile(r"(?<![A-Za-z0-9._%+'-])[A-Za-z0-9._%+'-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}")
 
 
 def strip_accents(text: str) -> str:
@@ -71,8 +72,13 @@ def company_key(name: Any, domain: Any = "") -> str:
     return d if d else "name:" + normalize_company_name(name)
 
 
-def parse_date(value: Any) -> Optional[date]:
-    """Parse ISO strings, datetimes, unix timestamps (s or ms), and 'N days ago'."""
+def parse_date(value: Any, today: Optional[date] = None) -> Optional[date]:
+    """Parse ISO strings, datetimes, unix timestamps (s or ms), and 'N days ago'.
+
+    Relative phrases ('3 days ago', 'today', 'yesterday') resolve against
+    ``today`` (the run date) when given, else the system date.
+    """
+    ref = today or date.today()
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
@@ -91,16 +97,16 @@ def parse_date(value: Any) -> Optional[date]:
     if not s:
         return None
     if s.isdigit() and len(s) >= 9:
-        return parse_date(int(s))
+        return parse_date(int(s), today)
     m = re.match(r"^(\d+)\+?\s*(day|week|month|hour|minute)s?\s+ago$", s.lower())
     if m:
         n, unit = int(m.group(1)), m.group(2)
         days = {"day": n, "week": 7 * n, "month": 30 * n}.get(unit, 0)
-        return date.today() - timedelta(days=days)
+        return ref - timedelta(days=days)
     if s.lower() in ("today", "just now", "just posted"):
-        return date.today()
+        return ref
     if s.lower() == "yesterday":
-        return date.today() - timedelta(days=1)
+        return ref - timedelta(days=1)
     iso = s.replace("Z", "+00:00")
     try:
         return datetime.fromisoformat(iso).date()
@@ -114,7 +120,7 @@ def parse_date(value: Any) -> Optional[date]:
             continue
     m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
     if m:
-        return parse_date(m.group(1))
+        return parse_date(m.group(1), today)
     return None
 
 

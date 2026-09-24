@@ -79,6 +79,7 @@ DEFAULTS: Dict[str, Any] = {
         "max_age_days": 60,
         "urgency_keywords": ["urgent", "immediate", "immediately", "asap", "start now", "quick start"],
         "stale_after_days": 21,   # a signal still open this long = hard-to-fill / persistent need
+        "match_description": True,  # match_keywords may also hit the signal description
     },
     "buyers": {
         "titles": [],             # priority order: first = best
@@ -127,7 +128,13 @@ DEFAULTS: Dict[str, Any] = {
             "I wanted to reach out", "touch base", "circle back",
         ],
         "extra_instructions": "",
-        "templates": {},          # template writer overrides: {subject, steps: [..]}
+        # template writer overrides: {subject, subjects: [...], steps: [str | {subject, body}],
+        #   signal_phrases: {type: str}, hypotheses: {type: str}, topics: {type: str}}
+        "templates": {},
+        "max_tokens": 4000,       # per-call output budget for the AI writer (reasoning models think inside it)
+        "max_llm_failures": 3,    # consecutive LLM failures before the AI writer switches to templates
+        "acronyms": [],           # extra ALL-CAPS words the guardrails accept (e.g. SOC2, HIPAA)
+        "llm": {},                # extra client options: timeout, reasoning_effort, effort, extra_body, ...
         "fallback_to_template": True,
         "max_leads": 500,
         "tiers": ["hot", "normal"],
@@ -137,10 +144,14 @@ DEFAULTS: Dict[str, Any] = {
         "tiers": ["hot", "normal"],
         "require_email": True,
         "dedupe_days": 90,        # don't export the same person again within N days
+        # don't email a colleague at a company that was contacted in the last N days
+        # (0 = off). Companies that replied, unsubscribed or said no are always skipped.
+        "company_cooldown_days": 30,
     },
     "replies": {
         "classifier": "auto",     # auto (ai if configured else rules) | rules | ai
         "timing_default_days": 30,
+        "ooo_default_days": 7,
     },
     "notify": {
         "channels": [{"type": "console"}],

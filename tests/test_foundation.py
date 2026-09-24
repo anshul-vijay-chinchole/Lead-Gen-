@@ -128,3 +128,51 @@ def test_store_signal_history_repost_detection():
     undated = Signal(type="funding", title="Series A")
     s.observe_signals("acme.com", [undated], date(2026, 9, 21))
     assert undated.first_seen == date(2026, 9, 21) and not undated.reposted
+
+
+def test_parse_date_relative_to_given_today():
+    assert parse_date("3 days ago", today=TODAY) == TODAY - timedelta(days=3)
+    assert parse_date("yesterday", today=TODAY) == TODAY - timedelta(days=1)
+
+
+def test_email_find_regex_is_linear_on_long_garbage():
+    import time
+    from leadgen.utils import EMAIL_FIND_RE
+    t = time.time()
+    assert EMAIL_FIND_RE.search("a" * 200_000) is None
+    assert time.time() - t < 1.0
+    assert EMAIL_FIND_RE.search("mail jane.doe@acme.com now").group(0) == "jane.doe@acme.com"
+
+
+def test_store_first_seen_uses_posting_date_and_lost_is_sticky():
+    s = Store(":memory:")
+    sig = Signal(type="job_posting", title="Controller", external_id="x", posted_at="2026-09-01")
+    s.observe_signals("acme.com", [sig], TODAY)
+    assert sig.first_seen == date(2026, 9, 1)
+    lead = Lead(company=Company(name="Acme", domain="acme.com"),
+                contact=Contact(full_name="Jane Doe", email="jane@acme.com"), playbook="p", stage=Stage.READY)
+    s.save_lead(lead)
+    s.set_stage(lead.id, Stage.LOST)
+    lead.stage = Stage.READY          # a later pipeline run re-saves it
+    s.save_lead(lead)
+    assert s.get_lead(lead.id).stage == Stage.LOST
+    eng = s.company_engagement("acme.com", "p")
+    assert Stage.LOST in eng["stages"] and eng["last_exported"] is None
+
+
+def test_store_find_reply_roundtrip():
+    s = Store(":memory:")
+    r = Reply(from_email="Jane@acme.com", body="yes", received_at="2026-09-20T10:00:00Z",
+              data={"campaign_id": "c1"})
+    s.save_reply(r, "p")
+    got = s.find_reply("p", "jane@acme.com", "2026-09-20T10:00:00Z")
+    assert len(got) == 1 and got[0].data == {"campaign_id": "c1"}
+
+
+def test_build_llm_passes_writer_llm_options(make_ctx):
+    from leadgen.llm import build_llm
+    ctx = make_ctx(env={"ANTHROPIC_API_KEY": "k"},
+                   writer={"type": "ai", "provider": "anthropic", "llm": {"timeout": 33, "effort": "low"}})
+    client = build_llm(ctx)
+    assert client.config["timeout"] == 33 and client.config["effort"] == "low"
+    assert client.config["type"] == "anthropic"

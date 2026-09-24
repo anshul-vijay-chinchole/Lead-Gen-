@@ -80,7 +80,7 @@ from urllib.parse import urlparse
 from ..context import MissingCredentialError
 from ..http import HttpError
 from ..utils import get_path
-from .base import LLMClient, LLMError
+from .base import LLMClient, LLMConfigError, LLMError, LLMTruncatedError
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_PATH = "/chat/completions"
@@ -93,16 +93,7 @@ JSON_HINT = "Respond with a single valid JSON object."
 # --- errors shared by the HTTP LLM clients ------------------------------------------------
 # (duck-typed flags so callers can react without importing these classes)
 
-class LLMConfigError(LLMError):
-    """The client is misconfigured (missing base_url/model, ...). Retrying will not help."""
-
-    permanent = True
-
-
-class LLMTruncatedError(LLMError):
-    """The model hit the output-token limit before finishing its answer."""
-
-    truncated = True
+# LLMConfigError / LLMTruncatedError live in .base; re-exported here for compatibility.
 
 
 def effective_temperature(config: Dict[str, Any], temperature: Optional[float]) -> Optional[float]:

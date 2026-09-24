@@ -687,7 +687,13 @@ def cmd_demo(args: argparse.Namespace) -> int:
     try:
         run_id = _resolve_run(session, args.run)
         leads = session.store.leads_for_run(run_id)
-        out = Path(args.out) if args.out else Path("output") / session.ctx.playbook.name / run_id
+        if args.out:
+            out = Path(args.out)
+        else:  # the folder the run itself wrote to (recorded in the run's meta)
+            meta = next((r["meta"] for r in session.ctx.store.list_runs(session.ctx.playbook.name, limit=1000)
+                         if r["id"] == run_id), {}) or {}
+            base = Path(meta["out_dir"]) if meta.get("out_dir") else Path("output") / session.ctx.playbook.name
+            out = base / run_id
         md, page = write_demo(leads, session.ctx, out, top=args.top, prospect=args.prospect,
                               mask=not args.no_mask)
         _out(f"Demo report for run {run_id} ({len(leads)} leads in the run):")

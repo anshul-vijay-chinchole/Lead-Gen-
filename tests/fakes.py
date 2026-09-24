@@ -61,7 +61,7 @@ class FakeHttp:
                 raise_for_status: bool = True) -> FakeResponse:
         method = method.upper()
         call = {"method": method, "url": url, "params": dict(params or {}), "json": json,
-                "data": data, "headers": dict(headers or {})}
+                "data": data, "headers": dict(headers or {}), "timeout": timeout}
         self.calls.append(call)
         for route in self.routes:
             if not self._match(route, method, url):
@@ -109,7 +109,8 @@ class FakeLLM:
 
     def complete(self, system: str, user: str, *, json_mode: bool = False, max_tokens: int = 1500,
                  temperature: Optional[float] = None) -> str:
-        self.calls.append({"system": system, "user": user, "json_mode": json_mode})
+        self.calls.append({"system": system, "user": user, "json_mode": json_mode,
+                           "max_tokens": max_tokens, "temperature": temperature})
         if not self.responses:
             raise AssertionError("FakeLLM: no more queued responses")
         r = self.responses.pop(0)
@@ -120,4 +121,5 @@ class FakeLLM:
     def complete_json(self, system: str, user: str, *, max_tokens: int = 1500,
                       temperature: Optional[float] = None) -> Dict[str, Any]:
         from leadgen.llm.base import parse_json_block
-        return parse_json_block(self.complete(system, user, json_mode=True, max_tokens=max_tokens))
+        return parse_json_block(self.complete(system, user, json_mode=True, max_tokens=max_tokens,
+                                              temperature=temperature))

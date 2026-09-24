@@ -372,6 +372,7 @@ class Reply:
     suggested_reply: str = ""
     action: str = ""
     classifier: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)  # provider ids, bounced address, ...
 
     def __post_init__(self) -> None:
         self.from_email = (self.from_email or "").strip().lower()
