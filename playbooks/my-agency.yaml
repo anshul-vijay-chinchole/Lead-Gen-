@@ -137,7 +137,7 @@ notify:
     - type: console
     # - type: slack             # needs SLACK_WEBHOOK_URL in .env
     #   events: [positive, referral, question]
-  on: [positive, referral, question, run_summary]
+  "on": [positive, referral, question, run_summary]     # keep "on" quoted (YAML)
 
 storage:
   path: data/leadgen.db

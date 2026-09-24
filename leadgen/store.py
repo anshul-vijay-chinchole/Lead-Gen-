@@ -176,22 +176,35 @@ class Store:
           current posting date.
         """
         t = today.isoformat()
+        signals = list(signals)
+        # read history for the whole batch BEFORE inserting, so siblings in this
+        # batch (same role in two locations, same ad from two sources) are not
+        # mistaken for re-posts of each other.
+        prior: Dict[str, List[sqlite3.Row]] = {}
+        batch_ids: Dict[str, set] = {}
+        for s in signals:
+            fp = s.fingerprint
+            batch_ids.setdefault(fp, set()).add(s.external_id or "")
+            if fp not in prior:
+                prior[fp] = self.conn.execute(
+                    "SELECT external_id, first_seen FROM signal_history WHERE company_key=? AND fingerprint=?",
+                    (company_key, fp)).fetchall()
         for s in signals:
             fp = s.fingerprint
             ext = s.external_id or ""
-            rows = self.conn.execute(
-                "SELECT external_id, first_seen FROM signal_history WHERE company_key=? AND fingerprint=?",
-                (company_key, fp)).fetchall()
+            rows = prior[fp]
             earliest = min((r["first_seen"] for r in rows), default=None)
-            other_ids = {r["external_id"] for r in rows if r["external_id"] != ext}
+            own = next((r["first_seen"] for r in rows if ext and r["external_id"] == ext), None)
             if earliest:
                 s.first_seen = date.fromisoformat(earliest)
             elif s.first_seen is None:
                 s.first_seen = min(s.posted_at, today) if s.posted_at else today
-            # same title previously posted under a different (real) id => re-posted
-            if ext and any(o for o in other_ids if o):
+            # the same title was posted before under a different id that is no longer live => re-posted
+            gone = {r["external_id"] for r in rows if r["external_id"] and r["external_id"] not in batch_ids[fp]}
+            if ext and gone:
                 s.reposted = True
-            if s.posted_at and s.first_seen and (s.posted_at - s.first_seen).days >= 7:
+            ref_seen = date.fromisoformat(own) if own else (s.first_seen if not ext else None)
+            if s.posted_at and ref_seen and (s.posted_at - ref_seen).days >= 7:
                 s.reposted = True
             self.conn.execute(
                 "INSERT INTO signal_history (company_key, fingerprint, external_id, first_seen, last_seen) "
@@ -365,9 +378,12 @@ class Store:
                           "VALUES (?,?,?,?)", (v, kind, reason, _now()))
         self.conn.commit()
 
-    def unsuppress(self, value: str) -> int:
+    def unsuppress(self, value: str, kind: Optional[str] = None) -> int:
+        """Remove one suppression entry. ``kind`` defaults to email if the value has an '@'."""
         v = value.strip().lower()
-        cur = self.conn.execute("DELETE FROM suppression WHERE value IN (?, ?)", (v, normalize_domain(v)))
+        k = kind or ("email" if "@" in v else "domain")
+        v = v if k == "email" else normalize_domain(v)
+        cur = self.conn.execute("DELETE FROM suppression WHERE value=? AND kind=?", (v, k))
         self.conn.commit()
         return cur.rowcount
 
@@ -427,12 +443,17 @@ class Store:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def due_followups(self, today: date, playbook: Optional[str] = None) -> List[Dict[str, Any]]:
+    def due_followups(self, today: date, playbook: Optional[str] = None,
+                      include_suppressed: bool = False) -> List[Dict[str, Any]]:
         q, args = "SELECT * FROM followups WHERE done=0 AND due<=?", [today.isoformat()]
         if playbook:
             q += " AND playbook=?"
             args.append(playbook)
-        return [dict(r) for r in self.conn.execute(q + " ORDER BY due", args)]
+        rows = [dict(r) for r in self.conn.execute(q + " ORDER BY due", args)]
+        # someone suppressed after the follow-up was scheduled is never due
+        if include_suppressed:
+            return rows
+        return [r for r in rows if not (r.get("email") and self.is_suppressed(email=r["email"]))]
 
     def complete_followup(self, followup_id: int) -> None:
         self.conn.execute("UPDATE followups SET done=1 WHERE id=?", (followup_id,))

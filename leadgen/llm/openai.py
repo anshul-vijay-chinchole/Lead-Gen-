@@ -31,11 +31,15 @@ gpt-5-mini count their hidden reasoning tokens against the budget, so a small
 Credentials
 -----------
 ``type: openai`` reads ``OPENAI_API_KEY`` (config ``api_key`` / ``api_key_env``
-override, as for every adapter). ``type: openai_compatible`` needs an explicit
+override, as for every adapter). ``type: openai_compatible`` - and ``type: openai``
+with a ``base_url`` that is not ``api.openai.com`` - needs an explicit
 ``api_key_env`` (e.g. ``OPENROUTER_API_KEY``) or ``api_key``: the OpenAI key is
 only ever sent to ``api.openai.com``, never silently to a third-party host. A
 local server without auth can set ``api_key_required: false``. Keys are resolved
-lazily at the first request, so constructing the client never fails.
+lazily at the first request, so constructing the client never fails; surrounding
+whitespace (a trailing newline from a mounted secret) is stripped, and a key that
+still contains whitespace / control characters raises ``MissingCredentialError``
+(without echoing it).
 
 Config keys
 -----------
@@ -143,6 +147,30 @@ def post_json(client: LLMClient, url: str, headers: Dict[str, str], body: Dict[s
         raise LLMError(f"{label}: response is not JSON: {snippet!r}") from e
 
 
+def clean_api_key(key: str, label: str) -> str:
+    """Strip surrounding whitespace from a resolved API key and refuse a malformed one.
+
+    Mounted secrets / CI variables often carry a trailing newline. HTTP libraries
+    reject such a header value and echo it in their error message, which would
+    carry the key into logs, lead notes and exports - so the key is stripped, and
+    a key that still contains whitespace, control or non-ASCII characters raises
+    ``MissingCredentialError`` without ever showing the value.
+    """
+    k = (key or "").strip()
+    if k and (not k.isascii() or any(c.isspace() or not c.isprintable() for c in k)):
+        raise MissingCredentialError(
+            f"{label}: the API key contains whitespace, control or non-ASCII characters "
+            f"(check the configured value / environment variable)")
+    return k
+
+
+def clean_headers(extra: Any) -> Dict[str, str]:
+    """``extra_headers`` config as a str->str dict with surrounding whitespace stripped."""
+    if not isinstance(extra, dict):
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in extra.items()}
+
+
 def _join_text(content: Any) -> str:
     """Message content as text: a string, or a list of ``{"type": "text", "text": ...}`` parts."""
     if isinstance(content, str):
@@ -217,16 +245,17 @@ class OpenAIClient(LLMClient):
         """Resolve the API key (lazily; see module docstring). '' = send no auth header."""
         explicit = bool(self.config.get("api_key") or self.config.get("api_key_env"))
         optional = self.compatible and self.config.get("api_key_required") is False
-        if self.compatible and not explicit and self.host not in OPENAI_HOSTS:
+        if not explicit and self.host not in OPENAI_HOSTS:
+            # Never send OPENAI_API_KEY to a third-party host implicitly - neither for
+            # openai_compatible nor for ``type: openai`` with a custom base_url.
             if optional:
                 return ""
             raise MissingCredentialError(
-                f"openai_compatible: missing credential (set writer.api_key_env to the env var "
+                f"{self.kind}: missing credential (set writer.api_key_env to the env var "
                 f"holding the API key for {self.host or 'the endpoint'}; OPENAI_API_KEY is only "
-                f"sent to api.openai.com)")
-        if optional:
-            return self.secret(required=False)
-        return self.secret()
+                f"sent to api.openai.com unless named explicitly)")
+        key = self.secret(required=False) if optional else self.secret()
+        return clean_api_key(key, self.kind)
 
     # --- request -------------------------------------------------------------------------
     def build_request(self, system: str, user: str, *, json_mode: bool = False,
@@ -238,9 +267,7 @@ class OpenAIClient(LLMClient):
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        extra_headers = self.config.get("extra_headers")
-        if isinstance(extra_headers, dict):
-            headers.update({str(k): str(v) for k, v in extra_headers.items()})
+        headers.update(clean_headers(self.config.get("extra_headers")))
 
         system = system or ""
         if json_mode and "json" not in (system + " " + (user or "")).lower():
@@ -300,5 +327,5 @@ class OpenAIClient(LLMClient):
         return text
 
 
-__all__ = ["OpenAIClient", "LLMConfigError", "LLMTruncatedError", "effective_temperature",
-           "post_json", "timeout_from"]
+__all__ = ["OpenAIClient", "LLMConfigError", "LLMTruncatedError", "clean_api_key", "clean_headers",
+           "effective_temperature", "post_json", "timeout_from"]

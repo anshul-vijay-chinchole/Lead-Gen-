@@ -57,6 +57,27 @@ def _safe_host(url: str) -> str:
         return "<webhook>"
 
 
+def _safe_detail(e: HttpError, url: str) -> str:
+    """What went wrong, without any part of the secret URL.
+
+    A network error (status 0) carries the ``requests`` exception text, which
+    embeds the request path and query ("Max retries exceeded with url:
+    /hook/SECRET?sig=...") - only its exception class is kept. Any other body
+    is scrubbed of the URL, its path and its query.
+    """
+    body = str(e.body or "")
+    if not e.status:
+        return body.split(":", 1)[0].strip()[:80] or "network error"
+    try:
+        p = urlparse(url)
+        pieces = [url, p.path + (f"?{p.query}" if p.query else ""), p.path, p.query]
+    except ValueError:
+        pieces = [url]
+    for piece in sorted((x for x in pieces if x and x != "/"), key=len, reverse=True):
+        body = body.replace(piece, "<redacted>")
+    return body[:200]
+
+
 def jsonable(value: Any) -> Any:
     """Return a JSON-serialisable deep copy (unknown objects -> ``str``)."""
     def _default(o: Any) -> Any:
@@ -116,7 +137,7 @@ class WebhookNotifier(Notifier):
                                      timeout=timeout, raise_for_status=False)
         except HttpError as e:
             raise WebhookError(f"webhook: could not reach {_safe_host(url)} "
-                               f"(HTTP {e.status}): {e.body[:200]}") from None
+                               f"(HTTP {e.status}): {_safe_detail(e, url)}") from None
         if not resp.ok:
             body = (resp.text or "").strip()[:200] or "no response body"
             raise WebhookError(f"webhook: {_safe_host(url)} returned HTTP {resp.status}: {body}")

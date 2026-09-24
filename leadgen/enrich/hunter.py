@@ -47,7 +47,12 @@ department            Hunter department filter (string, comma list or list).
                       C-Suite -> executive, Accounting -> finance, ...);
                       unknown values are dropped with a warning.
 use_buyer_departments Default true: without ``department``, map
-                      ``buyers.departments`` to Hunter's set.
+                      ``buyers.departments`` to Hunter's set. Hunter's
+                      department is a hard filter, so ``executive`` (and
+                      ``management`` for managing directors / general
+                      managers) is added when ``buyers.titles`` holds
+                      executive titles (Founder, CEO, Owner, Chief ...,
+                      CFO, Managing Director, ...).
 params                Extra raw query parameters for the domain search.
 base_url              Default ``https://api.hunter.io/v2``.
 domain_search_path    Default ``/domain-search``.
@@ -57,7 +62,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..http import HttpError
+from ..http import HttpError, redact
 from ..models import Company, Contact, EmailStatus
 from ..utils import get_path, is_valid_email, normalize_domain, normalize_text
 from .base import ContactFinder
@@ -107,6 +112,14 @@ DEPARTMENT_SYNONYMS: Tuple[Tuple[str, str], ...] = (
     ("production", "operations"), ("manufacturing", "operations"),
 )
 
+# Buyer titles Hunter files under the "executive" / "management" departments (whole-word match).
+EXECUTIVE_TITLE_PHRASES: Tuple[str, ...] = (
+    "founder", "co founder", "cofounder", "owner", "ceo", "chief", "president", "managing director",
+    "managing partner", "general manager", "c suite", "c level", "cfo", "coo", "cto", "cmo", "cro", "cio",
+    "cpo", "chro", "ciso", "cco",
+)
+MANAGEMENT_TITLE_PHRASES: Tuple[str, ...] = ("managing director", "general manager", "managing partner")
+
 _SYNONYMS_LONGEST_FIRST: Tuple[Tuple[str, str], ...] = tuple(
     sorted(DEPARTMENT_SYNONYMS, key=lambda t: -len(t[0].split())))
 
@@ -146,6 +159,18 @@ def hunter_departments(value: Any) -> List[str]:
             hay = hay.replace(needle, " ")
             if dept not in out:
                 out.append(dept)
+    return out
+
+
+def executive_departments(titles: Any) -> List[str]:
+    """Hunter departments that hold the executive buyers among ``titles`` ([] when there are none)."""
+    out: List[str] = []
+    for title in _as_list(titles):
+        hay = f" {normalize_text(title)} ".replace(" vice president ", " ")
+        if any(f" {phrase} " in hay for phrase in EXECUTIVE_TITLE_PHRASES) and "executive" not in out:
+            out.append("executive")
+        if any(f" {phrase} " in hay for phrase in MANAGEMENT_TITLE_PHRASES) and "management" not in out:
+            out.append("management")
     return out
 
 
@@ -201,6 +226,10 @@ class HunterFinder(ContactFinder):
             raw = _as_list(self.config.get("department"))
         elif self.config.get("use_buyer_departments", True):
             raw = _as_list(self.ctx.playbook.buyers.get("departments"))
+            if raw:
+                # Hunter's department is a hard filter: keep founders / CEOs / owners (Hunter
+                # department "executive") when they are among the buyer titles.
+                raw.extend(executive_departments(self.ctx.playbook.buyers.get("titles")))
         else:
             raw = []
         out: List[str] = []
@@ -227,6 +256,16 @@ class HunterFinder(ContactFinder):
     @staticmethod
     def _domain(company: Company) -> str:
         return company.domain or normalize_domain((company.data or {}).get("email_domain"))
+
+    def _get_json(self, url: str, params: Dict[str, Any]) -> Any:
+        try:
+            return self.http.get_json(url, params=params)
+        except HttpError as e:
+            # network errors quote the request URL - api_key query parameter included
+            body = redact(e.body or "")
+            if body != (e.body or ""):
+                raise HttpError(e.status, e.url, body) from None
+            raise
 
     # --- domain search ------------------------------------------------------------------
     def search_params(self, company: Company) -> Optional[Dict[str, Any]]:
@@ -263,7 +302,7 @@ class HunterFinder(ContactFinder):
         if params is None:
             return []
         params["api_key"] = self.secret()
-        resp = self.http.get_json(self._url("domain_search_path", DOMAIN_SEARCH_PATH), params=params)
+        resp = self._get_json(self._url("domain_search_path", DOMAIN_SEARCH_PATH), params)
         data = get_path(resp, "data")
         if not isinstance(data, dict):
             raise ValueError(f"hunter: unexpected domain-search response for {company.name}: {resp!r:.200}")
@@ -340,7 +379,7 @@ class HunterFinder(ContactFinder):
             return contact
         params.update({"first_name": first, "last_name": last, "api_key": self.secret()})
         try:
-            resp = self.http.get_json(self._url("email_finder_path", EMAIL_FINDER_PATH), params=params)
+            resp = self._get_json(self._url("email_finder_path", EMAIL_FINDER_PATH), params)
         except HttpError as e:
             if e.status in SOFT_STATUSES:
                 self.log.info("hunter: no email for %s at %s (HTTP %d)", contact.full_name, company.name, e.status)
@@ -370,5 +409,6 @@ class HunterFinder(ContactFinder):
         return contact
 
 
-__all__ = ["DEPARTMENT_SYNONYMS", "HUNTER_DEPARTMENTS", "HUNTER_SENIORITIES", "HunterFinder",
-           "hunter_departments", "linkedin_url", "verification_status"]
+__all__ = ["DEPARTMENT_SYNONYMS", "EXECUTIVE_TITLE_PHRASES", "HUNTER_DEPARTMENTS", "HUNTER_SENIORITIES",
+           "HunterFinder", "executive_departments", "hunter_departments", "linkedin_url",
+           "verification_status"]

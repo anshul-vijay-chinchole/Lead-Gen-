@@ -264,10 +264,12 @@ def test_ooo_return_date_resolution_rules():
 
 def test_weak_ooo_has_lower_confidence(make_ctx):
     ctx = make_ctx()
-    weak = classify_rules(R("Travelling now, back on Monday - let's chat then"), ctx)
+    weak = classify_rules(R("Travelling now, back on Monday."), ctx)
     strong = classify_rules(R("Out of office until Monday"), ctx)
     assert weak.category == strong.category == RC.OOO
     assert weak.confidence < 0.8 <= strong.confidence
+    # ... but a person answering ("let's chat then") is not an out-of-office
+    assert classify_rules(R("Travelling now, back on Monday - let's chat then"), ctx).category == RC.POSITIVE
 
 
 # --- referral ----------------------------------------------------------------------
@@ -453,7 +455,7 @@ def test_classify_ai_referral_fields(make_ctx):
     ctx = make_ctx()
     ctx.llm = FakeLLM(ai_json(category="referral", referral_name="Bob Jones",
                               referral_email="Bob.Jones@Acme.com"))
-    r = classify_ai(R("Please talk to Bob"), ctx)
+    r = classify_ai(R("Please talk to Bob - Bob.Jones@Acme.com"), ctx)
     assert (r.category, r.referral_name, r.referral_email) == (RC.REFERRAL, "Bob Jones", "bob.jones@acme.com")
 
 
@@ -1072,3 +1074,254 @@ def test_webhook_to_handle_reply_end_to_end(make_ctx, capsys):
     assert r.category == RC.POSITIVE and r.lead_id == lead.id
     assert r.body == "Sounds good, send me some times."
     assert "Positive reply: Jane Doe (Acme)" in capsys.readouterr().out
+
+
+# =============================================================================
+# Regressions (verified review findings)
+# =============================================================================
+
+@pytest.mark.parametrize("body", [
+    # a generic "for"/"before" after the request is not a time box
+    "Please remove me for good", "Unsubscribe me for good please", "Please unsubscribe me for all future emails",
+    "Stop emailing me before I report you as spam", "Don't contact me until further notice",
+    # an earlier "No" / "Not now" (another line or clause) does not negate the request
+    "No\n\nPlease unsubscribe", "Not now - please remove me", "Not now\nplease remove me",
+    "No - take me off your list", "No please remove me from your list",
+    # passive / indirect removal requests
+    "I would like to be removed from your list", "I'd love to be removed", "Keen to be removed",
+    "I want to be removed", "Please have me removed", "Please delete me from your database",
+    "Please remove jane@acme.com from your mailing list", "Please confirm I've been removed", "Please stop.",
+    "Sorry, I can't unsubscribe - the link is broken",
+    # vacation wording in a person's message does not hide the opt-out
+    "Please stop emailing me, I'm on vacation.",
+])
+def test_regression_unsubscribe_requests(make_ctx, body):
+    r = classify_rules(R(body), make_ctx())
+    assert r.category == RC.UNSUBSCRIBE, (body, r.category, r.summary)
+
+
+@pytest.mark.parametrize("body,category", [
+    ("Stop emailing me until Q1", RC.TIMING),            # a stop boxed in time is "not now"
+    ("Don't email me until January", RC.TIMING),
+    ("Don't reach out before March", RC.TIMING),
+    ("Please don't remove me, I'm interested", RC.POSITIVE),
+    ("I don't want to be removed, just not now", RC.TIMING),
+    ("Can the setup fee be removed?", RC.QUESTION),       # "be removed" about something else
+    ("Happy to take my team through it next week", RC.OTHER),
+    ("Please stop by our booth at the conference", RC.OTHER),
+])
+def test_regression_unsubscribe_guards(make_ctx, body, category):
+    r = classify_rules(R(body), make_ctx())
+    assert r.category == category, (body, r.category, r.summary)
+
+
+def test_regression_unsubscribe_with_vacation_is_handled_as_unsubscribe(make_ctx):
+    ctx = make_ctx()
+    seed_lead(ctx)
+    ctx.llm = FakeLLM(ai_json(category="unsubscribe", confidence=0.95))
+    r = handle_reply(R("Please stop emailing me, I'm on vacation.", received_at="t1"), ctx)
+    assert r.category == RC.UNSUBSCRIBE and ctx.store.is_suppressed(email="jane@acme.com")
+    assert ctx.store.due_followups(date(2030, 1, 1), "test") == []
+    r = handle_reply(R("Not now - please remove me", received_at="t2", frm="bob@beta.com"), ctx)
+    assert r.category == RC.UNSUBSCRIBE and ctx.store.is_suppressed(email="bob@beta.com")
+    assert ctx.store.due_followups(date(2030, 1, 1), "test") == []
+
+
+@pytest.mark.parametrize("body,category", [
+    ("Yes! Very interested. I'm on vacation next week, so let's talk the week after.", RC.POSITIVE),
+    ("Sounds great - I'm back in the office Monday, can we talk Tuesday?", RC.POSITIVE),
+    ("I'm OOO next week but yes, let's talk after", RC.POSITIVE),
+    ("No thanks, I'm on holiday anyway", RC.NEGATIVE),
+    # real auto-replies (no marker in the subject) are still out-of-office
+    ("Thanks for your email. I am on vacation until Oct 5 with limited access to email.", RC.OOO),
+    ("I'm on annual leave until 5 October. Please do not contact me until my return.", RC.OOO),
+    ("Hi, I'm currently out of the office until Monday. If urgent, call me on 555 0100.", RC.OOO),
+])
+def test_regression_human_reply_mentioning_vacation(make_ctx, body, category):
+    r = classify_rules(R(body), make_ctx())
+    assert r.category == category, (body, r.category, r.summary)
+
+
+def test_regression_auto_mode_sends_human_vacation_reply_to_ai(make_ctx):
+    ctx = make_ctx()
+    ctx.llm = FakeLLM(ai_json(category="positive"))
+    r = classify(R("Yes! Very interested. I'm on vacation next week, so let's talk the week after."), ctx)
+    assert r.classifier == "ai" and r.category == RC.POSITIVE and len(ctx.llm.calls) == 1
+    # an auto-reply marker still decides without the AI, whatever else the text says
+    r = classify(R("On leave. Please do not contact me.", subject="Automatic reply: Re: hi"), ctx)
+    assert (r.category, r.classifier) == (RC.OOO, "rules") and len(ctx.llm.calls) == 1
+
+
+@pytest.mark.parametrize("body", [
+    "Happy to chat, but please don't call my mobile - email me some times.",
+    "Yes, let's talk. Please don't send a calendar invite, just reply with times.",
+    "Sounds good. Please do not book Monday though.",
+])
+def test_regression_please_dont_inside_positive_reply(make_ctx, body):
+    ctx = make_ctx(replies={"classifier": "rules"})
+    seed_lead(ctx)
+    r = handle_reply(R(body), ctx)
+    assert r.category == RC.POSITIVE, (body, r.category)
+    assert not ctx.store.is_suppressed(email="jane@acme.com")
+
+
+@pytest.mark.parametrize("body", ["Please don't.", "No, please don't!", "Absolutely not.", "Definitely not.",
+                                  "Yeah, no.", "OK - no"])
+def test_regression_curt_declines_are_negative(make_ctx, body):
+    r = classify_rules(R(body), make_ctx())
+    assert r.category == RC.NEGATIVE, (body, r.category)
+
+
+@pytest.mark.parametrize("body", ["Sure, no rush - send me details when you can", "Yes, no problem",
+                                  "Sure, not a problem", "Absolutely, let's talk"])
+def test_regression_weak_positives_still_positive(make_ctx, body):
+    assert classify_rules(R(body), make_ctx()).category == RC.POSITIVE, body
+
+
+@pytest.mark.parametrize("body,name,email", [
+    ("You should speak to Bob Smith, our CFO. For invoices use accounts@acme.com.", "Bob Smith", ""),
+    ("Talk to Bob in finance.\nJane Doe\nChief Financial Officer, Acme\nE: jane.doe@acme.com", "Bob", ""),
+    # the address is still used when it is clearly the named person's
+    ("Speak to Bob Smith. His email is bob.smith@acme.com", "Bob Smith", "bob.smith@acme.com"),
+    ("Speak to Bob Smith, he runs finance: bob@acme.com", "Bob Smith", "bob@acme.com"),
+    ("Please forward to our finance team. finance@acme.com", "", "finance@acme.com"),
+])
+def test_regression_referral_pairs_name_with_its_own_address(make_ctx, body, name, email):
+    r = classify_rules(R(body), make_ctx(offer=OFFER))
+    assert (r.category, r.referral_name, r.referral_email) == (RC.REFERRAL, name, email)
+
+
+def test_regression_referral_to_unrelated_address_creates_no_lead(make_ctx):
+    ctx = make_ctx(offer=OFFER, replies={"classifier": "rules"})
+    seed_lead(ctx)
+    r = handle_reply(R("You should speak to Bob Smith, our CFO. For invoices use accounts@acme.com."), ctx)
+    assert "no address given" in r.action
+    assert ctx.store.find_lead_by_email("accounts@acme.com", "test") is None
+
+
+@pytest.mark.parametrize("ai_email", ["tom@northwind.io", "mailer-daemon@acme.com", "bob@acme.com",
+                                      "jane@acme.com"])
+def test_regression_ai_referral_email_must_be_a_third_party_address_in_the_reply(make_ctx, ai_email):
+    ctx = make_ctx(offer=OFFER, replies={"classifier": "ai"})
+    seed_lead(ctx)
+    ctx.llm = FakeLLM(ai_json(category="referral", referral_name="Bob", referral_email=ai_email,
+                              suggested_reply=""))
+    r = handle_reply(R("Speak to Bob, he runs finance. Or mail tom@northwind.io / mailer-daemon@acme.com",
+                       received_at="t"), ctx)
+    assert r.category == RC.REFERRAL and r.referral_email == ""
+    assert ctx.store.find_lead_by_email(ai_email, "test") is None or ai_email == "jane@acme.com"
+    assert "no address given" in r.action
+
+
+def test_regression_ai_referral_email_in_reply_is_kept(make_ctx):
+    ctx = make_ctx(offer=OFFER)
+    ctx.llm = FakeLLM(ai_json(category="referral", referral_name="", referral_email=""))
+    r = classify_ai(R("Speak to Bob. Our generic inbox is info@acme.com; Priya Patel (priya@acme.com) decides"), ctx)
+    assert (r.referral_name, r.referral_email) == ("Priya Patel", "priya@acme.com")
+
+
+def test_regression_followups_cancelled_on_unsubscribe_negative_and_bounce(make_ctx):
+    ctx = make_ctx(replies={"classifier": "rules"})
+    seed_lead(ctx)
+    handle_reply(R("I am out of the office until October 1.", subject="Automatic reply: Re: hi",
+                   received_at="t1"), ctx)
+    assert len(ctx.store.due_followups(date(2026, 10, 2), "test")) == 1
+    r = handle_reply(R("Please unsubscribe me.", received_at="t2"), ctx)
+    assert "cancelled 1 pending follow-up(s)" in r.action
+    assert ctx.store.due_followups(date(2030, 1, 1), "test") == []
+
+    seed_lead(ctx, email="sam@beta.com", name="Sam Lee", company="Beta", domain="beta.com")
+    handle_reply(R("Not right now - try us next quarter", frm="sam@beta.com", received_at="t3"), ctx)
+    handle_reply(R("Actually, not interested.", frm="sam@beta.com", received_at="t4"), ctx)
+    assert ctx.store.due_followups(date(2030, 1, 1), "test") == []
+
+    seed_lead(ctx, email="kim@gamma.com", name="Kim Ray", company="Gamma", domain="gamma.com")
+    handle_reply(R("Out of office until October 1.", frm="kim@gamma.com", subject="Automatic reply: hi",
+                   received_at="t5"), ctx)
+    handle_reply(R("Your message wasn't delivered to kim@gamma.com because the address couldn't be found",
+                   frm="mailer-daemon@googlemail.com", subject="Delivery Status Notification (Failure)",
+                   received_at="t6"), ctx)
+    assert ctx.store.due_followups(date(2030, 1, 1), "test") == []
+
+
+def test_regression_repeated_auto_replies_keep_one_followup(make_ctx):
+    ctx = make_ctx(replies={"classifier": "rules"})
+    lead = seed_lead(ctx)
+    for t in ("t1", "t2", "t3"):
+        handle_reply(R("Out of the office until October 12.", subject="Automatic reply: Re: hi", received_at=t), ctx)
+    due = ctx.store.due_followups(date(2026, 12, 1), "test")
+    assert [(d["due"], d["reason"], d["lead_id"]) for d in due] == [("2026-10-13", "ooo", lead.id)]
+    # a later "try us next quarter" replaces it; an OOO after that does not pull it earlier
+    handle_reply(R("Not right now - try us in Q1", received_at="t4"), ctx)
+    r = handle_reply(R("Out of the office until October 20.", subject="Automatic reply: Re: hi",
+                       received_at="t5"), ctx)
+    assert "already scheduled 2027-01-01 (timing)" in r.action
+    due = ctx.store.due_followups(date(2027, 12, 1), "test")
+    assert [(d["due"], d["reason"]) for d in due] == [("2027-01-01", "timing")]
+
+
+def test_regression_bounce_for_unknown_address_does_not_touch_colleagues_lead(make_ctx):
+    ctx = make_ctx(replies={"classifier": "rules"})
+    lead = seed_lead(ctx)
+    r = handle_reply(R("Your message wasn't delivered to bob.old@acme.com because the address couldn't be "
+                       "found", frm="mailer-daemon@googlemail.com",
+                       subject="Delivery Status Notification (Failure)", received_at="t"), ctx)
+    assert r.category == RC.BOUNCE and r.lead_id == ""
+    assert stage_of(ctx, lead) == Stage.EXPORTED and not ctx.store.is_suppressed(email="jane@acme.com")
+    assert ctx.store.is_suppressed(email="bob.old@acme.com")
+
+
+def test_regression_load_replies_csv_with_huge_body(tmp_path):
+    import csv as _csv
+
+    p = tmp_path / "big.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["from_email", "body"])
+        w.writerow(["bob@acme.com", "Please unsubscribe me"])
+        w.writerow(["jane@acme.com", '<div>Yes</div><img src="data:image/png;base64,' + "A" * 200_000 + '">'])
+    limit = _csv.field_size_limit()
+    rows = load_replies_csv(p)
+    assert [r.from_email for r in rows] == ["bob@acme.com", "jane@acme.com"]
+    assert _csv.field_size_limit() == limit  # the global csv setting is restored
+
+
+def test_regression_webhook_sender_key_with_body_dict():
+    r = parse_webhook_payload({"sender": "jane@acme.com", "subject": "Re: hi", "body": {"text": "Please unsubscribe me"}})
+    assert (r.from_email, r.body, r.subject) == ("jane@acme.com", "Please unsubscribe me", "Re: hi")
+    r = parse_webhook_payload({"sender_email": "Jane <jane@acme.com>", "body": {"html": "<p>Yes</p>"}})
+    assert r.from_email == "jane@acme.com" and r.body == "<p>Yes</p>"
+    # wrapped events still unwrap
+    r = parse_webhook_payload({"event": "reply", "body": {"data": {"sender": "a@b.com", "text": "hi"}}})
+    assert (r.from_email, r.body) == ("a@b.com", "hi")
+
+
+def test_regression_far_future_dates_do_not_crash(make_ctx):
+    ctx = make_ctx(replies={"classifier": "rules"})
+    horizon = TODAY + timedelta(days=3 * 365 + 1)
+    r = classify_rules(R("Try again after 9999-12-31"), ctx)
+    assert r.category == RC.TIMING and date.fromisoformat(r.follow_up_date) <= horizon + timedelta(days=1)
+    r = handle_reply(R("Out of office until December 31, 9999", received_at="t1"), ctx)
+    assert r.category == RC.OOO and "follow-up scheduled" in r.action
+    ctx = make_ctx(replies={"classifier": "ai"})
+    ctx.llm = FakeLLM(ai_json(category="ooo", follow_up_date="9999-12-31"),
+                      ai_json(category="timing", follow_up_date="9999-12-30", suggested_reply=""))
+    r = handle_reply(R("away", received_at="t2"), ctx)
+    assert r.follow_up_date == horizon.isoformat()
+    r = handle_reply(R("later", received_at="t3", frm="bob@beta.com"), ctx)
+    assert r.follow_up_date == horizon.isoformat()
+    assert parse_webhook_payload({"from_email": "a@b.com", "body": "hi", "timestamp": 10 ** 400}) is not None
+
+
+@pytest.mark.parametrize("first,greeting", [("McKenzie", "Hi McKenzie,"), ("Jean-Luc", "Hi Jean-Luc,"),
+                                            ("DeShawn", "Hi DeShawn,"), ("mckenzie", "Hi Mckenzie,"),
+                                            ("JANE", "Hi Jane,"), ("  ", "Hi there,")])
+def test_regression_greeting_keeps_name_casing(make_ctx, first, greeting):
+    ctx = make_ctx()
+    lead = Lead(company=Company(name="Acme", domain="acme.com"),
+                contact=Contact(first_name=first, last_name="Smith", email="m@acme.com"))
+    text = suggest_reply(Reply(from_email="m@acme.com", body="x", category=RC.POSITIVE), lead, ctx)
+    assert text.splitlines()[0] == greeting
+    ref = suggest_reply(Reply(from_email="m@acme.com", body="", category=RC.REFERRAL,
+                              referral_name="  ", referral_email="li.wei@acme.com"), lead, ctx)
+    assert ref.startswith("Hi Li,")

@@ -19,20 +19,26 @@ referral     Points us to someone else ("speak to Jane - jane@acme.com").
                 suppressed or already a lead; alert "referral".
 timing       Not now, maybe later ("try us next quarter").
              -> REPLIED; follow-up scheduled on ``follow_up_date`` (or today +
-                ``replies.timing_default_days``).
+                ``replies.timing_default_days``), replacing any pending one for
+                that person (one open follow-up per person; the newest answer wins).
 ooo          Out-of-office auto-reply; ``follow_up_date`` = the return date.
              -> no stage change; follow-up the day after the return date (or
-                today + ``replies.ooo_default_days``).
+                today + ``replies.ooo_default_days``) - unless a later follow-up
+                is already pending for that person (repeated auto-replies add none).
 negative     Not interested / not a fit / already covered.
-             -> REPLIED then LOST; the address is suppressed ("not interested").
+             -> REPLIED then LOST; the address is suppressed ("not interested")
+                and its pending follow-ups are cancelled.
 unsubscribe  Asks to be removed / stop emailing / opt out.
-             -> LOST; the address is suppressed ("unsubscribed").
+             -> LOST; the address is suppressed ("unsubscribed") and its pending
+                follow-ups are cancelled.
 bounce       Delivery failure. The sender is a mail server (mailer-daemon), so
              the bounced address is read from the notice body (Final-Recipient
              header, "wasn't delivered to x@y", Outlook/Postfix formats, ...),
              preferring an address that belongs to a known lead.
-             -> LOST; the address is suppressed ("bounced") and cached as
-                ``invalid`` in the verification cache.
+             -> LOST (only the lead with exactly that address - never a colleague
+                matched by domain); the address is suppressed ("bounced"), cached
+                as ``invalid`` in the verification cache and its pending
+                follow-ups are cancelled.
 other        Anything else (acknowledgements, unclear).
              -> REPLIED - except automated delivery notices ("delivery
                 delayed, will retry"), which change nothing.
@@ -47,13 +53,21 @@ body) is not processed twice, so webhook retries and CSV re-imports are safe.
 Classifiers (``replies.classifier``)
 ------------------------------------
 rules  Deterministic keyword/regex rules (``classify_rules``). Precedence:
-       bounce > ooo > unsubscribe > referral > negative > timing > positive >
-       question > other. Negations win ("not interested" / "not sure" are never
-       positive; the negation scope ends at punctuation or "but"). A soft
-       decline with a concrete time ("no thanks - try us next quarter") is
-       timing; a hard one ("not a fit", "please don't") stays negative.
+       bounce > auto-reply ooo (auto-responder marker in the subject or body) >
+       unsubscribe > ooo (vacation wording / return date, unless the reply also
+       answers: "yes, let's talk", "not interested") > referral > negative >
+       timing > positive > question > other. Negations win ("not interested" /
+       "not sure" are never positive; the negation scope ends at punctuation or
+       "but"). A removal request is only negated by a "don't"/"never" right
+       before it, and only a date or a return after "until/before" turns it
+       into timing ("don't email me until Q1"). A soft decline with a concrete
+       time ("no thanks - try us next quarter") is timing; a hard one ("not a
+       fit", a bare "please don't.") stays negative. A referral names an
+       address only when it is clearly that person's (next to the name, in the
+       referral sentence, or matching the name).
 ai     The playbook's LLM (``writer.provider``/``model``) via ``classify_ai``.
-       The answer is validated (category, YYYY-MM-DD date); any error or
+       The answer is validated (category, YYYY-MM-DD date; a referral address
+       must be a third-party address that appears in the reply); any error or
        malformed answer falls back to the rules.
 auto   (default) Machine-generated mail - bounces, clear out-of-office
        replies, explicit unsubscribes, anything from a mailer-daemon - is
@@ -64,7 +78,8 @@ Dates: relative expressions ("back on October 3", "returning 3rd October",
 "until 10/03/2026", "until Monday", "next quarter", "in 3 weeks", "after
 Q1") resolve against ``ctx.today`` to the next occurrence. Numeric dates are
 read both ways (month/day and day/month) and the nearest plausible one wins,
-so nothing depends on the sender's country.
+so nothing depends on the sender's country. Dates (parsed or from the AI) are
+capped at today + ``MAX_FOLLOW_UP_DAYS`` (about 3 years).
 
 Config keys (``playbook.replies``)
 ----------------------------------
@@ -89,6 +104,8 @@ import copy
 import csv
 import html
 import re
+import sys
+from bisect import bisect_right
 from dataclasses import fields, replace
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr
@@ -113,6 +130,8 @@ MAX_STORED_RAW_CHARS = 2000
 #: Longer inputs are cut before parsing (what a person wrote is at the top; this
 #: bounds the work done on untrusted webhook payloads).
 MAX_INPUT_CHARS = 500_000
+#: Parsed/AI follow-up and return dates are capped at today + this many days.
+MAX_FOLLOW_UP_DAYS = 3 * 365 + 1
 
 # Linear-time address finder: a match may only start at the beginning of a run of
 # local-part characters, and parts are length-capped (RFC 5321), so long junk
@@ -362,7 +381,10 @@ class _Text:
     """Token view of a text: whole-word phrase search with negation awareness."""
 
     def __init__(self, text: Any):
-        self.tokens = _tokens(text)
+        self.prepped = _prep(text)
+        found = list(_TOKEN.finditer(self.prepped))
+        self.tokens = [m.group(0) for m in found]
+        self.starts = [m.start() for m in found]  # offset of each token in ``prepped``
         self.joined = " " + " ".join(self.tokens) + " "
 
     def __bool__(self) -> bool:
@@ -377,20 +399,25 @@ class _Text:
                 return True
         return False
 
-    def find(self, phrase: str, negatable: bool = False,
-             unless_next: Iterable[str] = ()) -> bool:
+    def spans(self, phrase: str) -> Iterable[Tuple[int, int]]:
+        """(first token index, index after the last token) of each whole-word match."""
         pat = _phrase_re(phrase)
         if pat is None:
-            return False
-        stop_next = set(unless_next)
+            return
+        pos = spaces = 0  # counted incrementally: linear even with many matches
         for m in pat.finditer(self.joined):
-            start = self.joined.count(" ", 0, m.start()) - 1
+            spaces += self.joined.count(" ", pos, m.start())
+            pos = m.start()
+            yield spaces - 1, spaces + self.joined.count(" ", m.start(), m.end())
+
+    def find(self, phrase: str, negatable: bool = False,
+             unless_next: Iterable[str] = ()) -> bool:
+        stop_next = set(unless_next)
+        for start, nxt in self.spans(phrase):
             if negatable and self._negated(start):
                 continue
-            if stop_next:
-                nxt = self.joined.count(" ", 0, m.end())
-                if any(t in stop_next for t in self.tokens[nxt:nxt + 2]):
-                    continue
+            if stop_next and any(t in stop_next for t in self.tokens[nxt:nxt + 2]):
+                continue
             return True
         return False
 
@@ -446,6 +473,18 @@ def _safe_date(y: int, m: int, d: int) -> Optional[date]:
         return date(y, m, d)
     except (ValueError, OverflowError):
         return None
+
+
+def _horizon(today: date) -> date:
+    """Latest follow-up date we schedule ("back on December 31, 9999" is not a plan)."""
+    try:
+        return today + timedelta(days=MAX_FOLLOW_UP_DAYS)
+    except OverflowError:
+        return date.max - timedelta(days=366)
+
+
+def _clamp(d: date, today: date) -> date:
+    return min(d, _horizon(today))
 
 
 def _next_occurrence(m: int, d: int, today: date, grace: int) -> Optional[date]:
@@ -551,7 +590,7 @@ def _dates_after(trigger: Pattern[str], text: str, today: date, grace: int
         at = _skip_fillers(text, m.end())
         got = _parse_date_at(text, at, today, grace)
         if got:
-            out.append((m.start(), got[0], got[2], m.group(0).lower()))
+            out.append((m.start(), _clamp(got[0], today), got[2], m.group(0).lower()))
     return out
 
 
@@ -563,7 +602,7 @@ def _scan_unambiguous_dates(text: str, today: date, grace: int) -> List[date]:
             continue  # "24/7", "3/4" ... too ambiguous without a trigger word
         got = _parse_date_at(text, m.start(), today, grace, allow_weekday=False)
         if got:
-            out.append(got[0])
+            out.append(_clamp(got[0], today))
     return out
 
 
@@ -678,7 +717,7 @@ def timing_follow_up(text: str, today: date, default_days: int = DEFAULT_TIMING_
     for pat, fn in _PERIODS:
         for m in pat.finditer(low):
             try:
-                hits.append((m.start(), fn(m, today)))
+                hits.append((m.start(), _clamp(fn(m, today), today)))
             except (ValueError, OverflowError):
                 continue
     future = [(p, d) for p, d in hits if d > today]
@@ -724,6 +763,11 @@ _OOO_STRONG = (
     "limited access to e mail", "limited email access", "no access to email",
     "no access to my email", "intermittent access", "ooo",
 )
+# Wording only an auto-responder uses: a reply carrying it is an out-of-office even when it
+# also says something else ("Automatic reply: ... please do not contact me until my return").
+_OOO_AUTO = ("automatic reply", "auto reply", "autoreply", "auto response", "automatic response",
+             "autoresponder", "auto responder", "automated reply", "automated response",
+             "this is an automated")
 # Checked only in the subject part *before* any "Re:"/"Fwd:" (our own subject line
 # may contain anything, e.g. "Holiday hiring push").
 _OOO_SUBJECT = ("automatic reply", "auto reply", "autoreply", "auto response", "automatic response",
@@ -735,15 +779,43 @@ _BARE_STOP = re.compile(r"^\W*(?:stop|remove|remove me|unsubscribe|opt out|opt-o
 _OOO_LEAVE = re.compile(r"\bon\s+(?:[a-z]+\s+){0,2}leave\b"
                         r"|\b(?:am|be|is|are|currently)\s+(?:out|off|away)\s+until\b")
 _UNSUBSCRIBE = (
-    "unsubscribe", "unsub", "remove me", "remove us", "remove my email", "remove my address",
-    "remove this email", "take me off", "take us off", "stop emailing", "stop sending",
+    "unsubscribe", "unsubscribed", "unsub", "remove me", "remove us", "remove my email", "remove my address",
+    "remove my e mail", "remove my name", "remove my details", "remove my contact", "remove my data",
+    "remove my info", "remove my information", "remove our email", "remove our address",
+    "remove our details", "remove our contact", "remove our data", "remove our company",
+    "remove this email", "remove this address", "take me off", "take us off",
+    "have me removed", "have us removed", "get me removed", "get us removed", "delete me", "delete us",
+    "delete my data", "delete my details", "delete my email", "delete my contact", "delete my info",
+    "delete my information", "delete my personal", "delete my address", "delete my record",
+    "delete our data", "delete our details", "delete our contact", "delete our information",
+    "erase my", "stop emailing", "stop sending",
     "stop contacting", "stop spamming", "stop messaging", "do not contact", "do not email",
-    "do not message", "do not reach out", "do not write", "opt out", "opt me out", "no more emails",
+    "do not message", "do not reach out", "do not write", "do not follow up", "do not send me any",
+    "do not send me more", "do not send me anything", "do not send any more", "do not send more",
+    "do not send any further", "do not send further", "opt out", "opt me out", "no more emails",
     "no further emails", "no more contact", "never contact", "never email", "leave me alone",
     "off your list", "off your mailing list", "this is spam",
 )
+# "(I'd like to / keen to / can I) be removed", "please confirm we've been unsubscribed".
+_PASSIVE_REMOVAL = frozenset({"removed", "unsubscribed", "deleted"})
+_PASSIVE_WANT = frozenset({"like", "love", "keen", "want", "wish", "prefer", "ask", "asking", "asked",
+                           "need", "request", "requesting", "happy", "glad"})
+# "remove jane@acme.com from your mailing list", "take my colleague off this sequence".
+_UNSUB_FROM_LIST = re.compile(
+    r"\b(?:remove|removed|delete|deleted|drop|take|taken)\b(?:[^.!?;]|[.!?](?=\S)){0,60}?\b(?:from|off)\s+"
+    r"(?:(?:your|this|these|all\s+(?:your|future)|any\s+(?:further|future))\s+(?:\w+\s+){0,2}"
+    r"(?:lists?|database|db|crm|mailings?|e?mails|sequences?|campaigns?|outreach|records|contacts)"
+    r"|the\s+(?:mailing|email|e\s+mail|contact|distribution|marketing|sales|prospect|prospecting)\s+lists?)\b")
+# "Please stop." / "Stop it!" / "Stop, please" (a whole clause - not "please stop by").
+_PLEASE_STOP = re.compile(r"(?:^|[.!?;,:]\s*|\s[-–—]\s*)(?:please\s+)?stop(?:\s+(?:it|this|that|now|please|already))*"
+                          r"\s*(?:[.!?;,]|$)")
+# A request to stop is deferred, not an opt-out, only when it names a time or a return:
+# "don't reach out until Q1", "stop emailing me until I'm back".
+_UNSUB_DEFER = frozenset({"until", "till", "til", "before"})
+_UNSUB_OBJECT = frozenset({"me", "us", "again", "please", "anymore"})
+_RETURN_WORDS = re.compile(r"\b(?:back|return|returns|returning)\b")
 _NEG_HARD = (
-    "not a fit", "not a good fit", "not the right fit", "not a match", "please do not",
+    "not a fit", "not a good fit", "not the right fit", "not a match",
     "we use an in house", "we have an in house", "we do this in house", "we do it in house",
     "handle this in house", "handled in house", "not relevant", "already have someone",
     "already have a provider", "already have an agency", "already have a partner",
@@ -757,6 +829,12 @@ _NEG_SOFT = (
 )
 _NEG_INTEREST = re.compile(r"\b(?:not|never|no\s+longer|nor)\s+(?:[a-z]+\s+){0,4}interested\b")
 _BARE_NO = re.compile(r"^\W*(?:no|nope|nah|no thanks|no thank you)\W*$", re.I)
+# A bare "Please don't." / "No, please don't!" (a whole clause, not "please don't call my mobile").
+_PLEASE_DONT = re.compile(r"(?:^|[.!?;,:]\s*|\s[-–—]\s*)(?:no\s*[,.!\-]?\s*)?please\s+do\s+not\s*(?:[.!?;]|$)")
+# Curt declines built from a "positive" word: "Absolutely not." / "Yeah, no." / "OK - no".
+_CURT_NO = re.compile(
+    r"\b(?:absolutely|definitely|certainly|surely|hell|god)\s+not\s*(?:[.!?;,]|$)"
+    r"|\b(?:yes|yeah|yep|ok|okay|sure|um|umm|well)\s*[,.!\-–—]*\s*(?:no|nope|nah)\s*(?:[.!?;]|$)")
 _TIMING_PHRASES = (
     "not right now", "not now", "not at the moment", "not at this time", "not at this stage",
     "not at this point", "not yet", "maybe later", "not the right time", "bad timing", "bad time",
@@ -784,6 +862,19 @@ _POSITIVE_STRONG = (
     "give me a call", "more info", "more information", "more details", "go ahead",
 )
 _POSITIVE_WEAK = ("yes", "sure", "definitely", "absolutely", "ok", "okay", "yep", "yeah")
+# Things a person writes and an auto-reply never does: when a reply mentioning a vacation
+# or a return date also says one of these, it is a human answer, not an out-of-office.
+_HUMAN_POSITIVE = (
+    "sounds good", "sounds great", "sounds interesting", "let's chat", "let's talk", "let's connect",
+    "let's do it", "let's set up", "let's schedule", "let's book", "happy to chat", "happy to talk",
+    "happy to connect", "happy to hop on", "happy to jump on", "tell me more", "am interested",
+    "we are interested", "be interested", "very interested", "definitely interested",
+    "really interested", "quite interested",
+)
+_HUMAN_DECLINE = ("not interested", "no thanks", "no thank you", "no interest", "not a fit",
+                  "not a good fit", "not the right fit", "not for us", "will pass", "going to pass",
+                  "we are all set")
+_HUMAN_OPENERS = frozenset({"yes", "yeah", "yep", "sure", "absolutely", "definitely"})
 _QUESTION_PHRASES = ("how much", "pricing", "price", "cost", "costs", "how does", "how do you",
                      "can you explain", "could you explain", "what do you charge", "rates", "fees")
 _URL = re.compile(r"https?://\S+|www\.\S+", re.I)
@@ -934,11 +1025,12 @@ def _is_machine_address(email: str) -> bool:
 
 def _third_party_emails(text: str, reply: Reply, ctx: Any) -> List[Tuple[int, str]]:
     own = _own_domain(ctx)
+    sender = (reply.from_email or "").strip().lower()
     out: List[Tuple[int, str]] = []
     seen = set()
     for m in _EMAIL_RE.finditer(text):
         e = m.group(0).strip(".").lower()
-        if e in seen or e == reply.from_email or not is_valid_email(e) or _is_machine_address(e):
+        if e in seen or e == sender or not is_valid_email(e) or _is_machine_address(e):
             continue
         if own and normalize_domain(e) == own:
             continue
@@ -964,6 +1056,22 @@ def _name_next_to_email(text: str, pos: int) -> str:
             break
         tail.insert(0, w)
     return " ".join(tail)
+
+
+_SENTENCE_END = re.compile(r"[.!?;](?:\s|$)|\n")
+
+
+def _email_matches_name(email: str, name: str) -> bool:
+    """'bob.smith@x' / 'bob@x' / 'bsmith@x' plausibly belong to 'Bob Smith'."""
+    pieces = [p for p in re.split(r"[^a-z]+", (email or "").split("@", 1)[0].lower()) if p]
+    parts = [re.sub(r"[^a-z]", "", strip_accents(w).lower()) for w in (name or "").split()]
+    parts = [p for p in parts if len(p) >= 2]
+    if not pieces or not parts:
+        return False
+    first, last, local = parts[0], parts[-1], "".join(pieces)
+    if pieces[0] == first or local == first:
+        return True
+    return len(parts) > 1 and local in (first + last, first[0] + last, last + first, last + first[0], last)
 
 
 def extract_referral(text: str, reply: Reply, ctx: Any) -> Optional[Tuple[str, str]]:
@@ -999,20 +1107,32 @@ def extract_referral(text: str, reply: Reply, ctx: Any) -> Optional[Tuple[str, s
         has_trigger = True
     if not has_trigger or not (emails or names):
         return None
+    trigger_name = sorted(names)[0][1] if names else ""
     email = ""
     if emails:
         if trigger_positions:
             first_trigger = min(trigger_positions)
-            after = [e for p, e in emails if p >= first_trigger - 80]
-            email = after[0] if after else emails[0][1]
+            after = [(p, e) for p, e in emails if p >= first_trigger - 80]
+            if trigger_name:
+                # A named person is only paired with an address that is clearly theirs: next
+                # to a name, in the same sentence as the referral cue, or matching the name -
+                # not "For invoices use accounts@..." or the signature's own address.
+                bounds = [m.end() for m in _SENTENCE_END.finditer(text)]
+                cue_sentences = {bisect_right(bounds, p) for p in trigger_positions}
+                after = [(p, e) for p, e in after
+                         if _name_next_to_email(text, p) or bisect_right(bounds, p) in cue_sentences
+                         or _email_matches_name(e, trigger_name)]
+                email = after[0][1] if after else ""
+            else:
+                email = after[0][1] if after else emails[0][1]
         else:
             email = emails[0][1]
     name = ""
     if email:
         pos = next(p for p, e in emails if e == email)
         name = _name_next_to_email(text, pos)
-    if not name and names:
-        name = sorted(names)[0][1]
+    if not name:
+        name = trigger_name
     if not name and email:
         name = name_from_email(email)
     return name, email
@@ -1099,6 +1219,105 @@ def _fmt_date(d: date, today: date) -> str:
     return s if d.year == today.year else f"{s}, {d.year}"
 
 
+def _unsub_negated(tokens: Sequence[str], idx: int) -> bool:
+    """Only an explicit "don't"/"never" right before a removal request negates it
+    ("please don't remove me", "no need to unsubscribe me"). A "No" / "Not now" earlier in
+    the reply does not ("No - take me off your list", "Not now\\nplease remove me")."""
+    if idx >= 1 and tokens[idx - 1] in ("not", "never"):
+        # "I can't unsubscribe" / "couldn't unsubscribe" is a complaint: still an opt-out
+        return not (idx >= 2 and tokens[idx - 2] in ("can", "could"))
+    return (idx >= 3 and tokens[idx - 1] == "to" and tokens[idx - 3] in ("not", "never", "no")
+            and tokens[idx - 2] in ("need", "have", "want", "ask", "asked", "mean"))
+
+
+def _unsub_deferred(t: "_Text", end: int, today: date) -> bool:
+    """A stop request boxed in time: "don't reach out until Q1", "stop emailing me until
+    I'm back". Only "until/till/before" + a date or a return counts - "stop emailing me
+    before I report you as spam" or "... until further notice" is still an opt-out."""
+    toks = t.tokens
+    j = end
+    while j < len(toks) and j < end + 3 and toks[j] in _UNSUB_OBJECT:
+        j += 1
+    if j >= len(toks) or toks[j] not in _UNSUB_DEFER:
+        return False
+    rest = t.prepped[t.starts[j] + len(toks[j]):][:120]
+    cut = re.search(r"[.!?;](?:\s|$)|\n", rest)
+    rest = rest[:cut.start()] if cut else rest
+    return bool(_RETURN_WORDS.search(rest)) or timing_follow_up("until " + rest, today)[1]
+
+
+def _passive_removal(toks: Sequence[str], i: int) -> bool:
+    """``toks[i:i+2]`` is "be/been removed|unsubscribed|deleted": is it a request about
+    the writer ("I'd like to be removed", "can I be unsubscribed", "keen to be removed")?"""
+    prev = toks[i - 1] if i >= 1 else ""
+    before = toks[i - 2] if i >= 2 else ""
+    if prev in ("i", "we"):
+        return True
+    if prev in ("please", "kindly", "just", "have", "has", "am", "are") and before in ("i", "we"):
+        return True
+    if prev == "to" and before in _PASSIVE_WANT:
+        return not (i >= 3 and toks[i - 3] in ("not", "never", "no"))
+    return False
+
+
+def _unsubscribe_request(t: "_Text", low: str, today: date) -> Tuple[bool, bool]:
+    """(asks to be removed, asked only to pause until a date) for a reply's token view."""
+    deferred = False
+    for phrase in _UNSUBSCRIBE:
+        for start, end in t.spans(phrase):
+            if _unsub_negated(t.tokens, start):
+                continue
+            if _unsub_deferred(t, end, today):
+                deferred = True
+                continue
+            return True, False
+    toks = t.tokens
+    for i in range(len(toks) - 1):
+        if toks[i] in ("be", "been") and toks[i + 1] in _PASSIVE_REMOVAL and _passive_removal(toks, i):
+            return True, False
+    if _UNSUB_FROM_LIST.search(low) or _PLEASE_STOP.search(low):
+        return True, False
+    return False, deferred
+
+
+def _human_answer(t: "_Text", low: str) -> bool:
+    """True when a reply says something only a person writes (yes / let's talk / not
+    interested), so vacation wording or a return date in it does not make it an OOO."""
+    if t.first(_HUMAN_POSITIVE, negatable=True) or t.first(_HUMAN_DECLINE):
+        return True
+    if _NEG_INTEREST.search(low) or _CURT_NO.search(low):
+        return True
+    words = [w for w in t.tokens if w not in _PUNCT]
+    return bool(words) and words[0] in _HUMAN_OPENERS and (len(words) < 2 or words[1] not in ("not", "no"))
+
+
+def _weak_positive(t: "_Text") -> Optional[str]:
+    """A bare "yes"/"sure"/"ok" - unless negated before or after ("Absolutely not.", "Yeah, no.")."""
+    toks = t.tokens
+    for p in _POSITIVE_WEAK:
+        for start, end in t.spans(p):
+            if t._negated(start):
+                continue
+            k = end
+            while k < len(toks) and toks[k] in _PUNCT:
+                k += 1
+            nxt = toks[k] if k < len(toks) else ""
+            if nxt == "not" or (nxt in ("no", "nope", "nah") and (k + 1 >= len(toks) or toks[k + 1] in _PUNCT)):
+                continue
+            return p
+    return None
+
+
+def _as_ooo(reply: Reply, text: str, subject: str, today: date, confidence: float) -> Reply:
+    ret = ooo_return_date(text, today) or ooo_return_date(subject, today)
+    reply.category = RC.OOO
+    reply.confidence = confidence
+    reply.follow_up_date = ret.isoformat() if ret else None
+    reply.summary = (f"Out of office until {_fmt_date(ret, today)}" if ret
+                     else "Out of office (no return date given)")
+    return reply
+
+
 def classify_rules(reply: Reply, ctx: Any) -> Reply:
     """Classify with keyword/regex rules (see module docstring). Mutates + returns ``reply``."""
     today = _today(ctx)
@@ -1129,29 +1348,29 @@ def classify_rules(reply: Reply, ctx: Any) -> Reply:
         return reply
 
     # 2. out of office -----------------------------------------------------------------------
-    low = _prep(text)
-    strong = subj.first(_OOO_SUBJECT) or t.first(_OOO_STRONG) or _OOO_LEAVE.search(low)
+    # An auto-responder marker ("Automatic reply:" subject, "this is an automated response")
+    # decides at once. Vacation wording / a return date without such a marker may come from
+    # a person, so an opt-out or a clear answer in the same reply wins over it (step 3b).
+    low = t.prepped
+    if subj.first(_OOO_SUBJECT) or t.first(_OOO_AUTO):
+        return _as_ooo(reply, text, subject, today, 0.9)
+    ooo_words = t.first(_OOO_STRONG) or _OOO_LEAVE.search(low)
     dated = bool(_dates_after(_OOO_BACK_TRIGGER, low, today, grace=30))
-    if strong or dated:
-        ret = ooo_return_date(text, today) or ooo_return_date(subject, today)
-        reply.category = RC.OOO
-        reply.confidence = 0.9 if strong else 0.6
-        reply.follow_up_date = ret.isoformat() if ret else None
-        reply.summary = (f"Out of office until {_fmt_date(ret, today)}" if ret
-                         else "Out of office (no return date given)")
-        return reply
 
     if not t and not subj:
         reply.summary = "Empty reply"
         return reply
 
     # 3. unsubscribe ---------------------------------------------------------------------------
-    guard = ("until", "till", "before", "for")
-    if (t.first(_UNSUBSCRIBE, negatable=True, unless_next=guard) or _BARE_STOP.match(text)
-            or subj.first(("unsubscribe", "remove me"))):
+    unsub, deferred = _unsubscribe_request(t, low, today)
+    if unsub or _BARE_STOP.match(text) or subj.first(("unsubscribe", "remove me")):
         reply.category, reply.confidence = RC.UNSUBSCRIBE, 0.9
         reply.summary = _summ("Asked to be removed", text)
         return reply
+
+    # 3b. out of office without an auto-reply marker ------------------------------------------
+    if (ooo_words or dated) and not _human_answer(t, low):
+        return _as_ooo(reply, text, subject, today, 0.9 if ooo_words else 0.6)
 
     # 4. referral ----------------------------------------------------------------------------------
     ref = extract_referral(text, reply, ctx)
@@ -1166,10 +1385,11 @@ def classify_rules(reply: Reply, ctx: Any) -> Reply:
 
     # 5/6. negative vs timing -------------------------------------------------------------------------
     default_days = _cfg_days(ctx, "timing_default_days", DEFAULT_TIMING_DAYS)
-    hard = t.first(_NEG_HARD, unless_next=("hesitate", "worry"))
+    hard = t.first(_NEG_HARD, unless_next=("hesitate", "worry")) or (_PLEASE_DONT.search(low) and "please do not")
     soft = (t.first(_NEG_SOFT, unless_next=("to",)) or (_NEG_INTEREST.search(low) and "not interested")
-            or (_BARE_NO.match(text) and "no"))
-    timing_hit = t.first(_TIMING_PHRASES, negatable=True) or _TIMING_RE.search(low)
+            or (_BARE_NO.match(text) and "no") or (_CURT_NO.search(low) and "no"))
+    timing_hit = (t.first(_TIMING_PHRASES, negatable=True) or _TIMING_RE.search(low)
+                  or (deferred and "until"))
     when, explicit = timing_follow_up(text, today, default_days)
     if hard or (soft and not (timing_hit and explicit)):
         reply.category, reply.confidence = RC.NEGATIVE, 0.85 if hard else 0.8
@@ -1183,7 +1403,7 @@ def classify_rules(reply: Reply, ctx: Any) -> Reply:
 
     # 7. positive ----------------------------------------------------------------------------------------
     pos = t.first(_POSITIVE_STRONG, negatable=True)
-    weak = None if pos else t.first(_POSITIVE_WEAK, negatable=True)
+    weak = None if pos else _weak_positive(t)
     if pos or weak:
         reply.category, reply.confidence = RC.POSITIVE, 0.75 if pos else 0.55
         reply.summary = _summ("Interested", text)
@@ -1342,6 +1562,17 @@ def classify_ai(reply: Reply, ctx: Any) -> Reply:
         ctx.log.warning("AI reply classifier failed (%s); falling back to rules", e)
         return classify_rules(reply, ctx)
 
+    if follow_up and date.fromisoformat(follow_up) > _horizon(today):
+        follow_up = _horizon(today).isoformat()
+    if ref_email and category == RC.REFERRAL:
+        # Same filters as the rules (not the sender, not us, not a daemon) and it must really
+        # be in the reply: a guessed "bob@acme.com" for "speak to Bob" is never used.
+        seen = {e for _, e in _third_party_emails(f"{text}\n{reply.subject or ''}", reply, ctx)}
+        if ref_email not in seen:
+            ctx.log.info("AI referral address %s is not a third-party address in the reply; ignored",
+                         ref_email)
+            ref_email = ""
+
     _reset(reply)
     reply.classifier = "ai"
     reply.category = category
@@ -1351,9 +1582,10 @@ def classify_ai(reply: Reply, ctx: Any) -> Reply:
     if category == RC.REFERRAL:
         if not ref_email:
             ref = extract_referral(text, reply, ctx)
-            if ref:
+            if ref and ref[1] and (ref[0] or not ref_name or _email_matches_name(ref[1], ref_name)):
+                ref_name, ref_email = ref[0] or ref_name, ref[1]
+            elif ref:
                 ref_name = ref_name or ref[0]
-                ref_email = ref[1]
         reply.referral_name, reply.referral_email = ref_name, ref_email
     if category == RC.TIMING:
         if not follow_up:
@@ -1402,9 +1634,21 @@ def classify(reply: Reply, ctx: Any) -> Reply:
 # suggest_reply
 # =============================================================================
 
+def _greeting_name(name: Any) -> str:
+    """First word of a name for "Hi <name>,": keeps "McKenzie" / "Jean-Luc" / "DeShawn" as
+    written and only fixes all-lower/all-upper input ("mckenzie" -> "Mckenzie")."""
+    words = str(name or "").split()
+    if not words:
+        return ""
+    n = words[0]
+    return n.title() if (n.islower() or n.isupper()) else n
+
+
 def _first_name(lead: Optional[Lead], email: str) -> str:
-    if lead and lead.contact and lead.contact.first_name:
-        return lead.contact.first_name.strip().split()[0].capitalize()
+    if lead and lead.contact:
+        n = _greeting_name(lead.contact.first_name)
+        if n:
+            return n
     guess = name_from_email(email)
     return guess.split()[0] if guess else ""
 
@@ -1444,8 +1688,8 @@ def suggest_reply(reply: Reply, lead: Optional[Lead], ctx: Any) -> str:
                                "what time works for you this week?")
         return f"{hi}\n\nGood question - [short answer to their question].\n\n{ask}\n\n{sign}"
     if cat == RC.REFERRAL:
-        to_first = (reply.referral_name.split()[0] if reply.referral_name
-                    else (name_from_email(reply.referral_email).split() or [""])[0])
+        to_first = (_greeting_name(reply.referral_name)
+                    or (name_from_email(reply.referral_email).split() or [""])[0])
         referrer = ""
         if lead and lead.contact and lead.contact.full_name and lead.contact.email == reply.from_email:
             referrer = lead.contact.full_name
@@ -1508,7 +1752,7 @@ def _find_duplicate(reply: Reply, body: str, ctx: Any) -> Optional[Reply]:
     return None
 
 
-def _link_lead(reply: Reply, email: str, ctx: Any) -> Optional[Lead]:
+def _link_lead(reply: Reply, email: str, ctx: Any, by_domain: bool = True) -> Optional[Lead]:
     store, pb = ctx.store, ctx.playbook
     if reply.lead_id:
         lead = store.get_lead(reply.lead_id)
@@ -1519,7 +1763,7 @@ def _link_lead(reply: Reply, email: str, ctx: Any) -> Optional[Lead]:
     lead = store.find_lead_by_email(email, pb.name)
     if lead:
         return lead
-    if _is_machine_address(email) or is_personal_email(email):
+    if not by_domain or _is_machine_address(email) or is_personal_email(email):
         return None  # a gmail.com "domain match" would link strangers
     domain = normalize_domain(email)
     leads = store.find_leads_by_domain(domain, pb.name) if domain else []
@@ -1552,6 +1796,43 @@ def _suppress(email: str, reason: str, ctx: Any, actions: List[str]) -> None:
     if email and is_valid_email(email):
         ctx.store.suppress(email, "email", reason)
         actions.append(f"suppressed {email} ({reason})")
+
+
+def _open_followups(ctx: Any, email: str, lead_id: str) -> List[Dict[str, Any]]:
+    """Not-yet-done follow-ups of this playbook for this address or lead."""
+    email = (email or "").strip().lower()
+    rows = ctx.store.due_followups(date.max, ctx.playbook.name, include_suppressed=True)
+    return [f for f in rows if (email and (f.get("email") or "").lower() == email)
+            or (lead_id and f.get("lead_id") == lead_id)]
+
+
+def _cancel_followups(ctx: Any, email: str, lead_id: str, actions: List[str]) -> None:
+    """Close pending follow-ups for someone who opted out, declined or bounced."""
+    rows = _open_followups(ctx, email, lead_id)
+    for f in rows:
+        ctx.store.complete_followup(f["id"])
+    if rows:
+        actions.append(f"cancelled {len(rows)} pending follow-up(s)")
+
+
+def _schedule_followup(ctx: Any, due: date, reason: str, email: str, lead_id: str,
+                       keep_later: bool, label: str, actions: List[str]) -> None:
+    """One open follow-up per person: the pending ones are replaced (the newest answer
+    wins). With ``keep_later`` (an out-of-office auto-reply) a pending follow-up that is
+    already on/after ``due`` is kept instead ("try us next quarter" beats an OOO)."""
+    # per person: a colleague's reply linked to the lead by domain leaves the contact's own be
+    pending = _open_followups(ctx, email, "" if email else lead_id)
+    latest = max(pending, key=lambda f: f["due"]) if pending else None
+    if keep_later and latest is not None and latest["due"] >= due.isoformat():
+        for f in pending:
+            if f is not latest:
+                ctx.store.complete_followup(f["id"])
+        actions.append(f"follow-up already scheduled {latest['due']} ({latest.get('reason') or reason})")
+        return
+    for f in pending:
+        ctx.store.complete_followup(f["id"])
+    ctx.store.schedule_followup(due, reason, lead_id=lead_id, email=email, playbook=ctx.playbook.name)
+    actions.append(f"follow-up scheduled {due.isoformat()} ({label})")
 
 
 def _referral_lead(reply: Reply, lead: Optional[Lead], ctx: Any, actions: List[str]) -> Optional[Lead]:
@@ -1661,7 +1942,8 @@ def handle_reply(reply: Reply, ctx: Any) -> Reply:
     target = _bounce_target(reply, raw, ctx) if cat == RC.BOUNCE else reply.from_email
     if cat == RC.BOUNCE and target:
         reply.data["bounced_email"] = target
-    lead = _link_lead(reply, target, ctx)
+    # A bounce is about one exact address: never pin it on a colleague's lead by domain.
+    lead = _link_lead(reply, target, ctx, by_domain=cat != RC.BOUNCE)
     if lead:
         reply.lead_id = lead.id
 
@@ -1670,7 +1952,7 @@ def handle_reply(reply: Reply, ctx: Any) -> Reply:
     if cat == RC.TIMING:
         days = _cfg_days(ctx, "timing_default_days", DEFAULT_TIMING_DAYS)
         due = _parse_iso(reply.follow_up_date) or today + timedelta(days=days)
-        due = max(due, today + timedelta(days=1))
+        due = _clamp(max(due, today + timedelta(days=1)), today)
         reply.follow_up_date = due.isoformat()
 
     reply.suggested_reply = suggest_reply(reply, lead, ctx)
@@ -1684,32 +1966,32 @@ def handle_reply(reply: Reply, ctx: Any) -> Reply:
     elif cat == RC.TIMING:
         _move(lead, ctx, actions, note, Stage.REPLIED)
         due = _parse_iso(reply.follow_up_date) or today + timedelta(days=DEFAULT_TIMING_DAYS)
-        store.schedule_followup(due, "timing", lead_id=lead.id if lead else "",
-                                email=reply.from_email, playbook=pb.name)
-        actions.append(f"follow-up scheduled {due.isoformat()} (timing)")
+        _schedule_followup(ctx, due, "timing", reply.from_email, lead.id if lead else "",
+                           keep_later=False, label="timing", actions=actions)
     elif cat == RC.OOO:
         ret = _parse_iso(reply.follow_up_date)
         if ret:
-            due = ret + timedelta(days=1)
+            due = _clamp(ret, today) + timedelta(days=1)
         else:
             due = today + timedelta(days=_cfg_days(ctx, "ooo_default_days", DEFAULT_OOO_DAYS))
         due = max(due, today + timedelta(days=1))
-        store.schedule_followup(due, "ooo", lead_id=lead.id if lead else "",
-                                email=reply.from_email, playbook=pb.name)
-        actions.append(f"follow-up scheduled {due.isoformat()} (out of office"
-                       f"{'' if ret else ', no return date'})")
+        _schedule_followup(ctx, due, "ooo", reply.from_email, lead.id if lead else "", keep_later=True,
+                           label=f"out of office{'' if ret else ', no return date'}", actions=actions)
     elif cat == RC.NEGATIVE:
         _move(lead, ctx, actions, note, Stage.REPLIED, Stage.LOST)
         _suppress(reply.from_email, "not interested", ctx, actions)
+        _cancel_followups(ctx, reply.from_email, lead.id if lead else "", actions)
     elif cat == RC.UNSUBSCRIBE:
         _move(lead, ctx, actions, note, Stage.LOST)
         _suppress(reply.from_email, "unsubscribed", ctx, actions)
+        _cancel_followups(ctx, reply.from_email, lead.id if lead else "", actions)
     elif cat == RC.BOUNCE:
         if target:
             _move(lead, ctx, actions, note, Stage.LOST)
             _suppress(target, "bounced", ctx, actions)
             store.put_verification(target, "invalid", "bounce")
             actions.append(f"marked {target} invalid")
+            _cancel_followups(ctx, target, lead.id if lead else "", actions)
         else:
             actions.append("bounced address not found in the notice - nothing suppressed")
     else:  # other
@@ -1767,6 +2049,23 @@ def load_replies_csv(path: Any) -> List[Reply]:
     without any text are skipped.
     """
     p = Path(path)
+    # Exported bodies can exceed csv's default 128 KB field limit (HTML with inline images,
+    # long quoted threads); one such row must not abort the whole import.
+    old_limit = csv.field_size_limit()
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(max(old_limit, limit))
+            break
+        except OverflowError:
+            limit //= 10
+    try:
+        return _read_replies_csv(p)
+    finally:
+        csv.field_size_limit(old_limit)
+
+
+def _read_replies_csv(p: Path) -> List[Reply]:
     with p.open(newline="", encoding="utf-8-sig") as f:
         head = f.readline()
         f.seek(0)
@@ -1816,13 +2115,16 @@ def _ts(value: Any) -> str:
         return ""
     if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()
                                            and len(value.strip()) >= 9):
-        ts = float(value)
-        if ts > 1e12:
-            ts /= 1000.0
         try:
+            ts = float(value)
+            if ts > 1e12:
+                ts /= 1000.0
             return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat()
-        except (OverflowError, OSError, ValueError):
-            return str(value)
+        except (OverflowError, OSError, ValueError):  # 10**400, 1e308, nan ...
+            try:
+                return str(value)
+            except ValueError:  # int too large to print
+                return ""
     return str(value).strip()
 
 
@@ -1854,13 +2156,27 @@ def _first_addr(payload: Dict[str, Any], keys: Sequence[str]) -> str:
     return ""
 
 
+#: Every key ``parse_webhook_payload`` reads a sender / lead address from.
+_SENDER_KEYS = ("lead_email", "sl_lead_email", "from_email", "email", "from", "sender", "sender_email",
+                "to_email", "leadCorrespondence")
+_WRAPPER_KEYS = ("data", "payload", "body", "event")
+
+
+def _has_sender(p: Dict[str, Any]) -> bool:
+    return any(k in p for k in _SENDER_KEYS) or isinstance(p.get("lead"), dict)
+
+
 def _unwrap(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Some tools wrap the event: {"data": {...}} / {"payload": {...}} / {"event": {...}}."""
+    """Some tools wrap the event: {"data": {...}} / {"payload": {...}} / {"event": {...}}.
+
+    A dict is only unwrapped into when it carries a sender itself (or wraps one further):
+    ``{"sender": ..., "body": {"text": ...}}`` is a reply whose body is a text dict."""
     for _ in range(3):
-        if any(k in payload for k in ("lead_email", "sl_lead_email", "from_email", "email", "from")):
+        if _has_sender(payload):
             return payload
-        inner = next((payload[k] for k in ("data", "payload", "body", "event") if isinstance(payload.get(k), dict)),
-                     None)
+        inner = next((payload[k] for k in _WRAPPER_KEYS if isinstance(payload.get(k), dict)
+                      and (_has_sender(payload[k]) or any(isinstance(payload[k].get(w), dict)
+                                                          for w in _WRAPPER_KEYS))), None)
         if inner is None:
             return payload
         merged = dict(inner)

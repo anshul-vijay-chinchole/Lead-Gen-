@@ -23,14 +23,20 @@ senior / executive VPs, so they also match a ``VP ...`` buyer title, while
 Finance`` = ``VP Finance`` = ``Vice President, Finance``, and a multi-word buyer
 title also matches when all of its words appear in another order (``Head of
 Finance`` ~ ``Finance Head``, ``Finance Director`` ~ ``Director of Finance``).
-Trailing context such as ``at Acme``, ``to the CEO`` or ``reporting to ...`` is
-cut off first, so ``Chief of Staff to the CEO`` is not ranked as the CEO.
+Trailing context such as ``at Acme``, ``to the CEO``, ``reporting to ...`` or
+``Office of the CEO`` is cut off first, so ``Chief of Staff to the CEO`` is not
+ranked as the CEO. A buyer title does not match where a neighbouring word makes
+it someone else's role: ``Former`` / ``Ex`` / ``Deputy`` / ``Vice`` /
+``Assistant`` / ``Associate`` before it (``Ex-CEO``, ``Deputy CFO``,
+``Associate Director``), or a possessive / ``Associate`` / ``Assistant`` /
+``Office`` after it (``Founder's Associate``, ``CEO Office Manager``).
 Known ambiguity: ``CPO`` covers both Chief Product and Chief People Officer.
 
 Playbook keys read: ``buyers.titles``, ``buyers.exclude_titles``,
 ``buyers.allow_generic_emails``, ``enrichment.finders`` (each
-``{type: ..., label?: ..., enabled?: ...}``) and
-``enrichment.skip_if_contact_present``.
+``{type: ..., label?: ..., enabled?: ...}``),
+``enrichment.skip_if_contact_present`` and ``icp.exclude_domains`` (a contact
+whose email is at an excluded domain is never selected).
 """
 from __future__ import annotations
 
@@ -41,10 +47,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import registry
 from .context import MissingCredentialError
-from .http import HttpError
+from .filters import excluded_domain
+from .http import HttpError, redact
 from .models import Company, Contact, EmailStatus
-from .signals import as_str_list, contains_tokens, tokens_equal
-from .utils import normalize_text
+from .signals import as_str_list, contains_tokens, token_spans, tokens_equal
+from .utils import normalize_domain, normalize_text
 
 # --- title normalisation ---------------------------------------------------------
 
@@ -89,14 +96,30 @@ _alias(["biz dev", "bizdev"], "business development")
 
 _MAX_REWRITE = max(len(k) for k in _TITLE_REWRITES)
 
-# Context that is not part of the role: "VP Sales at Acme", "Chief of Staff to the CEO".
+# Context that is not part of the role: "VP Sales at Acme", "Chief of Staff to the CEO",
+# "Chief of Staff, Office of the CEO".
 _TITLE_CUTS = (
     re.compile(r"\s+(?:at|@)\s+.*$", re.IGNORECASE),
     re.compile(r"\b(?:reporting|reports)\s+(?:directly\s+)?to\b.*$", re.IGNORECASE),
     re.compile(r"\b(?:to|for)\s+the\s+.*$", re.IGNORECASE),
     re.compile(r"\bto\s+(?:ceo|cfo|coo|cto|cmo|cro|md|founders?|president|chairman|chief)\b.*$",
                re.IGNORECASE),
+    re.compile(r"\boffice\s+of\s+(?:the\s+)?(?:ceo|cfo|coo|cto|cmo|cro|md|founders?|president|chairman|"
+               r"chair|chief|managing)\b.*$", re.IGNORECASE),
 )
+
+# "Founder's Associate": the possessive "'s" becomes this token, so the role
+# word before it can be recognised as belonging to someone else.
+_POSSESSIVE = "possessive"
+_POSSESSIVE_RE = re.compile(r"(?<=[A-Za-z0-9])['\u2019`]s\b", re.IGNORECASE)
+# A buyer title right after one of these is not that role ("Former CEO",
+# "Ex-CEO", "Deputy CFO", "Vice Chair", "Assistant Controller", "Associate Director") ...
+_NOT_ROLE_BEFORE = frozenset({"former", "ex", "previous", "past", "retired", "deputy", "vice",
+                              "assistant", "associate"})
+# ... nor right before one of these ("Founder's Associate", "Founders Associate",
+# "CEO Office Manager", "CFO Assistant").
+_NOT_ROLE_AFTER = frozenset({_POSSESSIVE, "associate", "associates", "assistant", "assistants",
+                             "office"})
 
 
 @lru_cache(maxsize=8192)
@@ -107,6 +130,7 @@ def canonical_title(title: str) -> Tuple[str, ...]:
         shorter = cut.sub("", raw).strip()
         if shorter:
             raw = shorter
+    raw = _POSSESSIVE_RE.sub(f" {_POSSESSIVE} ", raw)
     tokens = [t for t in normalize_text(raw).split() if t not in _TITLE_STOPWORDS]
     out: List[str] = []
     i = 0
@@ -123,15 +147,29 @@ def canonical_title(title: str) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def _someone_elses_role(have: Sequence[str], start: int, end: int) -> bool:
+    """True when the words around ``have[start:end]`` make it a different role
+    ("Ex-CEO", "Founder's Associate")."""
+    before = have[start - 1] if start > 0 else ""
+    after = have[end] if end < len(have) else ""
+    return before in _NOT_ROLE_BEFORE or after in _NOT_ROLE_AFTER
+
+
 def title_matches(title: str, wanted: str) -> bool:
     """True if job ``title`` is an instance of buyer title ``wanted``."""
     have, want = canonical_title(title), canonical_title(wanted)
     if not have or not want:
         return False
-    if contains_tokens(have, want):
+    if any(not _someone_elses_role(have, a, b) for a, b in token_spans(have, want)):
         return True
     if len(want) >= 2:  # same words, different order: "Director of Finance" ~ "Finance Director"
-        return all(any(tokens_equal(h, w) for h in have) for w in want)
+        positions: List[int] = []
+        for w in want:
+            pos = next((i for i, h in enumerate(have) if tokens_equal(h, w)), None)
+            if pos is None:
+                return False
+            positions.append(pos)
+        return not _someone_elses_role(have, min(positions), max(positions) + 1)
     return False
 
 
@@ -213,7 +251,9 @@ def _allow_generic(ctx: Any) -> bool:
 
 
 def _usable_email(email: str, ctx: Any) -> bool:
-    return bool(email) and (_allow_generic(ctx) or not is_generic_email(email))
+    """A personal (or allowed generic) address that is not at an ``icp.exclude_domains`` domain."""
+    return (bool(email) and (_allow_generic(ctx) or not is_generic_email(email))
+            and excluded_domain(email, ctx) is None)
 
 
 def _is_named(contact: Contact) -> bool:
@@ -233,7 +273,8 @@ def _rank_key(contact: Contact, rank: Optional[int]) -> Tuple[int, int, int, int
 def select_contacts(company: Company, ctx: Any, limit: Optional[int] = 1) -> List[Contact]:
     """The best people at ``company`` to email, best first, at most ``limit``.
 
-    Drops excluded titles and generic mailboxes (unless
+    Drops excluded titles, people whose email is at an ``icp.exclude_domains``
+    domain (guessed candidates there are removed) and generic mailboxes (unless
     ``buyers.allow_generic_emails``; a *named* person with a generic address
     is kept without it). Ranks buyer titles first (by priority), then other
     titles; ties prefer people with an email, then valid > risky > unknown >
@@ -250,18 +291,20 @@ def select_contacts(company: Company, ctx: Any, limit: Optional[int] = 1) -> Lis
             continue
         if contact.title and is_excluded_title(contact.title, ctx):
             continue
+        if contact.email and excluded_domain(contact.email, ctx) is not None:
+            continue  # works at a company we never contact (client, competitor)
+        email, status = contact.email, contact.email_status
+        candidates = [e for e in contact.email_candidates if excluded_domain(e, ctx) is None]
         if not allow_generic:
-            generic_email = is_generic_email(contact.email)
+            generic_email = is_generic_email(email)
             if generic_email and not _is_named(contact):
                 continue  # a role mailbox, not a person
-            if generic_email or any(is_generic_email(e) for e in contact.email_candidates):
-                contact = replace(
-                    contact,
-                    email="" if generic_email else contact.email,
-                    email_status=EmailStatus.UNKNOWN if generic_email else contact.email_status,
-                    email_candidates=[e for e in contact.email_candidates if not is_generic_email(e)],
-                    data=dict(contact.data),
-                )
+            if generic_email:
+                email, status = "", EmailStatus.UNKNOWN
+            candidates = [e for e in candidates if not is_generic_email(e)]
+        if (email, status, candidates) != (contact.email, contact.email_status, contact.email_candidates):
+            contact = replace(contact, email=email, email_status=status, email_candidates=candidates,
+                              data=dict(contact.data))
         if not contact.key:
             continue
         pool.append((_rank_key(contact, title_rank(contact.title, ctx)), idx, contact))
@@ -297,11 +340,31 @@ def same_person(a: Contact, b: Contact) -> bool:
     return bool(na) and na == nb
 
 
-def fill_contact(target: Contact, source: Contact) -> None:
-    """Fill ``target``'s empty fields from ``source`` (never overwrites)."""
-    if not target.email and source.email:
-        target.email = source.email
-        target.email_status = source.email_status
+def _email_ok(email: str, status: str, ctx: Any) -> bool:
+    if not email or status == EmailStatus.INVALID:
+        return False
+    return _usable_email(email, ctx) if ctx is not None else not is_generic_email(email)
+
+
+def fill_contact(target: Contact, source: Contact, ctx: Any = None) -> None:
+    """Fill ``target``'s empty fields from ``source``.
+
+    Nothing is overwritten except an email address that cannot be used - an
+    INVALID one, a generic mailbox (unless ``buyers.allow_generic_emails``) or
+    one at an ``icp.exclude_domains`` domain (these two need ``ctx``; without
+    it generic mailboxes count as unusable): a usable address from ``source``
+    replaces it. Any other usable, different address from ``source`` at the
+    same domain is kept as an email candidate instead of being dropped.
+    """
+    if source.email and source.email != target.email:
+        if not target.email or (not _email_ok(target.email, target.email_status, ctx)
+                                and _email_ok(source.email, source.email_status, ctx)):
+            target.email = source.email
+            target.email_status = source.email_status
+        elif (_email_ok(source.email, source.email_status, ctx)
+              and normalize_domain(source.email) == normalize_domain(target.email)
+              and source.email not in target.email_candidates):
+            target.email_candidates.append(source.email)
     for attr in ("title", "linkedin_url", "full_name", "first_name", "last_name", "phone",
                  "seniority", "department", "location", "source"):
         if not getattr(target, attr) and getattr(source, attr):
@@ -315,8 +378,9 @@ def fill_contact(target: Contact, source: Contact) -> None:
         target.data.setdefault(k, v)
 
 
-def merge_contacts(company: Company, found: Sequence[Contact]) -> int:
-    """Add ``found`` people to ``company.contacts``; returns how many were new."""
+def merge_contacts(company: Company, found: Sequence[Contact], ctx: Any = None) -> int:
+    """Add ``found`` people to ``company.contacts``; returns how many were new.
+    A known person is updated with ``fill_contact(existing, new, ctx)``."""
     added = 0
     for c in found:
         existing = next((e for e in company.contacts if isinstance(e, Contact) and same_person(e, c)), None)
@@ -324,7 +388,7 @@ def merge_contacts(company: Company, found: Sequence[Contact]) -> int:
             company.contacts.append(c)
             added += 1
         else:
-            fill_contact(existing, c)
+            fill_contact(existing, c, ctx)
     return added
 
 
@@ -349,9 +413,13 @@ class ContactWaterfall:
     is on and the company already has a target-title contact with a usable
     (non-generic, not invalid) email. Otherwise each finder in turn:
     ``find(company)`` -> new people are merged into ``company.contacts`` (a
-    known person only gets missing fields filled); then ``complete(company,
-    contact)`` is called for target-title contacts that still lack an email,
-    best-ranked first. The waterfall stops as soon as a target-title contact
+    known person only gets missing fields filled, or an unusable email
+    replaced - see ``fill_contact``); then ``complete(company, contact)`` is
+    called for target-title contacts that still lack a usable email (none, a
+    generic mailbox or an INVALID one - the finder gets a copy with that
+    address cleared), best-ranked first. Nothing runs, or the waterfall stops,
+    once the company's domain or the email domain a finder resolved for it is
+    in ``icp.exclude_domains``. The waterfall stops as soon as a target-title contact
     (any contact when ``buyers.titles`` is empty) has a usable email or email
     candidates to verify. Finder errors are appended to ``errors`` as
     ``"finder <label>: <message>"`` and the next finder runs; after a missing
@@ -390,7 +458,8 @@ class ContactWaterfall:
 
     def _error(self, label: str, exc: Exception) -> None:
         text = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
-        msg = f"finder {label}: {text or type(exc).__name__}"
+        # network errors quote the full request URL, API key query parameter included
+        msg = redact(f"finder {label}: {text or type(exc).__name__}")
         self.errors.append(msg)
         self.ctx.log.error(msg)
 
@@ -414,6 +483,23 @@ class ContactWaterfall:
         return any(self._is_target(c) and self._reachable(c, with_candidates)
                    for c in company.contacts if isinstance(c, Contact))
 
+    def _wants_email(self, contact: Contact) -> bool:
+        """A target whose address is missing or unusable (generic mailbox, INVALID)."""
+        if not self._is_target(contact):
+            return False
+        if contact.email and excluded_domain(contact.email, self.ctx) is not None:
+            return False  # works at an excluded company: no point looking further
+        return not self._reachable(contact, with_candidates=False)
+
+    def _excluded(self, company: Company) -> Optional[str]:
+        """The ``icp.exclude_domains`` entry the company's (email) domain falls under."""
+        data = company.data if isinstance(company.data, dict) else {}
+        for value in (company.domain, data.get("email_domain")):
+            hit = excluded_domain(value, self.ctx)
+            if hit is not None:
+                return hit
+        return None
+
     # --- the waterfall ------------------------------------------------------------
     def _to_contacts(self, found: Any, label: str) -> List[Contact]:
         out: List[Contact] = []
@@ -429,8 +515,7 @@ class ContactWaterfall:
         return out
 
     def _complete(self, slot: _Slot, company: Company) -> None:
-        pending = [c for c in company.contacts
-                   if isinstance(c, Contact) and not c.email and self._is_target(c)]
+        pending = [c for c in company.contacts if isinstance(c, Contact) and self._wants_email(c)]
 
         def rank_of(c: Contact) -> int:
             r = title_rank(c.title, self.ctx)
@@ -438,14 +523,22 @@ class ContactWaterfall:
 
         pending.sort(key=rank_of)
         for contact in pending:
-            result = slot.finder.complete(company, contact)
+            # finders only complete contacts without an email: hand over a copy
+            # without the unusable one (jobs@..., an INVALID address)
+            probe = contact if not contact.email else replace(
+                contact, email="", email_status=EmailStatus.UNKNOWN,
+                email_candidates=list(contact.email_candidates), data=dict(contact.data))
+            result = slot.finder.complete(company, probe)
             if isinstance(result, Contact) and result is not contact:
-                fill_contact(contact, result)
+                fill_contact(contact, result, self.ctx)
             if self.satisfied(company):
                 break
 
     def enrich(self, company: Company) -> List[str]:
         """Run the waterfall for one company. Returns the labels of the finders called."""
+        if self._excluded(company) is not None:
+            self.ctx.log.info("enrich %s: domain is in icp.exclude_domains; not enriched", company.name)
+            return []
         if self.ctx.playbook.enrichment.get("skip_if_contact_present", True) and \
                 self.satisfied(company, with_candidates=False):
             self.ctx.log.debug("enrich %s: already has a reachable decision-maker", company.name)
@@ -457,23 +550,27 @@ class ContactWaterfall:
             ran.append(slot.label)
             try:
                 found = self._to_contacts(slot.finder.find(company), slot.label)
-                added = merge_contacts(company, found)
+                added = merge_contacts(company, found, self.ctx)
                 self.ctx.log.info("finder %s: %d people for %s (%d new)", slot.label, len(found),
                                   company.name, added)
                 if not self.satisfied(company):
                     self._complete(slot, company)
             except MissingCredentialError as e:
                 self._error(slot.label, e)
-                slot.disabled = str(e)
+                slot.disabled = redact(str(e))
             except HttpError as e:
                 self._error(slot.label, e)
                 if e.status in self.DISABLE_STATUSES:
-                    slot.disabled = str(e)
+                    slot.disabled = redact(str(e))
             except Exception as e:  # noqa: BLE001 - one broken provider must not stop the rest
                 self._error(slot.label, e)
             if slot.disabled:
                 self.ctx.log.warning("finder %s disabled for the rest of this run", slot.label)
             if self.satisfied(company):
+                break
+            if self._excluded(company) is not None:
+                self.ctx.log.info("enrich %s: resolved to a domain in icp.exclude_domains; stopping",
+                                  company.name)
                 break
         return ran
 

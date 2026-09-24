@@ -176,3 +176,84 @@ def test_build_llm_passes_writer_llm_options(make_ctx):
     client = build_llm(ctx)
     assert client.config["timeout"] == 33 and client.config["effort"] == "low"
     assert client.config["type"] == "anthropic"
+
+
+def test_http_network_error_never_leaks_query_keys():
+    from leadgen.http import HttpClient, HttpError
+    client = HttpClient(retries=0)
+    try:
+        client.get("http://127.0.0.1:1/v2/domain-search?domain=acme.com&api_key=SECRETKEY123")
+    except HttpError as e:
+        assert "SECRETKEY123" not in str(e) and "SECRETKEY123" not in e.body
+        assert e.status == 0
+    else:  # pragma: no cover
+        raise AssertionError("expected HttpError")
+
+
+def test_safe_url_and_redact():
+    from leadgen.http import redact, safe_url
+    fake_hook = "https://hooks.slack.com/" + "services/" + "T024BE7LD/B01234567/" + "abcdefghijklmnop" + "qrstuvwx"
+    assert "T024BE7LD" not in safe_url(fake_hook) and "qrstuvwx" not in safe_url(fake_hook)
+    assert safe_url("https://api.apollo.io/api/v1/mixed_people/api_search") == \
+        "https://api.apollo.io/api/v1/mixed_people/api_search"
+    assert "xyz" not in redact("Authorization: Bearer xyz.abc") and "k1" not in redact("?api_key=k1&x=1")
+
+
+def test_secret_is_stripped(make_ctx):
+    ctx = make_ctx(env={"FOO_KEY": "  abc\n", "EMPTY": "  "})
+
+    class A(Adapter):
+        name = "a"
+        env_key = "FOO_KEY"
+
+    assert A({}, ctx).secret() == "abc"
+    assert not A({"api_key_env": "EMPTY"}, ctx).has_secret()
+
+
+def test_yaml_on_key_is_not_a_boolean(tmp_path):
+    from leadgen.playbook import load_playbook
+    p = tmp_path / "p.yaml"
+    p.write_text("name: x\nnotify:\n  on: [positive]\n", encoding="utf-8")
+    assert load_playbook(str(p)).notify["on"] == ["positive"]
+
+
+def test_personal_email_detection_and_domain_junk():
+    from leadgen.utils import is_personal_email
+    for e in ("bob@gmail.com", "x@yahoo.fr", "y@sbcglobal.net", "z@web.de", "q@hotmail.co.uk"):
+        assert is_personal_email(e), e
+    for e in ("jane@acme.com", "jane@mail.acme.com", "a@outlook-partners.com"):
+        assert not is_personal_email(e), e
+    assert normalize_domain("[none]") == "" and normalize_domain("acme.com]") == ""
+    assert parse_date("05/06/2026", date_order="mdy") == date(2026, 5, 6)
+    assert parse_date("05/06/2026") == date(2026, 6, 5)
+
+
+def test_contact_full_name_split_handles_honorifics():
+    assert (Contact(full_name="Dr. Jane Doe").first_name, Contact(full_name="Dr. Jane Doe").last_name) == ("Jane", "Doe")
+    c = Contact(full_name="Doe, Jane")
+    assert (c.first_name, c.last_name) == ("Jane", "Doe")
+
+
+def test_unsuppress_is_kind_aware_and_followups_hide_suppressed():
+    s = Store(":memory:")
+    s.suppress("acme.com", "domain")
+    s.suppress("jane@acme.com", "email")
+    assert s.unsuppress("jane@acme.com") == 1
+    assert s.is_suppressed(domain="acme.com")
+    s.schedule_followup(TODAY, "timing", email="bob@beta.com", playbook="p")
+    s.suppress("bob@beta.com", "email")
+    assert s.due_followups(TODAY, "p") == []
+    assert len(s.due_followups(TODAY, "p", include_suppressed=True)) == 1
+
+
+def test_sibling_postings_in_one_batch_are_not_reposts():
+    s = Store(":memory:")
+    a = Signal(type="job_posting", title="Accountant", external_id="1", location="NYC")
+    b = Signal(type="job_posting", title="Accountant", external_id="2", location="LA")
+    s.observe_signals("acme.com", [a, b], TODAY)
+    assert not a.reposted and not b.reposted
+    # next run: id 1 disappeared, id 3 appeared -> genuine re-post
+    c = Signal(type="job_posting", title="Accountant", external_id="3")
+    d = Signal(type="job_posting", title="Accountant", external_id="2")
+    s.observe_signals("acme.com", [c, d], TODAY + timedelta(days=10))
+    assert c.reposted

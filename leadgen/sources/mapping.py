@@ -64,6 +64,7 @@ import re
 import string
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from ..models import Company, Contact, EmailStatus, Signal, SignalType
 from ..utils import (
@@ -72,6 +73,7 @@ from ..utils import (
     is_valid_email,
     normalize_company_name,
     normalize_domain,
+    normalize_text,
     parse_date,
     truncate,
 )
@@ -137,7 +139,76 @@ BLOCKED_DOMAINS = frozenset({
     "youtube.com", "tiktok.com", "pinterest.com", "google.com", "goo.gl", "g.page",
     "maps.app.goo.gl", "bit.ly", "indeed.com", "glassdoor.com", "yelp.com",
     "wa.me", "whatsapp.com", "t.me", "linktr.ee",
+    # link shorteners / map links: the host is never the business
+    "youtu.be", "t.co", "tinyurl.com", "ow.ly", "buff.ly", "rebrand.ly", "cutt.ly", "is.gd", "rb.gy",
+    "shorturl.at", "tiny.cc", "t.ly", "lnkd.in", "fb.me", "m.me", "instagr.am", "wa.link", "g.co",
+    "maps.apple.com",
 })
+
+# Shared booking / listing / directory / marketplace / profile platforms. A
+# business "website" that is a page on one of these (``doctolib.fr/dentiste/
+# paris/luc-martin``, ``booksy.com/en-us/123_salon``, ``calendly.com/acme``)
+# is not the business's own domain - many unrelated businesses share the host.
+# Matched on the registrable name (every country TLD) and only for URLs with a
+# path/query, so the platform company itself (``calendly.com``) stays usable.
+_PLATFORM_NAMES = frozenset({
+    # booking / scheduling / health directories
+    "doctolib", "booksy", "fresha", "vagaro", "calendly", "treatwell", "setmore", "acuityscheduling",
+    "squareup", "schedulicity", "mindbodyonline", "styleseat", "genbook", "planity", "zocdoc",
+    "jameda", "doctoralia", "docplanner", "znanylekarz", "miodottore", "practo", "healthgrades", "vitals",
+    "ratemds", "simplybook", "timify", "salonized", "phorest", "gettimely", "youcanbookme",
+    # restaurants / delivery / travel
+    "opentable", "resy", "sevenrooms", "thefork", "lafourchette", "quandoo", "exploretock", "toasttab",
+    "ubereats", "doordash", "grubhub", "deliveroo", "justeat", "just-eat", "lieferando", "thuisbezorgd",
+    "menulog", "skipthedishes", "foodpanda", "wolt", "glovoapp", "chownow", "menufy", "slicelife",
+    "tripadvisor", "booking", "airbnb", "expedia", "agoda", "trivago", "vrbo",
+    # directories / reviews / marketplaces
+    "yelp", "yell", "yellowpages", "pagesjaunes", "gelbeseiten", "paginegialle", "paginasamarillas",
+    "houzz", "angi", "angieslist", "homeadvisor", "thumbtack", "bark", "nextdoor", "checkatrade",
+    "trustatrader", "mybuilder", "ratedpeople", "trustpilot", "foursquare", "zomato", "bbb", "manta",
+    "etsy", "amazon", "ebay",
+    # profiles / link-in-bio / code & media hosts
+    "beacons", "taplink", "lnk", "campsite", "xing", "vk", "threads", "snapchat", "reddit", "medium",
+    "github", "gitlab", "behance", "dribbble", "vimeo", "soundcloud",
+})
+_PLATFORM_HOSTS = frozenset({"about.me", "bio.link", "apps.apple.com", "play.google.com"})
+_SECOND_LEVEL = frozenset({"co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go", "gob", "nom"})
+_TRIVIAL_PATH = re.compile(r"^(?:[a-z]{2}(?:[-_][a-z]{2,4})?|index\.[a-z]{3,4}|home|default\.aspx?)?$", re.I)
+
+# Free-mail / ISP mailbox domains (on top of ``utils.PERSONAL_EMAIL_DOMAINS``):
+# an address there says nothing about the company, so it never becomes the
+# company domain (two businesses both on ``sbcglobal.net`` must not merge).
+_FREE_EMAIL_DOMAINS = frozenset({
+    "ymail.com", "rocketmail.com", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it", "yahoo.ca",
+    "yahoo.com.au", "yahoo.co.in", "yahoo.co.jp", "yahoo.com.br", "yahoo.com.mx", "hotmail.fr",
+    "hotmail.de", "hotmail.es", "hotmail.it", "hotmail.ca", "live.co.uk", "live.fr", "live.de", "live.nl",
+    "live.ca", "live.com.au", "outlook.fr", "outlook.de", "outlook.es", "outlook.it", "windowslive.com",
+    "passport.com", "aim.com", "aol.co.uk", "aol.de", "aol.fr", "gmx.net", "gmx.at", "gmx.ch", "gmx.fr",
+    "gmx.co.uk", "web.de", "t-online.de", "freenet.de", "arcor.de", "online.de", "posteo.de",
+    "mailbox.org", "orange.fr", "wanadoo.fr", "free.fr", "sfr.fr", "neuf.fr", "laposte.net", "bbox.fr",
+    "numericable.fr", "libero.it", "virgilio.it", "tin.it", "alice.it", "tiscali.it", "email.it",
+    "fastwebnet.it", "telefonica.net", "terra.es", "ono.com", "kpnmail.nl", "planet.nl", "home.nl",
+    "ziggo.nl", "hetnet.nl", "xs4all.nl", "telenet.be", "skynet.be", "proximus.be", "bluewin.ch",
+    "hispeed.ch", "sunrise.ch", "chello.at", "aon.at", "seznam.cz", "centrum.cz", "wp.pl", "o2.pl",
+    "onet.pl", "interia.pl", "op.pl", "mail.ru", "bk.ru", "list.ru", "inbox.ru", "rambler.ru",
+    "yandex.ru", "ya.ru", "ukr.net", "abv.bg", "sapo.pt", "eircom.net", "sbcglobal.net", "bellsouth.net",
+    "pacbell.net", "swbell.net", "ameritech.net", "prodigy.net", "flash.net", "cox.net", "charter.net",
+    "optonline.net", "optimum.net", "earthlink.net", "mindspring.com", "juno.com", "netzero.net",
+    "netzero.com", "frontier.com", "frontiernet.net", "windstream.net", "centurylink.net", "centurytel.net",
+    "embarqmail.com", "q.com", "roadrunner.com", "rr.com", "twc.com", "spectrum.net", "suddenlink.net",
+    "mediacombb.net", "cableone.net", "wowway.com", "hughes.net", "rcn.com", "shaw.ca", "rogers.com",
+    "sympatico.ca", "videotron.ca", "cogeco.ca", "telus.net", "bigpond.com", "bigpond.net.au",
+    "optusnet.com.au", "iinet.net.au", "tpg.com.au", "internode.on.net", "xtra.co.nz", "ntlworld.com",
+    "blueyonder.co.uk", "talktalk.net", "tiscali.co.uk", "virgin.net", "btopenworld.com", "orange.net",
+    "plus.net", "fsmail.net", "uol.com.br", "bol.com.br", "terra.com.br", "ig.com.br", "globo.com",
+    "prodigy.net.mx", "rediffmail.com", "sify.com", "qq.com", "163.com", "126.com", "yeah.net",
+    "sina.com", "sina.cn", "sohu.com", "naver.com", "hanmail.net", "daum.net", "nate.com",
+    "hushmail.com", "tutanota.com", "tuta.io", "fastmail.com", "fastmail.fm", "pm.me", "gmx.us",
+    "inbox.com", "lycos.com", "excite.com", "mail.ch",
+})
+# Webmail brands whose every country domain is free mail (``yahoo.co.nz``, ``hotmail.be``, ...).
+_FREE_EMAIL_BRANDS = frozenset({"gmail", "googlemail", "yahoo", "ymail", "hotmail", "outlook", "live",
+                                "msn", "aol", "gmx", "icloud", "protonmail", "yandex"})
 
 # Placeholder addresses some exports put in the email column.
 _PLACEHOLDER_EMAIL_DOMAINS = frozenset({"domain.com", "example.com", "example.org", "example.net",
@@ -240,15 +311,66 @@ def clean_url(value: Any) -> str:
     return text
 
 
+def safe_host(value: Any) -> str:
+    """``utils.normalize_domain`` that never raises: stray brackets ('[acme.com]',
+    'acme.com]') are dropped and anything unparsable yields ``""``."""
+    try:
+        host = normalize_domain(value)
+    except ValueError:  # urlparse: 'Invalid IPv6 URL' / "... does not appear to be an IPv4 or IPv6 address"
+        host = ""
+    if host or value is None or not any(b in str(value) for b in "[]"):
+        return host
+    try:
+        return normalize_domain(str(value).replace("[", "").replace("]", ""))
+    except ValueError:
+        return ""
+
+
+def _url_path_and_query(text: str) -> Tuple[str, str]:
+    v = text.strip()
+    if "://" not in v:
+        v = "http://" + v
+    try:
+        parsed = urlparse(v.replace("[", "").replace("]", ""))
+    except ValueError:
+        return "", ""
+    return parsed.path or "", parsed.query or ""
+
+
+def registrable_name(domain: str) -> str:
+    """'www.tripadvisor.co.uk' -> 'tripadvisor', 'booksy.com' -> 'booksy' (heuristic, no PSL)."""
+    labels = [p for p in (domain or "").lower().split(".") if p]
+    if len(labels) < 2:
+        return labels[0] if labels else ""
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL:
+        return labels[-3]
+    return labels[-2]
+
+
+def is_platform_url(value: Any) -> bool:
+    """True for a page on a shared booking/listing/profile platform (see ``_PLATFORM_NAMES``)."""
+    text = as_text(value)
+    if not text or "@" in text:
+        return False
+    host = safe_host(text)
+    if not host:
+        return False
+    if not (registrable_name(host) in _PLATFORM_NAMES
+            or any(host == h or host.endswith("." + h) for h in _PLATFORM_HOSTS)):
+        return False
+    path, query = _url_path_and_query(text)
+    return bool(query) or not _TRIVIAL_PATH.match(path.strip("/"))
+
+
 def clean_domain(value: Any) -> str:
     """Normalized company domain, or ``""`` if the value is not a usable company domain."""
     text = as_text(value)
     if not text:
         return ""
-    d = normalize_domain(text)
+    d = safe_host(text)
     if not d or not _HOSTNAME.match(d):
         return ""
-    if is_blocked_domain(d):
+    if is_blocked_domain(d) or is_platform_url(text):
         return ""
     return d
 
@@ -258,20 +380,85 @@ def is_blocked_domain(domain: str) -> bool:
     return any(d == b or d.endswith("." + b) for b in BLOCKED_DOMAINS)
 
 
+def is_free_email(email: str) -> bool:
+    """Free-mail / ISP address (gmail, yahoo.fr, sbcglobal.net, web.de, ...): its domain is not a company's."""
+    if is_personal_email(email):
+        return True
+    d = safe_host(email)
+    if d in _FREE_EMAIL_DOMAINS:
+        return True
+    labels = d.split(".")
+    return len(labels) >= 2 and labels[0] in _FREE_EMAIL_BRANDS and registrable_name(d) == labels[0]
+
+
+_NAME_STOPWORDS = frozenset({"and", "the", "for", "und", "des", "les", "der", "die", "das", "von"})
+_TRANSLIT = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
+                           "æ": "ae", "Æ": "Ae", "ø": "oe", "Ø": "Oe", "å": "aa", "Å": "Aa", "œ": "oe"})
+
+
+def _words_match_domain(words: List[str], core: str, reg: str) -> bool:
+    compact = "".join(words)
+    if compact in core or (len(core) >= 4 and core in compact):
+        return True
+    if any(len(w) >= 3 and w not in _NAME_STOPWORDS and w in core for w in words):
+        return True
+    initials = "".join(w[0] for w in words if w not in _NAME_STOPWORDS)
+    return len(initials) >= 2 and (reg == initials or (len(initials) >= 3 and reg.startswith(initials)))
+
+
+def domain_matches_name(domain: str, name: str) -> bool:
+    """Heuristic: could ``domain`` be the own domain of a company called ``name``?
+
+    'acme-demo.com' ~ 'Acme Corp', 'bluedoordental.co.uk' ~ 'Blue Door Dental',
+    'ibm.com' ~ 'International Business Machines', 'mueller.de' ~ 'Müller GmbH';
+    'sbcglobal.net' !~ "Bob's HVAC". Names without latin letters cannot be judged
+    and count as a match."""
+    labels = [p for p in (domain or "").lower().split(".") if p]
+    core = "".join(labels[:-1] or labels).replace("-", "")
+    reg = registrable_name(domain).replace("-", "")
+    variants = [normalize_text(name).split(), normalize_text(str(name or "").translate(_TRANSLIT)).split()]
+    if not variants[0]:
+        return True
+    return bool(core) and any(_words_match_domain(words, core, reg) for words in variants if words)
+
+
+_NEGATED_GOOD = re.compile(r"(?:^|_)(?:not|non|no|never)_?(?:valid|deliverable)(?:_|$)")
+_NEGATED_CHECK = re.compile(r"(?:^|_)(?:not|non|no|never|un|cannot|unable)_?(?:verif|valid|deliver|confirm|check)")
+_PENDING_WORDS = ("pending", "need", "require", "validation", "validating", "verification", "verifying",
+                  "processing", "queue", "progress", "checking", "to_verify", "to_validate", "todo",
+                  "unchecked", "not_checked", "waiting", "retry")
+_GOOD_TOKENS = frozenset({"verified", "valid", "deliverable", "validated", "ok", "safe", "good"})
+
+
 def normalize_email_status(value: Any) -> str:
-    """Map a provider/export email status to ``EmailStatus`` (valid | risky | invalid | unknown)."""
+    """Map a provider/export email status to ``EmailStatus`` (valid | risky | invalid | unknown).
+
+    Only statuses that clearly say "valid" become VALID: negations ('Not valid',
+    'non-deliverable' -> invalid; 'unvalidated', 'not verified' -> unknown) and
+    pending states ('Validation pending', 'Needs validation' -> unknown) never
+    do, so the configured verifier still checks those addresses. Unrecognised
+    strings are UNKNOWN (verified later), never VALID."""
     s = re.sub(r"[^a-z0-9]+", "_", as_text(value).lower()).strip("_")
     if not s:
         return EmailStatus.UNKNOWN
     if s in _EMAIL_STATUS_MAP:
         return _EMAIL_STATUS_MAP[s]
+    if _NEGATED_GOOD.search(s):
+        return EmailStatus.INVALID
     if any(w in s for w in ("invalid", "bounce", "undeliverable", "disposable", "spamtrap")):
         return EmailStatus.INVALID
+    if _NEGATED_CHECK.search(s):
+        return EmailStatus.UNKNOWN
     if "unverified" in s or "unknown" in s or "guess" in s:
+        return EmailStatus.UNKNOWN
+    if any(w in s for w in _PENDING_WORDS):
         return EmailStatus.UNKNOWN
     if "catch" in s or "accept" in s or "risky" in s:
         return EmailStatus.RISKY
-    if "verified" in s or "valid" in s or "deliverable" in s:
+    tokens = s.split("_")
+    if any(t in ("not", "non", "no", "never", "un") for t in tokens):
+        return EmailStatus.UNKNOWN
+    if any(t in _GOOD_TOKENS for t in tokens):
         return EmailStatus.VALID
     return EmailStatus.UNKNOWN
 
@@ -323,15 +510,75 @@ def _unit_key(unit: str) -> str:
     return unit[0]
 
 
-def parse_when(value: Any, today: Optional[date] = None) -> Optional[date]:
+# numeric d/m/y or m/d/y dates ("9/5/2026", "09/05/2026 14:03") - the order is ambiguous
+_SLASH_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})(?:[ T,]+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?"
+                         r"(?:\s*[ap]\.?m\.?)?)?$", re.I)
+_DATE_ORDERS = {"mdy": "mdy", "m/d/y": "mdy", "us": "mdy", "month_first": "mdy",
+                "dmy": "dmy", "d/m/y": "dmy", "eu": "dmy", "uk": "dmy", "day_first": "dmy"}
+
+
+def normalize_date_order(value: Any) -> Optional[str]:
+    """'mdy' | 'dmy' | None (= infer). Accepts 'us'/'m/d/y' and 'eu'/'uk'/'d/m/y'; ValueError otherwise."""
+    if is_blank(value) or str(value).strip().lower() == "auto":
+        return None
+    key = str(value).strip().lower()
+    if key not in _DATE_ORDERS:
+        raise ValueError(f"date_order must be 'mdy' (US, 9/5/2026 = Sep 5) or 'dmy' (9/5/2026 = 9 May) "
+                         f"or 'auto', got {value!r}")
+    return _DATE_ORDERS[key]
+
+
+def _slash_parts(value: Any) -> Optional[Tuple[int, int, int]]:
+    if not isinstance(value, str):
+        return None
+    s = _WS.sub(" ", value).strip()
+    m = _SLASH_DATE.match(_REL_PREFIX.sub("", s).strip() or s)  # also "Posted 9/5/2026"
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def infer_date_order(values: Iterable[Any]) -> Optional[str]:
+    """Day/month order of a column of numeric dates: values like '9/20/2026' prove m/d/y,
+    '20/9/2026' proves d/m/y (majority wins); None when no value decides it."""
+    mdy = dmy = 0
+    for v in values:
+        parts = _slash_parts(v)
+        if not parts:
+            continue
+        a, b, _ = parts
+        if a > 12 >= b:
+            dmy += 1
+        elif b > 12 >= a:
+            mdy += 1
+    if mdy > dmy:
+        return "mdy"
+    if dmy > mdy:
+        return "dmy"
+    return None
+
+
+def parse_when(value: Any, today: Optional[date] = None, date_order: Optional[str] = None) -> Optional[date]:
     """Like ``utils.parse_date`` but relative phrases ('3 days ago', '30+ days ago',
-    'Posted today', '2w ago') are resolved against ``today`` (the run date)."""
+    'Posted today', '2w ago') are resolved against ``today`` (the run date).
+
+    ``date_order`` ('mdy' | 'dmy') fixes how numeric dates like '9/5/2026' are
+    read; without it a value is read d/m/y when that is a valid date, else m/d/y."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (datetime, date, int, float)):
         return parse_date(value)
     s = _WS.sub(" ", str(value)).strip()
     if not s:
+        return None
+    parts = _slash_parts(s)
+    if parts:
+        a, b, y = parts
+        orders = [date_order] if date_order in ("mdy", "dmy") else ["dmy", "mdy"]
+        for order in orders:
+            day, month = (a, b) if order == "dmy" else (b, a)
+            try:
+                return date(y, month, day)
+            except ValueError:
+                continue
         return None
     ref = today or date.today()
     s = _REL_PREFIX.sub("", s).strip() or s
@@ -431,12 +678,12 @@ def pretty_stage(value: Any) -> str:
 
 def funding_signal(stage: Any = None, amount: Any = None, when: Any = None, *, label: str = "",
                    currency: str = "$", total: Any = None, url: Any = None,
-                   today: Optional[date] = None) -> Optional[Signal]:
+                   today: Optional[date] = None, date_order: Optional[str] = None) -> Optional[Signal]:
     """Build a ``funding`` signal ('Raised Series A ($12M)'); None when there is nothing to say."""
     stage_txt = pretty_stage(stage)
     n_amount, _ = parse_amount(amount)
     money = format_money(amount, currency) if n_amount else ""
-    posted = parse_when(when, today)
+    posted = parse_when(when, today, date_order)
     if not stage_txt and not money and posted is None:
         return None
     low = stage_txt.lower()
@@ -762,8 +1009,9 @@ class RecordMapper:
                  defaults: Optional[Dict[str, Any]] = None, today: Optional[date] = None,
                  signal_title_template: Optional[str] = None, default_signal: Any = None,
                  people: Any = None, location_from_signal: bool = True,
-                 signal_requires: Optional[Sequence[str]] = None):
+                 signal_requires: Optional[Sequence[str]] = None, date_order: Optional[str] = None):
         self.mapping = normalize_mapping(mapping)
+        self.date_order = normalize_date_order(date_order)
         self.label = label
         self.defaults = normalize_defaults(defaults)
         self.today = today
@@ -776,6 +1024,24 @@ class RecordMapper:
         if isinstance(signal_requires, str):
             signal_requires = [signal_requires]
         self.signal_requires = [str(p) for p in (signal_requires or []) if str(p).strip()]
+
+    def infer_date_order(self, records: Sequence[Dict[str, Any]]) -> Optional[str]:
+        """Day/month order of the file's numeric signal/funding dates (see ``infer_date_order``)."""
+        paths = list(self.mapping.get("signal_date", ())) + list(self.mapping.get("funding_date", ()))
+        if not paths:
+            return None
+        return infer_date_order(lookup_path(r, p) for r in records if isinstance(r, dict) for p in paths)
+
+    def has_ambiguous_dates(self, records: Sequence[Dict[str, Any]]) -> bool:
+        paths = list(self.mapping.get("signal_date", ())) + list(self.mapping.get("funding_date", ()))
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            for p in paths:
+                parts = _slash_parts(lookup_path(r, p))
+                if parts and parts[0] <= 12 and parts[1] <= 12 and parts[0] != parts[1]:
+                    return True
+        return False
 
     # value access ---------------------------------------------------------------
     def _getter(self, record: Dict[str, Any], defaults: Dict[str, Any]) -> Callable[[str], Any]:
@@ -799,6 +1065,7 @@ class RecordMapper:
     def _contact(self, val: Callable[[str], Any], data: Optional[Dict[str, Any]] = None) -> Optional[Contact]:
         first, last = clean_text(val("first_name"), 100), clean_text(val("last_name"), 100)
         full = clean_text(val("full_name"), NAME_LIMIT)
+        first, last = fill_name_parts(first, last, full)
         email = clean_email(val("email"))
         linkedin = clean_url(val("person_linkedin_url"))
         if not (first or last or full or email or linkedin):
@@ -855,7 +1122,7 @@ class RecordMapper:
             type=_signal_type(val("signal_type")) or SignalType.CUSTOM,
             title=title,
             source=self.label,
-            posted_at=parse_when(val("signal_date"), self.today),
+            posted_at=parse_when(val("signal_date"), self.today, self.date_order),
             url=clean_url(val("signal_url")),
             location=clean_text(val("signal_location"), 200),
             description=clean_description(val("signal_description")),
@@ -873,7 +1140,7 @@ class RecordMapper:
         desc = ds.get("description")
         return Signal(
             type=ds["type"], title=title, source=self.label,
-            posted_at=parse_when(ds.get("date") or ds.get("posted_at"), self.today),
+            posted_at=parse_when(ds.get("date") or ds.get("posted_at"), self.today, self.date_order),
             url=clean_url(ds.get("url")),
             description=clean_description(render_template(str(desc), record, canon,
                                                           require_value=False)) if desc else "",
@@ -895,13 +1162,16 @@ class RecordMapper:
         linkedin = clean_url(val("linkedin_url"))
         website = clean_url(val("website"))
         domain = clean_domain(val("domain"))
+        listing_url = ""
         if website:
-            host = normalize_domain(website)
+            host = safe_host(website)
             if is_blocked_domain(host):
                 if "linkedin.com" in host and not linkedin:
                     linkedin = website
                 website = ""
             elif not clean_domain(website):
+                if is_platform_url(website):
+                    listing_url = website  # booking/listing page shared with other businesses
                 website = ""
         domain = domain or clean_domain(website)
 
@@ -910,12 +1180,21 @@ class RecordMapper:
         if main is not None:
             contacts.append(main)
         contacts.extend(self._people(record))
+        email_domain = ""
         if not domain:
+            # A contact's work-email domain stands in for the company domain only when it
+            # plausibly *is* the company's (free-mail / ISP domains such as sbcglobal.net or
+            # web.de are shared by unrelated businesses and would merge them into one).
             for ct in contacts:
-                if ct.email and not is_personal_email(ct.email):
-                    domain = clean_domain(ct.email)
-                    if domain:
-                        break
+                if not ct.email or is_free_email(ct.email):
+                    continue
+                d = clean_domain(ct.email)
+                if not d:
+                    continue
+                if not name or domain_matches_name(d, name):
+                    domain = d
+                    break
+                email_domain = email_domain or d
         if not name and not domain:
             return None
         if not name:
@@ -924,6 +1203,10 @@ class RecordMapper:
         city, state, country = (clean_text(val(f), 100) for f in ("city", "state", "country"))
         location = clean_text(val("location"), 300) or join_location(city, state, country)
         data = self._data(record, "data.")
+        if listing_url:
+            data.setdefault("listing_url", listing_url)
+        if email_domain:
+            data.setdefault("email_domain", email_domain)
         if city:
             data.setdefault("city", city)
         if state:
@@ -939,7 +1222,8 @@ class RecordMapper:
                 location = sig.location
         fund = funding_signal(val("funding_stage"), val("funding_amount"), val("funding_date"),
                               label=self.label, currency=as_text(val("funding_currency")) or "$",
-                              total=val("funding_total"), url=val("funding_url"), today=self.today)
+                              total=val("funding_total"), url=val("funding_url"), today=self.today,
+                              date_order=self.date_order)
         if sig is None:
             dsig = self._default_signal(record, canon)
             if dsig is not None:
@@ -973,18 +1257,56 @@ class RecordMapper:
         return company
 
 
+def fill_name_parts(first: str, last: str, full: str) -> Tuple[str, str]:
+    """Derive a missing first/last name from ``full`` when only one part is given.
+
+    ('Lena', '', 'Lena Vogel') -> ('Lena', 'Vogel') - email finders (Hunter,
+    Apollo match) need both parts. (``Contact`` itself only splits ``full_name``
+    when *both* parts are empty.)"""
+    if not full or (first and last) or not (first or last):
+        return first, last
+    tokens = full.split()
+    if first:
+        if full.lower().startswith(first.lower() + " "):
+            last = full[len(first):].strip()
+        else:
+            idx = next((i for i, t in enumerate(tokens) if t.lower() == first.lower()), None)
+            if idx is not None:
+                last = " ".join(tokens[idx + 1:])
+            elif len(tokens) > 1:
+                last = " ".join(tokens[1:])
+    else:
+        if full.lower().endswith(" " + last.lower()):
+            rest = full[: len(full) - len(last)].split()
+            first = rest[0] if rest else ""
+        elif len(tokens) > 1 and tokens[0].lower() != last.lower():
+            first = tokens[0]
+    return first, last
+
+
 def records_to_companies(records: Iterable[Dict[str, Any]], mapping: Optional[Dict[str, Any]], *,
                          label: str, defaults: Optional[Dict[str, Any]] = None,
                          today: Optional[date] = None, limit: int = 0,
                          signal_title_template: Optional[str] = None, default_signal: Any = None,
                          people: Any = None, location_from_signal: bool = True,
                          signal_requires: Optional[Sequence[str]] = None,
-                         log: Any = None) -> List[Company]:
-    """Map records to grouped ``Company`` objects (see module docstring)."""
+                         log: Any = None, date_order: Optional[str] = None) -> List[Company]:
+    """Map records to grouped ``Company`` objects (see module docstring).
+
+    ``date_order`` ('mdy' | 'dmy'); unset, it is inferred from the records'
+    numeric dates so one column is never read half d/m/y and half m/d/y."""
     mapper = RecordMapper(mapping, label=label, defaults=defaults, today=today,
                           signal_title_template=signal_title_template, default_signal=default_signal,
                           people=people, location_from_signal=location_from_signal,
-                          signal_requires=signal_requires)
+                          signal_requires=signal_requires, date_order=date_order)
+    if mapper.date_order is None:
+        records = records if isinstance(records, list) else list(records)
+        mapper.date_order = mapper.infer_date_order(records)
+        if mapper.date_order is None and log is not None and mapper.has_ambiguous_dates(records):
+            log.warning("%s: numeric dates like 5/9/2026 are ambiguous (day/month order unknown); "
+                        "reading them as day/month - set 'date_order: mdy' for US-style dates", label)
+        elif mapper.date_order and log is not None:
+            log.debug("%s: numeric dates read as %s", label, mapper.date_order)
     collector = CompanyCollector(limit)
     total = skipped = 0
     for rec in records:
@@ -1045,7 +1367,8 @@ _H_PLAIN_LOCATION = ["location", "address", "fulladdress"]
 _H_PLAIN_CITY = ["city", "town"]
 _H_PLAIN_STATE = ["state", "region", "province", "stateprovince"]
 _H_PLAIN_COUNTRY = ["country", "countrycode", "countryname"]
-_H_INDUSTRY = ["industry", "companyindustry", "industries", "sector", "vertical", "category"]
+_H_INDUSTRY = ["industry", "companyindustry", "industries", "sector", "vertical", "category", "categoryname",
+               "maincategory"]
 _H_EMPLOYEES = ["#employees", "employees", "numberofemployees", "noofemployees", "numemployees",
                 "employeecount", "companyemployeecount", "companysize", "companyheadcount", "headcount",
                 "size", "employeesize", "estimatednumemployees", "employeerange", "staffcount",
@@ -1087,6 +1410,17 @@ _H_SIGNAL_LOCATION = ["signallocation", "joblocation", "vacancylocation", "posti
 _H_SIGNAL_DESCRIPTION = ["signaldescription", "jobdescription", "vacancydescription",
                          "postingdescription"]
 _H_SIGNAL_ID = ["signalid", "jobid", "postingid", "vacancyid", "jobreference", "jobref"]
+
+# Columns only place / local-business exports have (Google Maps scrapers, Outscraper, ...);
+# the weak ones (a CRM may have a 'Rating') count only in pairs.
+_H_PLACE = ["reviewscount", "reviewcount", "numberofreviews", "totalscore", "placeid", "googleplaceid",
+            "categoryname", "maincategory", "workinghours", "openinghours", "businessstatus", "googlemapsurl",
+            "mapsurl", "pluscode", "locatedin"]
+_H_PLACE_WEAK = ["rating", "reviews", "averagerating", "latitude", "longitude", "lat", "lng", "cid", "googleid"]
+# Columns that make a bare 'title' a job title rather than a business name.
+_H_JOB_EVIDENCE = (_H_SIGNAL_TITLE_ONLY + ["jobtitle", "position", "role"] + _H_SIGNAL_URL + _H_SIGNAL_DATE
+                   + _H_SIGNAL_DESCRIPTION + _H_SIGNAL_ID + ["salary", "jobtype", "employmenttype",
+                                                               "contracttype"])
 
 _H_FUNDING_STAGE = ["latestfunding", "latestfundingstage", "latestfundinground", "latestfundingtype",
                     "fundingstage", "lastfundingtype", "lastfundingstage", "lastfundinground",
@@ -1142,10 +1476,23 @@ def detect_mapping(headers: Sequence[Any]) -> Tuple[Dict[str, List[str]], Dict[s
         return chosen
 
     has_company_name_col = bool(present(_H_COMPANY_NAME))
+    has_person_name_cols = bool(present(_H_FIRST + _H_LAST + _H_FULL))
     has_person = bool(present(_H_FIRST + _H_LAST + _H_FULL + _H_EMAIL))
+    # Place / local-business exports (Google Maps scrapers, Outscraper, ...) have no
+    # company column: their 'title' / 'name' column *is* the business name - not a job
+    # title (-> "Saw you're hiring a Blue Door Dental") nor a person's name.
+    business_col = ""
+    place_like = bool(present(_H_PLACE)) or len(present(_H_PLACE_WEAK)) >= 2
+    if not has_company_name_col and not has_person_name_cols and place_like:
+        person_specific = present(_H_PERSON_TITLE_ONLY + _H_PERSON_LINKEDIN + _H_SENIORITY + _H_DEPARTMENT)
+        if "name" in by_norm and not person_specific and not present(_H_AMBIG_TITLE):
+            business_col = "name"
+        elif "title" in by_norm and "name" not in by_norm and not present(_H_JOB_EVIDENCE):
+            business_col = "title"
     if "name" in by_norm and (has_company_name_col or has_person):
         has_person = True
-    job_title_cols = present(_H_AMBIG_TITLE + _H_SIGNAL_TITLE_ONLY)
+    job_title_cols = [h for h in present(_H_AMBIG_TITLE + _H_SIGNAL_TITLE_ONLY)
+                      if not business_col or h != by_norm[business_col]]
     if has_person:
         mode = "people"
     elif job_title_cols:
@@ -1154,8 +1501,11 @@ def detect_mapping(headers: Sequence[Any]) -> Tuple[Dict[str, List[str]], Dict[s
         mode = "companies"
 
     # company identity
-    if not pick("name", _H_COMPANY_NAME, multi=True) and "name" in by_norm and not has_person:
-        pick("name", ["name"])
+    if not pick("name", _H_COMPANY_NAME, multi=True):
+        if business_col:
+            pick("name", [business_col])
+        elif "name" in by_norm and not has_person:
+            pick("name", ["name"])
     pick("domain", _H_DOMAIN)
     pick("website", _H_WEBSITE + (["url", "link"] if mode == "companies" else []))
     pick("linkedin_url", _H_COMPANY_LINKEDIN + (_H_AMBIG_LINKEDIN if mode != "people" else []))
@@ -1261,8 +1611,9 @@ __all__ = [
     "CANONICAL_FIELDS", "COMPANY_FIELDS", "PERSON_FIELDS", "SIGNAL_FIELDS", "FUNDING_FIELDS",
     "DESCRIPTION_LIMIT", "CompanyCollector", "RecordMapper", "records_to_companies",
     "detect_mapping", "resolve_columns", "normalize_mapping", "merge_mappings", "canonical_field",
-    "normalize_email_status", "parse_when", "strip_html", "clean_text", "clean_title",
-    "clean_description", "clean_domain", "clean_email", "clean_url", "funding_signal",
+    "normalize_email_status", "parse_when", "infer_date_order", "normalize_date_order", "strip_html",
+    "clean_text", "clean_title", "clean_description", "clean_domain", "clean_email", "clean_url",
+    "safe_host", "is_platform_url", "is_free_email", "domain_matches_name", "fill_name_parts", "funding_signal",
     "format_money", "parse_amount", "pretty_stage", "render_template", "is_blank", "as_text",
     "lookup_path", "first_value", "split_keywords", "join_location", "normalize_header", "record_keys",
 ]

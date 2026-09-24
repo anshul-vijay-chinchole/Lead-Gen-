@@ -871,3 +871,196 @@ def test_build_writer_selection(make_ctx, caplog):
 def test_pipeline_uses_build_writer():
     import leadgen.pipeline as pipeline
     assert pipeline.build_writer is build_writer
+
+
+# =============================================================================================
+# Regressions
+# =============================================================================================
+
+def test_ai_writer_network_error_reason_never_carries_the_request_headers(make_ctx):
+    # requests' InvalidHeader quotes the header value (= the API key); HttpClient wraps it as HTTP 0
+    leak = HttpError(0, "https://api.openai.com/v1/chat/completions",
+                     "InvalidHeader: Invalid leading whitespace, reserved character(s), or return "
+                     "character(s) in header value: 'Bearer sk-live-SECRETSECRET\\n'")
+    ctx = ai_ctx(make_ctx, leak, leak, leak, leak, max_llm_failures=3)
+    w = AIWriter({}, ctx)
+    outs = [w.write(make_lead()) for _ in range(4)]
+    for out in outs:
+        assert out.writer == "template" and "SECRET" not in " ".join(out.warnings)
+    assert outs[0].warnings[0] == "ai fallback: HttpError: LLM request failed without a response (InvalidHeader)"
+    assert w._disabled and "SECRET" not in w._disabled  # the disabled reason reaches every later lead
+    # an ordinary HTTP error keeps its useful detail
+    ctx2 = ai_ctx(make_ctx, HttpError(500, "https://api.openai.com/v1/chat/completions", "overloaded"))
+    assert "HTTP 500" in AIWriter({}, ctx2).write(make_lead()).warnings[0]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("Saw you're hiring a .NET Developer.", "Saw you're hiring a .NET Developer."),
+    (".NET developer at Acme", ".NET developer at Acme"),
+    ("Following up on the .NET role.", "Following up on the .NET role."),
+    ("We place .NET engineers", "We place .NET engineers"),
+    ("Java, .NET and Go", "Java, .NET and Go"),
+    ("roughly .5 FTE", "roughly .5 FTE"),
+    ("saw you're hiring a .", "saw you're hiring."),       # emptied placeholders are still tidied
+    ("line one.\n.\n, leftover", "line one.\n\nleftover"),
+])
+def test_tidy_keeps_words_that_start_with_a_dot(raw, expected):
+    assert tidy(raw) == expected
+
+
+def test_template_and_ai_copy_keep_dotnet_titles(make_ctx):
+    ctx = make_ctx(offer=OFFER)
+    lead = make_lead(signals=[Signal(type="job_posting", title=".NET Developer", posted_at="2026-09-22")])
+    out = TemplateWriter({}, ctx).write(lead)
+    assert out.messages[0].subject == ".NET developer at Acme Widgets"
+    assert "Saw you're hiring a .NET Developer this week." in out.messages[0].body
+    assert "the .NET Developer hire" in out.messages[1].body
+    assert out.warnings == []
+    assert article(".NET Developer") == "a"
+    assert clean_body("Hi Jane,\n\nFollowing up on the .NET role.\n\nAny interest?") == \
+        "Hi Jane,\n\nFollowing up on the .NET role.\n\nAny interest?"
+
+
+def test_ai_writer_rejects_non_string_bodies_and_subjects(make_ctx):
+    # a list of paragraphs is joined, never rendered as a Python list repr
+    data = ai_response(n=2)
+    data["emails"][0]["body"] = ["Hi Jane,", "Saw Acme is hiring a Senior Accountant.", "Worth a quick chat?"]
+    ctx = ai_ctx(make_ctx, data, sequence=[{"day": 1}, {"day": 3}])
+    out = AIWriter({}, ctx).write(make_lead())
+    assert out.writer == "ai:fake-model" and out.warnings == []
+    assert out.messages[0].body.startswith("Hi Jane,\n\nSaw Acme is hiring a Senior Accountant.\n\nWorth a quick chat?")
+    assert "['" not in out.messages[0].body
+    # anything else that is not text is a problem -> feedback retry -> template fallback
+    for field, value in (("body", {"text": "Hi"}), ("body", ["Hi", 3]), ("subject", ["senior accountant"])):
+        bad = ai_response(n=2)
+        bad["emails"][0][field] = value
+        ctx = ai_ctx(make_ctx, bad, bad, sequence=[{"day": 1}, {"day": 3}])
+        out = AIWriter({}, ctx).write(make_lead())
+        assert out.writer == "template", (field, value)
+        assert f"step 1: {field} must be a plain string" in out.warnings[0]
+        assert f"step 1: {field} must be a plain string" in ctx.llm.calls[1]["user"]  # fed back once
+
+
+def test_guardrails_work_for_non_latin_campaigns(make_ctx):
+    ctx = make_ctx(offer=dict(OFFER, language="Russian"), writer={
+        "type": "ai", "provider": "openai", "sequence": [{"day": 1}, {"day": 3}],
+        "banned_phrases": ["бесплатно"]})
+    lead = make_lead(name="Яндекс", domain="yandex.ru",
+                     signals=[Signal(type="job_posting", title="Главный бухгалтер", posted_at="2026-09-22")],
+                     contact=Contact(first_name="Анна", email="anna@yandex.ru"))
+    good = {"emails": [
+        {"step": 1, "subject": "бухгалтер в Яндекс",
+         "body": "Здравствуйте, Анна!\n\nУвидел, что Яндекс ищет главного бухгалтера.\n\nУдобно обсудить?"},
+        {"step": 2, "subject": "", "body": "Анна, добрый день.\n\nНапоминаю про бухгалтера.\n\nИнтересно?"}]}
+    ctx.llm = RecordingLLM(good)
+    out = AIWriter({}, ctx).write(lead)
+    assert out.writer == "ai:fake-model" and out.warnings == [] and len(ctx.llm.calls) == 1
+    # inflected company name ("в Яндексе") still counts as a mention
+    inflected = msg("Здравствуйте, Анна!\n\nКоманда в Яндексе растёт.\n\nУдобно?", "идея", lead=lead, ctx=ctx)
+    assert check_message(inflected, lead, ctx, 0) == []
+    # ... and non-Latin copy that ignores the company is still caught
+    vague = msg("Здравствуйте, Анна!\n\nЕсть идея.\n\nУдобно?", "идея", lead=lead, ctx=ctx)
+    assert any("does not mention" in p for p in check_message(vague, lead, ctx, 0))
+    # non-Latin banned phrases are enforced, identical bodies are detected
+    spam = msg("Здравствуйте!\n\nЯндекс, это бесплатно.\n\nУдобно?", "идея", lead=lead, ctx=ctx)
+    assert 'step 1: uses banned phrase "бесплатно"' in check_message(spam, lead, ctx, 0)
+    same = [Message(step=i + 1, day=i + 1, subject="идея" if i == 0 else "",
+                    body=append_signoff("Яндекс ищет бухгалтера.", *signoff_for(lead, ctx))) for i in range(2)]
+    assert "step 2: same body as step 1" in check_sequence(same, lead, ctx)
+    # Latin names next to non-spaced scripts (Japanese particles) still match
+    jp = make_lead(name="Acme", domain="acme.co.jp", signals=[])
+    assert check_message(msg("Acmeが経理担当者を募集中と拝見しました。", "ご提案", lead=jp, ctx=ctx), jp, ctx, 0) == []
+
+
+def test_custom_signal_phrase_gets_no_extra_age_phrase(make_ctx):
+    lead = make_lead(signals=[Signal(type="job_posting", title="Senior Accountant", posted_at="2026-09-22")])
+    cases = {
+        "saw your {signal_title} post {signal_age_phrase}": "Saw your Senior Accountant post this week.",
+        "I saw you're hiring a {signal_title}.": "I saw you're hiring a Senior Accountant.",
+        "congrats on opening the {signal_title} role!": "Congrats on opening the Senior Accountant role!",
+    }
+    for phrase, opener in cases.items():
+        ctx = make_ctx(offer=OFFER, writer={"templates": {"signal_phrases": {"job_posting": phrase}}})
+        out = TemplateWriter({}, ctx).write(lead)
+        assert out.personalization == opener
+        assert out.messages[0].body.split("\n")[2] == opener
+    # the built-in phrase still gets its age
+    assert TemplateWriter({}, make_ctx(offer=OFFER)).write(lead).personalization == \
+        "Saw you're hiring a Senior Accountant this week."
+
+
+def test_ai_side_fields_pass_guardrails_before_export(make_ctx):
+    data = ai_response(n=2, personalization_line="<the opening line of email 1, referencing the signal>",
+                       pain_hypothesis="[Company] is stretched")
+    ctx = ai_ctx(make_ctx, data, sequence=[{"day": 1}, {"day": 3}])
+    out = AIWriter({}, ctx).write(make_lead())
+    assert out.writer == "ai:fake-model"
+    assert out.personalization == "Saw Acme is hiring a Senior Accountant this week."  # first sentence of email 1
+    assert out.hypothesis == ""
+    for bad in ("Hi {first_name}, saw the role.", "See https://evil.example/x", "Act now on the Senior Accountant role",
+                ["Saw Acme is hiring."], {"line": "x"}):
+        ctx = ai_ctx(make_ctx, ai_response(n=2, personalization_line=bad, pain_hypothesis=bad),
+                     sequence=[{"day": 1}, {"day": 3}])
+        out = AIWriter({}, ctx).write(make_lead())
+        assert out.personalization == "Saw Acme is hiring a Senior Accountant this week.", bad
+        assert out.hypothesis == "", bad
+    # good values pass through, tidied to one line
+    ctx = ai_ctx(make_ctx, ai_response(n=2, personalization_line="  **Saw Acme** is hiring\na Senior Accountant. ",
+                                       pain_hypothesis="Month-end\nis landing on fewer people."),
+                 sequence=[{"day": 1}, {"day": 3}])
+    out = AIWriter({}, ctx).write(make_lead())
+    assert out.personalization == "Saw Acme is hiring a Senior Accountant."
+    assert out.hypothesis == "Month-end is landing on fewer people."
+
+
+@pytest.mark.parametrize("contact, greeting", [
+    (Contact(full_name="Dr. Jane Smith"), "Hi Jane,"),
+    (Contact(full_name="Smith, Jane"), "Hi Jane,"),
+    (Contact(full_name="Mr John Doe"), "Hi John,"),
+    (Contact(full_name="PROF. ANN LEE"), "Hi Ann,"),
+    (Contact(full_name="Dr. Smith"), "Hi there,"),               # only a surname left
+    (Contact(first_name="Dr.", last_name="Smith"), "Hi there,"),
+    (Contact(first_name="Ms", last_name="Jane Roe"), "Hi Jane,"),
+    (Contact(first_name="Jane", full_name="Dr. Jane Smith"), "Hi Jane,"),
+    (Contact(full_name="jane doe"), "Hi Jane,"),
+    (Contact(full_name="Jane Smith, CPA"), "Hi Jane,"),
+])
+def test_greeting_skips_honorifics_and_reads_last_first(make_ctx, contact, greeting):
+    ctx = make_ctx(offer=OFFER)
+    lead = make_lead(contact=contact)
+    assert TemplateWriter({}, ctx).write(lead).messages[0].body.split("\n")[0] == greeting
+    first = greeting[3:-1]
+    prompt = build_user_prompt(lead, ctx)
+    if first == "there":
+        assert "first name unknown" in prompt
+    else:
+        assert f"- first name: {first}\n" in prompt
+    assert nice_name("Dr.") == "" and nice_name("Dr. Jane") == "Jane" and nice_name("Mrs") == ""
+
+
+def test_booking_link_allowlist_needs_same_host_and_path_boundary(make_ctx):
+    lead = make_lead()
+    ctx = make_ctx(offer=dict(OFFER, booking_link="https://cal.com"))
+    for url in ("https://cal.com.evil.io/phish", "https://cal.comx.io", "https://cal.com@evil.io/x"):
+        assert any(p.startswith(f"step 1: link not allowed: {url}")
+                   for p in check_message(msg(GOOD_BODY + f" Book: {url}", "acme", lead=lead, ctx=ctx), lead, ctx, 0))
+    ok = GOOD_BODY + " Book: https://cal.com/sam and www.cal.com"
+    assert check_message(msg(ok, "acme", lead=lead, ctx=ctx), lead, ctx, 0) == []
+    ctx2 = make_ctx(offer=dict(OFFER, booking_link="https://calendly.com/sam"))
+    bad = check_message(msg(GOOD_BODY + " Book: https://calendly.com/sammy-scam", "acme", lead=lead, ctx=ctx2),
+                        lead, ctx2, 0)
+    assert bad == ["step 1: link not allowed: https://calendly.com/sammy-scam "
+                   "(only offer.booking_link / offer.sender_website)"]
+    for url in ("https://calendly.com/sam", "https://calendly.com/sam/15min", "https://calendly.com/sam?month=10",
+                "https://Calendly.com/Sam/"):
+        assert check_message(msg(GOOD_BODY + f" Book: {url}", "acme", lead=lead, ctx=ctx2), lead, ctx2, 0) == [], url
+
+
+def test_guardrails_flag_echoed_prompt_examples_but_not_bracketed_links(ctx):
+    lead = make_lead()
+    for token in ("<the opening line of email 1, referencing the signal>", "<plain text body>",
+                  "<one sentence: the problem this signal suggests they have now>"):
+        problems = check_message(msg(GOOD_BODY + f" {token}", "acme", lead=lead, ctx=ctx), lead, ctx, 0)
+        assert f"step 1: leftover placeholder or markup {token}" in problems
+    ok = GOOD_BODY + " Book: <https://cal.com/sam/15min> or mail <sam@northwind.example>, under <2 weeks."
+    assert check_message(msg(ok, "acme", lead=lead, ctx=ctx), lead, ctx, 0) == []

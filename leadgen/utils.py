@@ -61,7 +61,10 @@ def normalize_domain(value: Any) -> str:
         v = v.split("@", 1)[1]
     if "://" not in v:
         v = "http://" + v
-    host = urlparse(v).hostname or ""
+    try:
+        host = urlparse(v).hostname or ""
+    except ValueError:  # stray brackets ('[acme.com]', 'acme.com]') or other junk: no domain
+        return ""
     if host.startswith("www."):
         host = host[4:]
     return host.strip(".")
@@ -72,11 +75,13 @@ def company_key(name: Any, domain: Any = "") -> str:
     return d if d else "name:" + normalize_company_name(name)
 
 
-def parse_date(value: Any, today: Optional[date] = None) -> Optional[date]:
+def parse_date(value: Any, today: Optional[date] = None, date_order: Optional[str] = None) -> Optional[date]:
     """Parse ISO strings, datetimes, unix timestamps (s or ms), and 'N days ago'.
 
     Relative phrases ('3 days ago', 'today', 'yesterday') resolve against
-    ``today`` (the run date) when given, else the system date.
+    ``today`` (the run date) when given, else the system date. ``date_order``
+    ('mdy' or 'dmy') decides ambiguous numeric dates like 05/06/2026 (default: dmy
+    first, then mdy).
     """
     ref = today or date.today()
     if value is None or value == "":
@@ -112,7 +117,8 @@ def parse_date(value: Any, today: Optional[date] = None) -> Optional[date]:
         return datetime.fromisoformat(iso).date()
     except ValueError:
         pass
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d %b %Y", "%b %d, %Y",
+    numeric = ("%m/%d/%Y", "%d/%m/%Y") if (date_order or "").lower() == "mdy" else ("%d/%m/%Y", "%m/%d/%Y")
+    for fmt in ("%Y-%m-%d",) + numeric + ( "%Y/%m/%d", "%d %b %Y", "%b %d, %Y",
                 "%d %B %Y", "%B %d, %Y", "%Y-%m-%dT%H:%M:%S.%f%z", "%a, %d %b %Y %H:%M:%S %z"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -145,8 +151,36 @@ def is_valid_email(email: Any) -> bool:
     return bool(email) and bool(EMAIL_RE.match(str(email).strip().lower()))
 
 
+# Webmail brands whose regional domains (yahoo.fr, hotmail.de, gmx.net, ...) are personal too.
+_WEBMAIL_BRANDS = frozenset({"gmail", "googlemail", "yahoo", "ymail", "rocketmail", "hotmail", "outlook",
+                             "live", "msn", "aol", "gmx", "icloud", "protonmail", "proton", "yandex",
+                             "mail", "zoho", "tutanota", "fastmail"})
+_ISP_MAIL_DOMAINS = frozenset({
+    "sbcglobal.net", "bellsouth.net", "cox.net", "charter.net", "earthlink.net", "optonline.net",
+    "frontier.com", "roadrunner.com", "rr.com", "windstream.net", "centurylink.net", "q.com",
+    "shaw.ca", "rogers.com", "sympatico.ca", "videotron.ca", "telus.net", "bigpond.com",
+    "bigpond.net.au", "optusnet.com.au", "xtra.co.nz", "talktalk.net", "ntlworld.com",
+    "blueyonder.co.uk", "tiscali.co.uk", "orange.fr", "wanadoo.fr", "free.fr", "sfr.fr", "laposte.net",
+    "web.de", "t-online.de", "freenet.de", "arcor.de", "libero.it", "virgilio.it", "alice.it",
+    "tin.it", "telefonica.net", "terra.com.br", "uol.com.br", "bol.com.br", "seznam.cz",
+    "wp.pl", "o2.pl", "onet.pl", "interia.pl", "rediffmail.com", "naver.com", "hanmail.net",
+    "qq.com", "163.com", "126.com", "sina.com", "yeah.net", "mail.ru", "rambler.ru", "bk.ru",
+    "inbox.ru", "list.ru", "ukr.net", "hushmail.com", "pm.me", "hey.com",
+})
+
+
 def is_personal_email(email: str) -> bool:
-    return normalize_domain(email) in PERSONAL_EMAIL_DOMAINS
+    """Free-mail / ISP address (gmail, yahoo.fr, sbcglobal.net, web.de, ...): not a company domain."""
+    d = normalize_domain(email)
+    if not d:
+        return False
+    if d in PERSONAL_EMAIL_DOMAINS or d in _ISP_MAIL_DOMAINS:
+        return True
+    labels = d.split(".")
+    # brand.tld or brand.co.xx / brand.com.xx
+    if labels[0] in _WEBMAIL_BRANDS and (len(labels) == 2 or (len(labels) == 3 and labels[1] in ("co", "com"))):
+        return True
+    return False
 
 
 def contains_any(text: Any, needles: Iterable[str]) -> Optional[str]:

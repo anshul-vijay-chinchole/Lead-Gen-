@@ -127,7 +127,7 @@ notify:
   channels:
     - type: console
     # - type: slack
-  on: [positive, referral, question, run_summary]
+  "on": [positive, referral, question, run_summary]     # keep "on" quoted (YAML)
 
 storage:
   path: data/leadgen.db

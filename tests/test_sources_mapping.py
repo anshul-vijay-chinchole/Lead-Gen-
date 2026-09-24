@@ -334,3 +334,158 @@ def test_resolve_columns(caplog):
                               ["Company Name", "Industry"], log=logging.getLogger("leadgen.test"), label="csv")
     assert out == {"name": ["Company Name"], "industry": ["Sector", "Industry"], "city": ["hq.city"]}
     assert "'Sector': no such column" in caplog.text and "hq.city" not in caplog.text
+
+
+# --- regressions (verifier/fixer pass) --------------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    # negated "valid"/"deliverable" is a known-bad address, never VALID (verification would be skipped)
+    ("Not valid", EmailStatus.INVALID), ("not_valid", EmailStatus.INVALID), ("NotValid", EmailStatus.INVALID),
+    ("non-deliverable", EmailStatus.INVALID), ("Not deliverable", EmailStatus.INVALID),
+    # pending / negated checks -> unknown, so the configured verifier still runs
+    ("Validation pending", EmailStatus.UNKNOWN), ("Needs validation", EmailStatus.UNKNOWN),
+    ("unvalidated", EmailStatus.UNKNOWN), ("Not Validated", EmailStatus.UNKNOWN), ("not ok", EmailStatus.UNKNOWN),
+    ("verification required", EmailStatus.UNKNOWN),
+    # positives keep working
+    ("Email valid", EmailStatus.VALID), ("Verified - SMTP", EmailStatus.VALID),
+    ("Valid (catch-all)", EmailStatus.RISKY),
+])
+def test_email_status_negations_and_pending_are_never_valid(raw, expected):
+    assert normalize_email_status(raw) == expected
+
+
+def test_record_with_not_valid_status_is_not_marked_valid():
+    [c] = records_to_companies(
+        [{"Company": "Acme Corp", "Website": "acme-demo.com", "First Name": "Jane", "Last Name": "Doe",
+          "Email": "jane.doe@acme-demo.com", "Email Status": "Not valid"}],
+        {"name": "Company", "website": "Website", "first_name": "First Name", "last_name": "Last Name",
+         "email": "Email", "email_status": "Email Status"}, label="csv", today=TODAY)
+    assert c.contacts[0].email_status == EmailStatus.INVALID
+
+
+MAPPING_PEOPLE = {"name": "Company", "first_name": "First", "last_name": "Last", "email": "Email"}
+
+
+def test_isp_and_regional_freemail_domains_never_become_company_domain():
+    recs = [{"Company": "Bob's HVAC", "First": "Bob", "Last": "Smith", "Email": "bob@sbcglobal.net"},
+            {"Company": "Joe's Plumbing", "First": "Joe", "Last": "Jones", "Email": "joe@sbcglobal.net"},
+            {"Company": "Praxis Weber", "First": "Anna", "Last": "Weber", "Email": "praxis.weber@web.de"},
+            {"Company": "Praxis Keller", "First": "Tom", "Last": "Keller", "Email": "praxis.keller@web.de"},
+            {"Company": "Salon Lumi", "First": "Ana", "Last": "Lumi", "Email": "ana@yahoo.co.nz"}]
+    companies = records_to_companies(recs, MAPPING_PEOPLE, label="csv", today=TODAY)
+    assert [(c.name, c.domain, [ct.email for ct in c.contacts]) for c in companies] == [
+        ("Bob's HVAC", "", ["bob@sbcglobal.net"]), ("Joe's Plumbing", "", ["joe@sbcglobal.net"]),
+        ("Praxis Weber", "", ["praxis.weber@web.de"]), ("Praxis Keller", "", ["praxis.keller@web.de"]),
+        ("Salon Lumi", "", ["ana@yahoo.co.nz"])]
+
+
+def test_email_domain_unrelated_to_company_name_is_only_a_hint():
+    # an unknown ISP shared by two businesses must not merge them into one company
+    recs = [{"Company": "Bob's HVAC", "First": "Bob", "Last": "Smith", "Email": "bob@tri-county-isp.net"},
+            {"Company": "Joe's Plumbing", "First": "Joe", "Last": "Jones", "Email": "joe@tri-county-isp.net"},
+            {"Company": "Acme Corp", "First": "Jane", "Last": "Doe", "Email": "jane@acme-demo.com"},
+            {"Company": "Blue Door Dental", "First": "Sam", "Last": "Poe", "Email": "sam@bluedoordental.co.uk"},
+            {"Company": "International Business Machines", "First": "Al", "Last": "Bo", "Email": "al@ibm.com"}]
+    bob, joe, acme, blue, ibm = records_to_companies(recs, MAPPING_PEOPLE, label="csv", today=TODAY)
+    assert (bob.name, bob.domain, bob.data["email_domain"]) == ("Bob's HVAC", "", "tri-county-isp.net")
+    assert (joe.name, joe.domain, [c.email for c in joe.contacts]) == ("Joe's Plumbing", "", ["joe@tri-county-isp.net"])
+    assert acme.domain == "acme-demo.com" and blue.domain == "bluedoordental.co.uk" and ibm.domain == "ibm.com"
+    # nameless rows still take the work-email domain as identity
+    [c] = records_to_companies([{"Email": "jane@quantum-ink.com"}], {"email": "Email"}, label="csv")
+    assert (c.name, c.domain) == ("quantum-ink.com", "quantum-ink.com")
+
+
+GOOGLE_MAPS_KEYS = ["title", "totalScore", "reviewsCount", "street", "city", "countryCode", "website", "phone",
+                    "categoryName", "url", "placeId"]
+
+
+def test_detect_mapping_google_maps_title_is_the_business_name_not_a_job():
+    m, info = detect_mapping(GOOGLE_MAPS_KEYS)
+    assert m["name"] == ["title"] and "signal_title" not in m and info["mode"] == "companies"
+    assert m["industry"] == ["categoryName"]
+    # with an email column the business name is still not the person's title
+    m, info = detect_mapping(GOOGLE_MAPS_KEYS + ["email"])
+    assert m["name"] == ["title"] and "title" not in m and m["email"] == ["email"]
+    # a plain job list without company column keeps reading 'title' as the job
+    m, info = detect_mapping(["title", "website", "posted"])
+    assert info["mode"] == "jobs" and m["signal_title"] == ["title"]
+
+
+def test_detect_mapping_place_export_name_column_is_the_business():
+    m, info = detect_mapping(["name", "site", "phone", "full_address", "email_1", "rating", "reviews"])
+    assert m["name"] == ["name"] and "full_name" not in m and m["email"] == ["email_1"]
+    [c] = records_to_companies([{"name": "Blue Door Dental", "site": "https://bluedoordental.co.uk",
+                                 "email_1": "sarah.jones@bluedoordental.co.uk", "rating": 4.8, "reviews": 212}],
+                               m, label="csv", today=TODAY)
+    assert c.name == "Blue Door Dental" and c.domain == "bluedoordental.co.uk"
+    [ct] = c.contacts
+    assert (ct.first_name, ct.last_name, ct.email) == ("", "", "sarah.jones@bluedoordental.co.uk")
+    # people lists keep 'Name' as the person
+    m, _ = detect_mapping(["Name", "Email", "Title"])
+    assert m["full_name"] == ["Name"] and "name" not in m
+    m, _ = detect_mapping(["Name", "Email"])
+    assert m["full_name"] == ["Name"]
+
+
+def test_booking_and_listing_platform_pages_are_not_company_domains():
+    assert clean_domain("https://www.doctolib.fr/dentiste/paris/luc-martin") == ""
+    assert clean_domain("https://booksy.com/en-us/123_glow-salon") == ""
+    assert clean_domain("https://calendly.com/acme-consulting/30min") == ""
+    assert clean_domain("https://www.tripadvisor.co.uk/Restaurant_Review-g1-d2") == ""
+    assert clean_domain("https://youtu.be/abc") == "" and clean_domain("https://lnkd.in/xyz") == ""
+    # the platforms themselves stay usable as prospects
+    assert clean_domain("https://calendly.com") == "calendly.com"
+    assert clean_domain("https://www.doctolib.fr/") == "doctolib.fr" and clean_domain("doctolib.fr") == "doctolib.fr"
+    assert clean_domain("https://www.bluedoordental.co.uk/booking/online") == "bluedoordental.co.uk"
+    recs = [{"title": "Cabinet Dentaire Martin", "website": "https://www.doctolib.fr/dentiste/paris/luc-martin"},
+            {"title": "Centre Dentaire Opera", "website": "https://www.doctolib.fr/centre-dentaire/paris/opera"}]
+    a, b = records_to_companies(recs, {"name": "title", "website": "website"}, label="apify")
+    assert (a.name, a.domain, a.website) == ("Cabinet Dentaire Martin", "", "")
+    assert a.data["listing_url"] == "https://www.doctolib.fr/dentiste/paris/luc-martin"
+    assert (b.name, b.domain) == ("Centre Dentaire Opera", "")
+
+
+def test_bracketed_domain_values_do_not_raise():
+    assert clean_domain("acme.com]") == "acme.com"
+    assert clean_domain("[acme.com]") == "acme.com"
+    assert clean_domain("https://[www.acme.com]") == "acme.com"
+    assert clean_domain("[Acme](https://acme.com)") in ("", "acme.com")
+    recs = [{"Company": "Weird Co", "Website": "[weirdco.com]"}, {"Company": "Odd Co", "Website": "https://[odd.io"},
+            {"Company": "Good Co", "Website": "good.io"}]
+    companies = records_to_companies(recs, {"name": "Company", "website": "Website"}, label="csv")
+    assert [(c.name, c.domain) for c in companies] == [("Weird Co", "weirdco.com"), ("Odd Co", "odd.io"),
+                                                        ("Good Co", "good.io")]
+
+
+def test_numeric_dates_follow_the_files_day_month_order():
+    assert parse_when("9/5/2026", TODAY, "mdy") == date(2026, 9, 5)
+    assert parse_when("9/5/2026", TODAY, "dmy") == date(2026, 5, 9)
+    assert parse_when("9/5/2026 14:03", TODAY, "mdy") == date(2026, 9, 5)
+    assert parse_when("13/5/2026", TODAY, "mdy") is None
+    assert parse_when("9/5/2026", TODAY) == date(2026, 5, 9)  # legacy default without evidence
+    recs = [{"Company": "Fresh Co", "Date": "9/5/2026"}, {"Company": "Fresh Two", "Date": "9/20/2026"},
+            {"Company": "Stale Co", "Date": "1/9/2026"}]
+    mapping = {"name": "Company", "signal_title": "Company", "signal_date": "Date"}
+    got = {c.name: c.signals[0].posted_at for c in records_to_companies(recs, mapping, label="csv", today=TODAY)}
+    assert got == {"Fresh Co": date(2026, 9, 5), "Fresh Two": date(2026, 9, 20), "Stale Co": date(2026, 1, 9)}
+    got = {c.name: c.signals[0].posted_at
+           for c in records_to_companies(recs[:1], mapping, label="csv", today=TODAY, date_order="us")}
+    assert got == {"Fresh Co": date(2026, 9, 5)}
+    with pytest.raises(ValueError, match="date_order"):
+        records_to_companies(recs, mapping, label="csv", date_order="ymd")
+
+
+def test_first_name_plus_full_name_yields_last_name():
+    mapper = RecordMapper({}, label="x", people={"path": "team", "mapping": {"full_name": "full_name",
+                                                                             "first_name": "first_name"}})
+    c = mapper.to_company({"team": [{"full_name": "Lena Vogel", "first_name": "Lena"},
+                                    {"full_name": "Dr. Max Mustermann", "first_name": "Max"},
+                                    {"full_name": "Cher", "first_name": "Cher"}]},
+                          extra_defaults={"name": "Nordlicht"})
+    assert [(ct.first_name, ct.last_name) for ct in c.contacts] == [("Lena", "Vogel"), ("Max", "Mustermann"),
+                                                                    ("Cher", "")]
+
+
+def test_detect_mapping_crm_rating_column_does_not_make_name_a_business():
+    m, _ = detect_mapping(["Name", "Email", "Rating"])  # e.g. a CRM lead rating (Hot/Warm/Cold)
+    assert m["full_name"] == ["Name"] and "name" not in m

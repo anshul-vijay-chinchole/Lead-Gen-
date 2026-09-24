@@ -804,3 +804,74 @@ def test_registry_binds_api_sources(make_ctx, type_, cls, env_key):
     src = registry.create("source", {"type": type_}, make_ctx(env={}))  # no credential needed to build
     assert isinstance(src, cls) and src.name == type_ and src.env_key == env_key and src.offline is False
     assert src.label == type_
+
+
+# --- regressions (verifier/fixer pass) --------------------------------------------------------
+
+def test_apify_dataset_of_google_maps_items_uses_maps_preset_not_job_titles(make_ctx):
+    src, ctx = apify(make_ctx, dataset_id="maps1")
+    ctx.http.add("GET", "https://api.apify.com/v2/datasets/maps1/items", json=GOOGLE_MAPS_ITEMS)
+    blue, harbour = src.fetch()
+    assert blue.name == "Blue Door Dental" and blue.domain == "bluedoordental.co.uk"
+    assert [(s.type, s.title) for s in blue.signals] == [(SignalType.REVIEW, "Rated 4.8 from 212 Google reviews")]
+    assert harbour.name == "Harbourside Smiles" and harbour.signals == []  # no rating -> no review signal
+    # an actor given by id (no name hint) is recognised the same way
+    src, ctx = apify(make_ctx, actor="nwua9Gu5YrADL7ZDj")
+    ctx.http.add("POST", re.compile(r"/acts/nwua9Gu5YrADL7ZDj/run-sync-get-dataset-items$"),
+                 json=GOOGLE_MAPS_ITEMS[:1])
+    [c] = src.fetch()
+    assert c.name == "Blue Door Dental" and c.signals[0].type == SignalType.REVIEW
+    # preset: none keeps plain auto-detection - still never a job titled like the business
+    src, ctx = apify(make_ctx, dataset_id="maps2", preset="none")
+    ctx.http.add("GET", "https://api.apify.com/v2/datasets/maps2/items", json=GOOGLE_MAPS_ITEMS[:1])
+    [c] = src.fetch()
+    assert c.name == "Blue Door Dental" and all(s.title != "Blue Door Dental" for s in c.signals)
+
+
+def test_apify_signal_requires_as_a_single_string(make_ctx):
+    src, ctx = apify(make_ctx, actor="compass/crawler-google-places", signal_requires="totalScore")
+    assert src.signal_requires() == ["totalScore"]
+    ctx.http.add("POST", APIFY_RUN_URL, json=GOOGLE_MAPS_ITEMS[:1])
+    [c] = src.fetch()
+    assert [s.title for s in c.signals] == ["Rated 4.8 from 212 Google reviews"]
+    src, ctx = apify(make_ctx, actor="compass/crawler-google-places", signal_requires="")
+    assert src.signal_requires() == []
+
+
+def test_theirstack_hiring_team_contact_gets_a_last_name(make_ctx):
+    src, ctx = theirstack(make_ctx, job_titles=["CFO"], max_pages=1)
+    ctx.http.add("POST", THEIRSTACK_URL, json=ts_page([ts_job(1, "Head of Finance")], total=1))
+    [c] = src.fetch()
+    [lena] = c.contacts
+    assert (lena.first_name, lena.last_name, lena.full_name) == ("Lena", "Vogel", "Lena Vogel")
+
+
+def test_apollo_funding_signal_never_mixes_rounds():
+    org = {"id": "o1", "name": "Nimbus", "primary_domain": "nimbus.io", "latest_funding_stage": "Series B",
+           "latest_funding_round_date": "2026-09-01T00:00:00.000+00:00",
+           "funding_events": [
+               {"id": "e1", "date": "2024-03-01T00:00:00.000+00:00", "type": "Series A", "amount": "5M",
+                "currency": "$", "news_url": "https://news.example/nimbus-series-a"},
+               {"id": "e0", "date": "2022-01-01T00:00:00.000+00:00", "type": "Seed", "amount": "1M",
+                "currency": "$", "news_url": "https://news.example/nimbus-seed"}]}
+    rec = ApolloSource.prepare(org)
+    assert "_latest_funding_amount" not in rec and "_latest_funding_url" not in rec
+    # the matching event is still used when present
+    org2 = dict(org, funding_events=org["funding_events"] + [
+        {"id": "e2", "date": "2026-09-01T00:00:00.000+00:00", "type": "Series B", "amount": "20M",
+         "currency": "$", "news_url": "https://news.example/nimbus-series-b"}])
+    rec = ApolloSource.prepare(org2)
+    assert rec["_latest_funding_amount"] == "20M" and rec["_latest_funding_url"].endswith("series-b")
+    # no latest date: the newest event only counts when it is the named stage
+    org3 = {k: v for k, v in org.items() if k != "latest_funding_round_date"}
+    assert "_latest_funding_url" not in ApolloSource.prepare(org3)
+    org4 = {k: v for k, v in org3.items() if k != "latest_funding_stage"}
+    rec = ApolloSource.prepare(org4)
+    assert rec["latest_funding_stage"] == "Series A" and rec["_latest_funding_amount"] == "5M"
+
+
+def test_apollo_documented_single_range_list(make_ctx):
+    for raw, expected in (([11, 50], ["11,50"]), (["11", "50"], ["11,50"]), (["11,50", "51,200"], ["11,50", "51,200"]),
+                          ([[11, 50], [51, 200]], ["11,50", "51,200"])):
+        src, ctx = apollo(make_ctx, employee_ranges=raw)
+        assert src.search_body(1)["organization_num_employees_ranges"] == expected

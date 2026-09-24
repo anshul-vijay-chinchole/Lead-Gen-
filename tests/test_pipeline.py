@@ -85,3 +85,54 @@ def test_broken_source_is_reported_not_fatal(make_ctx, tmp_path):
     res = Pipeline(ctx, out_dir=tmp_path / "out").run()
     assert res.counts["sourced"] == 2
     assert any("apollo" in e.lower() for e in res.errors)
+
+
+def test_guessed_email_needs_valid_by_default(make_ctx, tmp_path):
+    """Pattern-guessed addresses that a verifier can only call 'unknown' are never handed over."""
+    pb = _playbook(tmp_path)
+    contacts = tmp_path / "noemail.csv"
+    with open(contacts, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Company", "Domain", "First Name", "Last Name", "Title"])
+        w.writerow(["Beta Freight", "beta-t.com", "Lee", "Chan", "CFO"])
+    pb["sources"][0]["path"] = str(tmp_path / "signals.csv")
+    pb["enrichment"]["finders"] = [{"type": "csv", "path": str(contacts)}, {"type": "pattern"}]
+    ctx = make_ctx(**pb)
+    res = Pipeline(ctx, out_dir=tmp_path / "out").run()
+    lee = next(ld for ld in res.leads if ld.contact and ld.contact.first_name == "Lee")
+    assert lee.contact.data.get("email_guessed") and lee.contact.email.endswith("@beta-t.com")
+    assert lee.stage != Stage.EXPORTED and not lee.messages
+    assert any("guessed" in n for n in lee.notes)
+    # opting in (e.g. offline demos) makes it sendable
+    pb["enrichment"]["accept_guessed_statuses"] = ["valid", "risky", "unknown"]
+    ctx2 = make_ctx(**pb)
+    res2 = Pipeline(ctx2, out_dir=tmp_path / "out2").run()
+    lee2 = next(ld for ld in res2.leads if ld.contact and ld.contact.first_name == "Lee")
+    assert lee2.stage == Stage.EXPORTED
+
+
+def test_verification_stops_once_enough_contacts_are_deliverable(make_ctx, tmp_path):
+    from leadgen import registry
+    registry.register("verifier", "counting", "tests.test_pipeline:CountingVerifier")
+    CountingVerifier.calls = []
+    pb = _playbook(tmp_path)
+    pb["enrichment"]["verifier"] = {"type": "counting"}
+    pb["enrichment"]["accept_statuses"] = ["valid"]
+    ctx = make_ctx(**pb)
+    Pipeline(ctx, out_dir=tmp_path / "out").run()
+    # Acme has two buyers (Jane CFO, Sam FD); one per company is needed -> Sam is never verified
+    assert "sam@acme-t.com" not in CountingVerifier.calls
+    assert "jane@acme-t.com" in CountingVerifier.calls
+
+
+from leadgen.verify.base import VerificationResult, Verifier  # noqa: E402
+
+
+class CountingVerifier(Verifier):
+    name = "counting"
+    offline = True
+    calls: list = []
+
+    def verify(self, email):
+        CountingVerifier.calls.append(email)
+        return VerificationResult(email=email, status="valid", provider="counting")

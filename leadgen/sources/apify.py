@@ -25,7 +25,8 @@ input            Actor input (dict), passed through untouched.
 dataset_id       Read this dataset instead of running an actor.
 use_last_run     With ``actor``: read the last successful run's dataset.
 preset           ``google_maps`` | ``linkedin_jobs`` | ``indeed_jobs`` | ``none``.
-                 Default: guessed from the actor name, else none. A preset
+                 Default: guessed from the actor name, else from the item shape
+                 (Google Maps place items), else none. A preset
                  supplies a best-effort mapping, signal type and title template.
 mapping          Field overrides (canonical field -> item key / dotted path);
                  they win over the preset. Without a preset, flat item keys are
@@ -38,6 +39,7 @@ signal_title_template  e.g. ``"Rated {totalScore} with {reviewsCount} reviews"``
 signal_requires  Item paths that must be non-empty for an item's own signal
                  (google_maps preset: ``["totalScore"]``; ``[]`` disables).
 default_signal   ``{type, title, ...}`` for items without a signal of their own.
+date_order       ``mdy`` | ``dmy`` for numeric dates like ``9/5/2026`` (default: inferred).
 people           ``{path, mapping}`` list of people inside each item.
 limit            Max companies returned (0 = all).
 max_items        Max dataset items to download (Apify ``limit`` parameter).
@@ -158,6 +160,21 @@ def guess_preset(actor: str) -> str:
     return ""
 
 
+def guess_preset_from_items(items: List[Dict[str, Any]], sample: int = 50) -> str:
+    """Preset from the item shape, for datasets / actors whose name gives no hint.
+
+    Google Maps place items (``placeId``/``cid`` + ``totalScore``/``reviewsCount``/
+    ``categoryName``) name the business ``title`` - auto-detection alone would
+    read that as a job title."""
+    for it in items[:sample]:
+        if not isinstance(it, dict):
+            continue
+        keys = set(it)
+        if keys & {"placeId", "cid"} and keys & {"totalScore", "reviewsCount", "categoryName"}:
+            return "google_maps"
+    return ""
+
+
 class ApifySource(Source):
     """Run an Apify actor / read a dataset and map the items (see module docstring)."""
 
@@ -244,15 +261,32 @@ class ApifySource(Source):
             raise ValueError(f"source {self.label}: unexpected Apify response ({type(body).__name__})")
         return [it for it in body if isinstance(it, dict)]
 
-    def signal_requires(self) -> List[str]:
-        if "signal_requires" in self.config:
-            return list(self.config.get("signal_requires") or [])
-        preset = PRESETS.get(self.preset) if self.preset else None
-        return list((preset or {}).get("signal_requires") or [])
+    def preset_for(self, items: Optional[List[Dict[str, Any]]] = None) -> str:
+        """The configured / actor-name preset, else (``preset`` unset) one guessed from the items."""
+        preset = self.preset
+        if not preset and self.config.get("preset") is None and items:
+            preset = guess_preset_from_items(items)
+            if preset:
+                self.log.info("source %s: items look like %s results; using the %s preset "
+                              "(set 'preset: none' to disable)", self.label, preset, preset)
+        return preset
 
-    def build_mapping(self, items: List[Dict[str, Any]]) -> Tuple[Dict[str, List[str]], Dict[str, Any], Optional[str]]:
+    def signal_requires(self, preset: Optional[str] = None) -> List[str]:
+        if "signal_requires" in self.config:
+            raw = self.config.get("signal_requires")
+            if isinstance(raw, str):  # 'signal_requires: totalScore' - one path, not its characters
+                return [raw] if raw.strip() else []
+            return [str(p) for p in (raw or [])]
+        name = self.preset if preset is None else preset
+        spec = PRESETS.get(name) if name else None
+        return list((spec or {}).get("signal_requires") or [])
+
+    def build_mapping(self, items: List[Dict[str, Any]],
+                      preset_name: Optional[str] = None) -> Tuple[Dict[str, List[str]], Dict[str, Any], Optional[str]]:
         """Return (mapping, defaults, signal_title_template) for these items."""
-        preset = PRESETS.get(self.preset) if self.preset else None
+        if preset_name is None:
+            preset_name = self.preset_for(items)
+        preset = PRESETS.get(preset_name) if preset_name else None
         if preset:
             base = preset["mapping"]
             auto_type = preset.get("signal_type")
@@ -275,7 +309,7 @@ class ApifySource(Source):
         merge_mappings(self.config.get("mapping"))
         RecordMapper({}, label=self.label, signal_title_template=self.config.get("signal_title_template"),
                      default_signal=self.config.get("default_signal"), people=self.config.get("people"),
-                     defaults=self.config.get("defaults"))
+                     defaults=self.config.get("defaults"), date_order=self.config.get("date_order"))
 
     def fetch(self) -> List[Company]:
         if self.ctx.dry_run:
@@ -286,16 +320,18 @@ class ApifySource(Source):
         if not items:
             self.log.warning("source %s: Apify returned no items", self.label)
             return []
-        mapping, defaults, template = self.build_mapping(items)
+        preset = self.preset_for(items)
+        mapping, defaults, template = self.build_mapping(items, preset)
         companies = records_to_companies(
             items, mapping, label=self.label, defaults=defaults, today=self.ctx.today, limit=self.limit,
             signal_title_template=template, default_signal=self.config.get("default_signal"),
             people=self.config.get("people"),
             location_from_signal=bool(self.config.get("location_from_signal", True)),
-            signal_requires=self.signal_requires(), log=self.log,
+            signal_requires=self.signal_requires(preset), log=self.log,
+            date_order=self.config.get("date_order"),
         )
         self.log.info("source %s: %d items -> %d companies", self.label, len(items), len(companies))
         return companies
 
 
-__all__ = ["ApifySource", "PRESETS", "guess_preset"]
+__all__ = ["ApifySource", "PRESETS", "guess_preset", "guess_preset_from_items"]

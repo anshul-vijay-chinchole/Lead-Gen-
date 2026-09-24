@@ -24,11 +24,14 @@ email_2 .. email_N`` - see ``leadgen.outbound.csv_export.outbound_row``).
 Follow-up subject ``""`` means "reply in the same thread". Everything is made
 JSON-safe (dates -> ISO strings).
 
-Any 2xx response counts as delivered. A failed request is logged and its
+A lead whose contact email already appeared earlier in the same export (the
+same person under two company records) is not sent; the highest-scored one
+is. Any 2xx response counts as delivered. A failed request is logged and its
 leads are left out of ``exported_ids`` (a later run retries them). HTTP 401 /
 403 / 404 / 405 / 410 stop the export (the URL or credentials are wrong):
 ``WebhookExportError`` if nothing was delivered, else a partial result. The URL
-may carry a secret, so logs and errors only ever show its scheme + host.
+may carry a secret, so logs and errors only ever show its scheme + host (the
+HTTP client's own retry / network-error warnings included).
 
 In ``ctx.dry_run`` no request is made (``count=0, detail="dry-run"``).
 
@@ -55,15 +58,17 @@ label         Name reported in ``ExportResult.exporter`` (default ``webhook``).
 from __future__ import annotations
 
 import json
+import logging
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import urlparse
 
-from ..http import HttpError
+from ..http import HttpError, redact
 from ..models import Lead
 from .base import Exporter, ExportResult
 from .csv_export import (BODY_FORMATS, _bool, config_int, followup_subject_steps, max_steps,
-                         outbound_row, response_error, sorted_by_score)
+                         outbound_row, response_error, sorted_by_score, unique_by_email)
 
 ENV_URL = "LEADGEN_EXPORT_WEBHOOK_URL"
 METHODS = ("POST", "PUT", "PATCH")
@@ -81,6 +86,42 @@ def safe_host(url: str) -> str:
         return f"{p.scheme}://{p.hostname}" if p.hostname else "<webhook>"
     except ValueError:
         return "<webhook>"
+
+
+class _MaskUrl(logging.Filter):
+    """Replaces the webhook URL in ``leadgen.http`` log records (its retry / network-error
+    warnings print the full URL, and a Zapier / Make / n8n hook's secret is in the path)."""
+
+    def __init__(self, url: str, shown: str):
+        super().__init__()
+        self._secrets = sorted({url, redact(url)}, key=len, reverse=True)
+        self._shown = shown
+
+    def _mask(self, value: Any) -> Any:
+        if isinstance(value, str):
+            for secret in self._secrets:
+                value = value.replace(secret, self._shown)
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._mask(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._mask(a) for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: self._mask(v) for k, v in record.args.items()}
+        return True
+
+
+@contextmanager
+def masked_http_logs(url: str) -> Iterator[None]:
+    """While active, ``leadgen.http`` logs show ``url`` as ``scheme://host/***``."""
+    logger = logging.getLogger("leadgen.http")
+    mask = _MaskUrl(url, safe_host(url) + "/***")
+    logger.addFilter(mask)
+    try:
+        yield
+    finally:
+        logger.removeFilter(mask)
 
 
 def jsonable(value: Any) -> Any:
@@ -139,10 +180,13 @@ class WebhookExporter(Exporter):
         return jsonable(d)
 
     def export(self, leads: List[Lead], out_dir: Path) -> ExportResult:
-        ordered = sorted_by_score(leads)
+        ordered, dups = unique_by_email(sorted_by_score(leads))
         if self.ctx.dry_run:
             self.log.info("webhook exporter: dry-run - not posting %d lead(s)", len(ordered))
             return ExportResult(exporter=self.label, count=0, detail="dry-run")
+        if dups:
+            self.log.warning("webhook exporter: skipped %d lead(s) whose email is already in this "
+                             "export", len(dups))
         if not ordered:
             return ExportResult(exporter=self.label, count=0, detail="no leads to send")
         fmt = str(self.config.get("body_format") or "text").lower()
@@ -169,8 +213,9 @@ class WebhookExporter(Exporter):
                 payload = {"playbook": playbook, "batch": bi, "batches": len(batches),
                            "count": len(items), "leads": items}
             try:
-                resp = self.http.request(method, url, json=payload, headers=headers,
-                                         timeout=timeout, raise_for_status=False)
+                with masked_http_logs(url):
+                    resp = self.http.request(method, url, json=payload, headers=headers,
+                                             timeout=timeout, raise_for_status=False)
                 status, ok = resp.status, resp.ok
                 err = "" if ok else response_error(resp)
             except HttpError as e:
@@ -194,6 +239,8 @@ class WebhookExporter(Exporter):
         parts = [f"delivered {len(delivered)}/{len(ordered)} to {host}"]
         if failed:
             parts.append(f"{failed} failed")
+        if dups:
+            parts.append(f"{len(dups)} skipped (duplicate email)")
         if abort:
             parts.append(f"stopped: {abort}")
             self.log.error("webhook exporter: stopped early - %s", abort)
@@ -203,4 +250,4 @@ class WebhookExporter(Exporter):
                             exported_ids=delivered)
 
 
-__all__ = ["WebhookExporter", "WebhookExportError", "safe_host", "jsonable"]
+__all__ = ["WebhookExporter", "WebhookExportError", "safe_host", "jsonable", "masked_http_logs"]

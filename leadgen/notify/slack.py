@@ -69,6 +69,27 @@ def _safe_host(url: str) -> str:
         return "<webhook>"
 
 
+def _safe_detail(e: HttpError, url: str) -> str:
+    """What went wrong, without any part of the secret URL.
+
+    A network error (status 0) carries the ``requests`` exception text, which
+    embeds the request path ("Max retries exceeded with url: /services/T../B../X")
+    - only its exception class is kept. Any other body is scrubbed of the URL,
+    its path and its query.
+    """
+    body = str(e.body or "")
+    if not e.status:
+        return body.split(":", 1)[0].strip()[:80] or "network error"
+    try:
+        p = urlparse(url)
+        pieces = [url, p.path + (f"?{p.query}" if p.query else ""), p.path, p.query]
+    except ValueError:
+        pieces = [url]
+    for piece in sorted((x for x in pieces if x and x != "/"), key=len, reverse=True):
+        body = body.replace(piece, "<redacted>")
+    return body[:200]
+
+
 class SlackNotifier(Notifier):
     """Post ``*title*\\ntext`` to a Slack incoming webhook (see module docstring)."""
 
@@ -128,7 +149,7 @@ class SlackNotifier(Notifier):
         except HttpError as e:
             # HttpError embeds the URL (whose path is the secret) - re-raise without it.
             raise SlackError(f"slack: could not reach {_safe_host(url)} "
-                             f"(HTTP {e.status}): {e.body[:200]}") from None
+                             f"(HTTP {e.status}): {_safe_detail(e, url)}") from None
         if not resp.ok:
             reason = (resp.text or "").strip()[:200] or "no response body"
             raise SlackError(f"slack: webhook rejected the message (HTTP {resp.status}): {reason}")

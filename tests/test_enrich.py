@@ -11,9 +11,10 @@ from leadgen import registry
 from leadgen.context import MissingCredentialError
 from leadgen.enrich.apollo import ApolloFinder, apollo_email_status, clean_email
 from leadgen.enrich.csv_finder import CsvFinder, map_status
-from leadgen.enrich.hunter import HunterFinder, hunter_departments, linkedin_url, verification_status
+from leadgen.enrich.hunter import (HunterFinder, executive_departments, hunter_departments, linkedin_url,
+                                   verification_status)
 from leadgen.enrich.pattern import (PatternFinder, contact_name_parts, name_token, normalize_pattern,
-                                    render_pattern)
+                                    render_pattern, split_full_name)
 from leadgen.http import HttpError
 from leadgen.models import Company, Contact, EmailStatus
 
@@ -419,6 +420,53 @@ def test_apollo_bad_config_values(make_ctx):
         ApolloFinder({"filters": ["x"]}, ctx).find(acme())
 
 
+def test_apollo_complete_forbidden_blocks_match_but_not_search(make_ctx):
+    # a 401/402/403 from people/match inside complete() must not take the whole finder down:
+    # it blocks people/match (like a failed reveal) and returns the contact unchanged
+    ctx = make_ctx(env={"APOLLO_API_KEY": "k"}, buyers=BUYERS)
+    ctx.http.add("POST", APOLLO_MATCH, status=402, json={"error": "insufficient credits"})
+    ctx.http.add("POST", APOLLO_SEARCH, json=apollo_search_payload(
+        apollo_person("p2", "Bo", "Li", "CFO", email="bo@acme.com", email_status="verified")))
+    finder = ApolloFinder({}, ctx)
+    jane = Contact(first_name="Jane", last_name="Doe", title="CFO")
+    assert finder.complete(acme(), jane) is jane and jane.email == ""
+    assert finder.complete(acme(), Contact(first_name="Bob", last_name="Stone")).email == ""
+    assert len(ctx.http.calls_to("/people/match")) == 1  # blocked after the refusal
+    (bo,) = finder.find(acme(name="Beta", domain="beta.com"))  # the search still runs
+    assert bo.email == "bo@acme.com" and len(ctx.http.calls_to("/mixed_people/")) == 1
+
+
+def test_apollo_reveal_non_json_response_keeps_people(make_ctx):
+    ctx = make_ctx(env={"APOLLO_API_KEY": "k"}, buyers=BUYERS)
+    ctx.http.add("POST", APOLLO_SEARCH, json=apollo_search_payload(
+        {"id": "p1", "first_name": "Jane", "last_name_obfuscated": "Do***e", "title": "CFO", "has_email": True},
+        apollo_person("p2", "Bob", "Li", "CFO", email="bob@acme.com", email_status="verified")))
+    ctx.http.add("POST", APOLLO_MATCH, text="<html>upstream error</html>")
+    found = ApolloFinder({}, ctx).find(acme())
+    assert [c.first_name for c in found] == ["Jane", "Bob"]
+    assert found[1].email == "bob@acme.com" and found[1].email_status == EmailStatus.VALID
+    with pytest.raises(ValueError, match="not JSON"):  # complete(): a clear error, nothing lost
+        ApolloFinder({}, ctx).complete(acme(), Contact(first_name="Jane", last_name="Doe"))
+
+
+def test_apollo_find_reveals_count_toward_the_company_budget(make_ctx):
+    ctx = make_ctx(env={"APOLLO_API_KEY": "k"}, buyers={"titles": ["CFO"]})
+    ctx.http.add("POST", APOLLO_SEARCH, json=apollo_search_payload(*[
+        {"id": f"p{i}", "first_name": f"N{i}", "last_name_obfuscated": "X***y", "title": "CFO", "has_email": True}
+        for i in range(6)]))
+    ctx.http.add("POST", APOLLO_MATCH, fn=lambda call: {"person": {"id": call["json"].get("id"), "email": None}})
+    finder = ApolloFinder({"reveal_limit": 2}, ctx)
+    company = acme()
+    found = finder.find(company)
+    assert len(ctx.http.calls_to("/people/match")) == 2
+    for contact in found:  # what the waterfall does next for the email-less targets
+        finder.complete(company, contact)
+    # one people/match budget per company: max(reveal_limit, complete_limit) = 3, not 2 + 3
+    assert len(ctx.http.calls_to("/people/match")) == 3
+    finder.complete(acme(name="Globex", domain="globex.com"), Contact(first_name="G", last_name="X"))
+    assert len(ctx.http.calls_to("/people/match")) == 4  # other companies keep their own budget
+
+
 # === Hunter =====================================================================================
 
 def hunter_email(value, first, last, position, status="valid", confidence=94, **extra):
@@ -449,8 +497,10 @@ def test_hunter_domain_search_request_shape(make_ctx):
     HunterFinder({"seniority": ["executive", "senior", "boss"]}, ctx).find(acme())
     call = ctx.http.calls[0]
     assert call["method"] == "GET" and call["url"] == HUNTER_DOMAIN
+    # "executive" joins buyers.departments: the CFO buyer title is an executive one
     assert call["params"] == {"domain": "acme.com", "limit": 10, "type": "personal",
-                              "seniority": "executive,senior", "department": "finance,hr", "api_key": "h-key"}
+                              "seniority": "executive,senior", "department": "finance,hr,executive",
+                              "api_key": "h-key"}
 
 
 def test_hunter_search_by_company_name_and_options(make_ctx):
@@ -472,6 +522,22 @@ def test_hunter_no_departments_when_disabled(make_ctx):
     ctx.http.add("GET", HUNTER_DOMAIN, json=hunter_domain_payload())
     HunterFinder({"use_buyer_departments": False}, ctx).find(acme())
     assert "department" not in ctx.http.calls[0]["params"]
+
+
+def test_hunter_buyer_departments_keep_executive_buyers(make_ctx):
+    # saas-funding style buyers: founders / CEOs sit in Hunter's "executive" department, which a
+    # department=marketing,sales filter would exclude
+    buyers = {"titles": ["Founder", "Co-founder", "CEO", "Head of Growth", "VP Marketing"],
+              "departments": ["marketing", "sales"]}
+    ctx = make_ctx(env={"HUNTER_API_KEY": "h-key"}, buyers=buyers)
+    assert HunterFinder({}, ctx).search_params(acme())["department"] == "marketing,sales,executive"
+    ctx = make_ctx(env={"HUNTER_API_KEY": "h-key"}, buyers=dict(buyers, titles=["Head of Growth", "VP Sales"]))
+    assert HunterFinder({}, ctx).search_params(acme())["department"] == "marketing,sales"
+    # an explicit department config is used as given
+    assert HunterFinder({"department": "sales"}, ctx).search_params(acme())["department"] == "sales"
+    assert executive_departments(["Managing Director"]) == ["executive", "management"]
+    assert executive_departments(["Vice President of Sales", "Head of Sales"]) == []
+    assert executive_departments(["Practice Owner"]) == ["executive"]
 
 
 def test_hunter_skips_company_without_domain_or_name(make_ctx):
@@ -528,6 +594,21 @@ def test_hunter_find_errors(make_ctx):
     with pytest.raises(HttpError) as ei:
         finder.find(acme())
     assert ei.value.status == 401
+
+
+def test_hunter_network_errors_do_not_leak_api_key(make_ctx):
+    def network_error(call):
+        query = "&".join(f"{k}={v}" for k, v in call["params"].items())
+        raise HttpError(0, call["url"], f"ConnectionError: Max retries exceeded with url: /v2/x?{query}")
+
+    ctx = make_ctx(env={"HUNTER_API_KEY": "SECRET-KEY-123"})
+    ctx.http.add("GET", "https://api.hunter.io/", fn=network_error)
+    finder = HunterFinder({}, ctx)
+    for call in (lambda: finder.find(acme()), lambda: finder.complete(acme(), Contact(first_name="J", last_name="D"))):
+        with pytest.raises(HttpError) as ei:
+            call()
+        assert ei.value.status == 0 and "SECRET-KEY-123" not in str(ei.value)
+    assert all(c["params"]["api_key"] == "SECRET-KEY-123" for c in ctx.http.calls)
 
 
 def test_hunter_empty_emails(make_ctx):
@@ -746,6 +827,35 @@ def test_pattern_whole_name_in_first_name_field(make_ctx):
     assert c.email_candidates[0] == "jane.doe@acme.com"
 
 
+@pytest.mark.parametrize("contact", [
+    Contact(full_name="Prof. Dr. Hans Meier"), Contact(first_name="Prof.", last_name="Dr. Hans Meier"),
+    Contact(full_name="Dr. Dr. Hans Meier"), Contact(full_name="Mr. Dr. Hans Meier"),
+    Contact(first_name="Prof. Dr.", last_name="Hans Meier"), Contact(full_name="Meier, Hans"),
+    Contact(full_name="Meier, Prof. Dr. Hans"),
+])
+def test_pattern_stacked_honorifics_and_last_first(make_ctx, contact):
+    finder = PatternFinder({}, make_ctx())
+    candidates = finder.candidates(Company(name="Klinik", domain="klinik.de"), contact)
+    assert candidates[:3] == ["hans.meier@klinik.de", "hans@klinik.de", "hmeier@klinik.de"]
+
+
+def test_pattern_honorifics_only_leave_no_first_name():
+    assert contact_name_parts(Contact(full_name="Prof. Dr. Meier")) == ("", "meier")
+    assert contact_name_parts(Contact(first_name="Prof", last_name="Dr Doe")) == ("", "doe")
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Dr. Jane Doe", ("Jane", "Doe")), ("Ms Jane Doe", ("Jane", "Doe")), ("Doe, Jane", ("Jane", "Doe")),
+    ("Prof. Dr. Hans Meier", ("Hans", "Meier")), ("Jane Doe, PhD", ("Jane", "Doe")),
+    ("Doe, Jane, CPA", ("Jane", "Doe")), ("van der Berg, Anna", ("Anna", "van der Berg")),
+    ("Anne-Marie van der Berg", ("Anne-Marie", "van der Berg")), ("Jane Doe, CFO", ("Jane", "Doe")),
+    ("John Smith Jr.", ("John", "Smith")), ("Jane Doe (She/Her)", ("Jane", "Doe")),
+    ("Dr Doe", ("", "Doe")), ("Jane", ("Jane", "")), ("Dr.", ("", "")), ("", ("", "")), (None, ("", "")),
+])
+def test_split_full_name(raw, expected):
+    assert split_full_name(raw) == expected
+
+
 @pytest.mark.parametrize("raw,expected", [
     ("{first}.{last}", "{first}.{last}"), ("{F}{Last}", "{f}{last}"), ("first.last", "{first}.{last}"),
     ("flast", "{f}{last}"), ("firstl", "{first}{l}"), ("first_last", "{first}_{last}"),
@@ -889,9 +999,62 @@ def test_csv_ignores_linkedin_url_as_company_website(make_ctx, tmp_path):
     ("Verified", EmailStatus.VALID), ("deliverable", EmailStatus.VALID), ("Catch-All", EmailStatus.RISKY),
     ("accept_all", EmailStatus.RISKY), ("Bounced", EmailStatus.INVALID), ("undeliverable", EmailStatus.INVALID),
     ("", EmailStatus.UNKNOWN), ("maybe", EmailStatus.UNKNOWN),
+    # "never mail" verdicts of list cleaners (ZeroBounce / NeverBounce / MillionVerifier exports)
+    ("spamtrap", EmailStatus.INVALID), ("Spam Trap", EmailStatus.INVALID), ("do_not_mail", EmailStatus.INVALID),
+    ("abuse", EmailStatus.INVALID), ("disposable", EmailStatus.INVALID), ("hard_bounce", EmailStatus.INVALID),
+    ("complainer", EmailStatus.INVALID), ("toxic", EmailStatus.INVALID), ("Unsubscribed", EmailStatus.INVALID),
+    ("Invalid - mailbox not found", EmailStatus.INVALID), ("not valid", EmailStatus.INVALID),
+    ("Not verified", EmailStatus.UNKNOWN), ("unverified", EmailStatus.UNKNOWN), ("unknown", EmailStatus.UNKNOWN),
 ])
 def test_csv_status_values(raw, expected):
     assert map_status(raw) == expected
+
+
+def test_csv_spamtrap_row_is_invalid_and_keeps_raw_status(make_ctx, tmp_path):
+    text = ("first name,last name,email,company,website,email status\n"
+            "Jane,Doe,jane@acme.com,Acme,acme.com,spamtrap\n"
+            "Bob,Stone,bob@acme.com,Acme,acme.com,do_not_mail\n")
+    jane, bob = CsvFinder({"path": str(write(tmp_path, text))}, make_ctx()).find(acme())
+    assert jane.email_status == EmailStatus.INVALID and jane.data["csv_email_status"] == "spamtrap"
+    assert bob.email_status == EmailStatus.INVALID and bob.data["csv_email_status"] == "do_not_mail"
+
+
+def test_csv_null_placeholders_are_empty(make_ctx, tmp_path):
+    text = ("first name,last name,email,company,website,notes\n"
+            "null,N/A,jane@acme.com,Acme Inc,N/A,-\n"
+            "Bob,-,bob@beta.com,Beta,-,\n"
+            "Cy,Li,cy@gamma.com,Gamma,none,none\n")
+    finder = CsvFinder({"path": str(write(tmp_path, text))}, make_ctx())
+    (jane,) = finder.find(acme())  # matched through the email domain, not a bogus 'n' domain
+    assert (jane.first_name, jane.last_name, jane.full_name) == ("", "", "")
+    assert jane.email == "jane@acme.com" and "csv" not in jane.data
+    (bob,) = finder.find(Company(name="Beta", domain="beta.com"))
+    assert bob.first_name == "Bob" and bob.last_name == ""
+    assert [c.first_name for c in finder.find(Company(name="Gamma", domain="gamma.com"))] == ["Cy"]
+    assert sorted(finder._by_domain) == ["acme.com", "beta.com", "gamma.com"]
+
+
+@pytest.mark.parametrize("bad", ["[none]", "acme.com]", "[x]", "http://[::1"])
+def test_csv_malformed_website_cell_is_ignored(make_ctx, tmp_path, bad):
+    text = ("first name,last name,email,company,website\n"
+            "Jane,Doe,jane@acme.com,Acme,acme.com\n"
+            f'Bob,Smith,bob@other.com,Other,"{bad}"\n')
+    finder = CsvFinder({"path": str(write(tmp_path, text))}, make_ctx())
+    assert [c.full_name for c in finder.find(acme())] == ["Jane Doe"]
+    assert [c.full_name for c in finder.find(Company(name="Other", domain="other.com"))] == ["Bob Smith"]
+
+
+def test_csv_full_name_only_drops_honorifics_and_turns_last_first(make_ctx, tmp_path):
+    text = ('name,email,company,website\n'
+            '"Dr. Jane Doe",jane@acme.com,Acme,acme.com\n'
+            '"Doe, John",john@acme.com,Acme,acme.com\n'
+            '"Prof. Dr. Hans Meier",hans@acme.com,Acme,acme.com\n'
+            'Dr Solo,solo@acme.com,Acme,acme.com\n'
+            'Dr.,x@acme.com,Acme,acme.com\n')
+    found = CsvFinder({"path": str(write(tmp_path, text))}, make_ctx()).find(acme())
+    assert [(c.first_name, c.last_name, c.full_name) for c in found] == [
+        ("Jane", "Doe", "Jane Doe"), ("John", "Doe", "John Doe"), ("Hans", "Meier", "Hans Meier"),
+        ("", "Solo", "Solo"), ("", "", "")]
 
 
 # === registry + cross-finder flow ===============================================================

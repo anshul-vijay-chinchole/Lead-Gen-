@@ -28,9 +28,11 @@
 else by ``first_name`` + ``last_name`` + ``domain`` (``organization_name``
 when the company has no domain; ``linkedin_url`` added when known), else by
 LinkedIn URL alone. People already tried, or flagged by Apollo as having no
-email (``has_email: false``), are not looked up again; at most
-``complete_limit`` lookups are made per company; HTTP 404/422 (no such
-person) leave the contact unchanged.
+email (``has_email: false``), are not looked up again; a company never costs
+more than ``complete_limit`` people/match calls through ``complete`` - the
+reveals ``find`` made for it count toward that budget; HTTP 404/422 (no such
+person) leave the contact unchanged; HTTP 401/402/403 block people/match for
+the rest of the run (like a failed reveal) without stopping the search.
 
 Mapping: ``email_status`` verified -> valid; catch_all / accept_all -> risky;
 bounced / invalid -> invalid; likely to engage / extrapolated / guessed /
@@ -57,9 +59,11 @@ filters                 Raw request-body fields merged into the search as-is
 reveal_emails           Default true. False disables the reveal step *and*
                         ``complete`` (no enrichment credits are spent).
 reveal_limit            Max ``people/match`` calls per ``find`` (default 2; 0 = none).
-complete_limit          Max ``people/match`` calls ``complete`` makes per company
-                        (default 3; 0 = none) - a credit guard for companies
-                        with many email-less people.
+complete_limit          Max ``people/match`` calls per company once ``complete``
+                        runs, the reveals ``find`` made for the company included
+                        (default 3; 0 = ``complete`` makes none) - a credit guard
+                        for companies with many email-less people. A company
+                        costs at most max(reveal_limit, complete_limit) credits.
 reveal_require_title_match
                         Only reveal people whose title contains a buyer title
                         (default false: others are revealed after them).
@@ -200,7 +204,7 @@ class ApolloFinder(ContactFinder):
     def __init__(self, config: Dict[str, Any], ctx: Any):
         super().__init__(config, ctx)
         self._match_blocked = ""
-        self._completed: Dict[str, int] = {}  # company key -> people/match calls made by complete()
+        self._completed: Dict[str, int] = {}  # company key -> people/match calls (find reveals + complete)
 
     # --- config helpers -------------------------------------------------------------
     def _url(self, key: str, default: str) -> str:
@@ -300,7 +304,7 @@ class ApolloFinder(ContactFinder):
         contacts = [c for c in (self.to_contact(p) for p in people) if c is not None]
         self._remember_org(company, people, by_domain="organization_ids" not in body)
         if contacts and self._reveal_enabled():
-            self._reveal(contacts)
+            self._reveal(contacts, company)
         return contacts
 
     @staticmethod
@@ -381,7 +385,10 @@ class ApolloFinder(ContactFinder):
 
     # --- reveal (people/match) --------------------------------------------------------------
     def _match(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        resp = self.http.post_json(self._url("match_path", MATCH_PATH), json=body, headers=self._headers())
+        try:
+            resp = self.http.post_json(self._url("match_path", MATCH_PATH), json=body, headers=self._headers())
+        except ValueError as e:  # a 2xx whose body is not JSON (proxy / CDN / maintenance page)
+            raise ValueError(f"apollo: people/match response is not JSON ({e})") from e
         if not isinstance(resp, dict):
             return None
         person = resp.get("person")
@@ -392,7 +399,7 @@ class ApolloFinder(ContactFinder):
                 and not contact.data.get("apollo_revealed")
                 and contact.data.get("apollo_has_email") is not False)
 
-    def _reveal(self, contacts: List[Contact]) -> None:
+    def _reveal(self, contacts: List[Contact], company: Optional[Company] = None) -> None:
         limit = self._reveal_limit()
         if limit <= 0 or self._match_blocked:
             return
@@ -418,6 +425,8 @@ class ApolloFinder(ContactFinder):
             if calls >= limit or not self._revealable(contact):
                 continue
             calls += 1
+            if company is not None:  # shared with complete(): one people/match budget per company
+                self._completed[company.key] = self._completed.get(company.key, 0) + 1
             contact.data["apollo_revealed"] = True
             try:
                 person = self._match({"id": contact.data["apollo_id"],
@@ -428,6 +437,10 @@ class ApolloFinder(ContactFinder):
                     continue
                 if e.status in BLOCKING_STATUSES:
                     self._match_blocked = str(e)
+                self.log.warning("apollo: email reveal failed (%s); keeping %d people found without it",
+                                 e, len(contacts))
+                break
+            except ValueError as e:  # unreadable response: never lose the people already found
                 self.log.warning("apollo: email reveal failed (%s); keeping %d people found without it",
                                  e, len(contacts))
                 break
@@ -515,6 +528,12 @@ class ApolloFinder(ContactFinder):
             if e.status in NOT_FOUND_STATUSES:
                 contact.data["apollo_revealed"] = True
                 self.log.info("apollo: no match for %s at %s (HTTP %d)", contact.full_name, company.name, e.status)
+                return contact
+            if e.status in BLOCKING_STATUSES:
+                # e.g. a plan without enrichment access / out of credits: stop people/match
+                # only - the people search keeps working for the other companies
+                self._match_blocked = str(e)
+                self.log.warning("apollo: email lookup refused (%s); no more people/match calls this run", e)
                 return contact
             raise
         contact.data["apollo_revealed"] = True

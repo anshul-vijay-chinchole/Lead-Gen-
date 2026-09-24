@@ -92,6 +92,10 @@ enrichment:
   # checker can never say "valid". With a real verifier (millionverifier,
   # zerobounce, ...) use [valid, risky] so guessed emails never get sent unchecked.
   accept_statuses: [valid, risky, unknown]
+  # Guessed addresses (first.last@ built by the pattern finder) normally need a
+  # real "valid" from a verifier. Offline nothing can be "valid", so the demo
+  # accepts them too. NEVER copy this line into a live playbook.
+  accept_guessed_statuses: [valid, risky, unknown]
   max_companies: 50
 
 # --- Scoring: 0-100, hot >= 80, normal >= 60, the rest are skipped -------------
@@ -127,7 +131,7 @@ replies:
 notify:
   channels:
     - type: console          # print alerts in the terminal
-  on: [positive, referral, question, run_summary]
+  "on": [positive, referral, question, run_summary]     # keep "on" quoted (YAML)
 
 # --- Memory (SQLite file; created automatically) ---------------------------------
 storage:

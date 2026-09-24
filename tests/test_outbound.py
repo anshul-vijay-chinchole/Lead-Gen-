@@ -126,6 +126,20 @@ def test_display_company_name():
     assert display_company_name("Visa") == "Visa"
 
 
+def test_display_company_name_keeps_ampersand_co():
+    """'& Co.' is part of the brand: never leave 'Tiffany &' in a {{company_name}} merge field."""
+    assert display_company_name("Tiffany & Co.") == "Tiffany & Co."
+    assert display_company_name("Merck & Co., Inc.") == "Merck & Co."
+    assert display_company_name("Goldman Sachs & Co. LLC") == "Goldman Sachs & Co."
+    assert display_company_name("Marks and Co") == "Marks and Co"
+    assert display_company_name("Procter & Gamble Co.") == "Procter & Gamble"
+    assert display_company_name("Smith & Partners LLP") == "Smith & Partners"
+    assert display_company_name("AT&T Inc.") == "AT&T"
+    assert display_company_name("Acme Co.") == "Acme"
+    lead = make_lead(name="Levi Strauss & Co.")
+    assert outbound_row(lead)["company_name"] == "Levi Strauss & Co."
+
+
 def test_format_body_html_escapes_and_breaks():
     assert format_body("a\r\nb") == "a\nb"
     assert format_body("Hi <b>\n\nx & y", "html") == "Hi &lt;b&gt;<br><br>x &amp; y"
@@ -288,7 +302,8 @@ def test_json_exporter_filename_and_empty(make_ctx, tmp_path):
 def test_instantly_csv(make_ctx, tmp_path, caplog):
     ctx = make_ctx()
     good = make_lead(name="Acme Inc", score=90, steps=4)
-    other = make_lead(name="Beta Ltd", domain="beta.io", score=70, first="Bob", last="Ray", steps=2)
+    other = make_lead(name="Beta Ltd", domain="beta.io", score=70, first="Bob", last="Ray", steps=2,
+                      email="bob@beta.io")
     noemail = make_lead(name="Gamma", domain="gamma.io", email=None)
     with caplog.at_level(logging.WARNING):
         res = InstantlyCsvExporter({"type": "instantly_csv"}, ctx).export([other, noemail, good], tmp_path)
@@ -345,7 +360,8 @@ def instantly_ok(call: Dict[str, Any]) -> Dict[str, Any]:
 def test_instantly_api_happy_path(make_ctx, tmp_path):
     ctx = make_ctx(env={"INSTANTLY_API_KEY": "inst-key-123"})
     ctx.http.add("POST", INSTANTLY_URL, fn=instantly_ok)
-    a, b = make_lead(score=70, steps=4), make_lead(name="Beta Ltd", domain="beta.io", first="Bob", score=90)
+    a = make_lead(score=70, steps=4)
+    b = make_lead(name="Beta Ltd", domain="beta.io", first="Bob", email="bob@beta.io", score=90)
     exp = InstantlyApiExporter({"type": "instantly", "campaign_id": "camp-uuid-1"}, ctx)
     res = exp.export([a, b], tmp_path)
     assert res.exporter == "instantly" and res.count == 2
@@ -653,6 +669,29 @@ def test_smartlead_api_network_error_batch(make_ctx, tmp_path):
     assert res.count == 1 and "1 failed batch(es)" in res.detail
 
 
+def test_smartlead_api_errors_never_leak_the_api_key(make_ctx, tmp_path, caplog):
+    """A network error's text carries the request URL incl. ``?api_key=``: it must be scrubbed
+    before it is logged or raised (logs / summary.json / Slack run summaries)."""
+    key = "SL-SECRET-KEY-123456"
+    ctx = make_ctx(env={"SMARTLEAD_API_KEY": key})
+
+    def boom(call):
+        raise HttpError(0, call["url"], "ConnectionError: HTTPConnectionPool(host='x', port=443): Max "
+                        f"retries exceeded with url: /api/v1/campaigns/4242/leads?api_key={key} "
+                        "(Caused by NewConnectionError('Connection refused'))")
+
+    ctx.http.add("POST", SMARTLEAD_URL, fn=boom, times=1)
+    ctx.http.add("POST", SMARTLEAD_URL, json={"ok": False, "message": f"bad request for api_key={key}"},
+                 times=1)
+    ctx.http.add("POST", SMARTLEAD_URL, status=401, text=f"Invalid api_key {key}")
+    with caplog.at_level(logging.DEBUG, logger="leadgen"):
+        with pytest.raises(SmartleadError) as ei:
+            SmartleadApiExporter({"campaign_id": "4242", "batch_size": 1}, ctx).export(many(3), tmp_path)
+    assert key not in caplog.text and key not in str(ei.value)
+    assert "api_key=***" in caplog.text and "Connection refused" in caplog.text
+    assert "Invalid api_key ***" in str(ei.value)
+
+
 # --- Google Sheets (fake gspread) ----------------------------------------------------------
 
 class WorksheetNotFound(Exception):
@@ -949,6 +988,37 @@ def test_webhook_fatal_and_network_errors_hide_url(make_ctx, tmp_path, caplog):
     assert "SECRET" not in caplog.text and "network error: ConnectionError" in caplog.text
 
 
+def test_webhook_url_secret_never_reaches_http_client_logs(make_ctx, tmp_path, caplog):
+    """HttpClient's own retry / network-error warnings print the URL; a hook's token is in its path."""
+    import requests
+
+    from leadgen.http import HttpClient
+
+    url = "https://hooks.zapier.com/hooks/catch/123456/SECRET-HOOK-TOKEN/"
+    client = HttpClient(retries=2, sleep=lambda s: None)
+    replies = iter([SimpleNamespace(status_code=503, text="busy", headers={}),
+                    requests.ConnectionError(f"Max retries exceeded with url: {url}"),
+                    SimpleNamespace(status_code=200, text="ok", headers={})])
+
+    def fake_request(*a, **kw):
+        r = next(replies)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    client.session.request = fake_request
+    ctx = make_ctx()
+    ctx.http = client
+    with caplog.at_level(logging.DEBUG, logger="leadgen"):
+        res = WebhookExporter({"url": url}, ctx).export(many(1), tmp_path)
+    assert res.count == 1
+    # the HTTP layer masks token-like path segments itself
+    assert "HTTP 503 on POST https://hooks.zapier.com/" in caplog.text
+    assert "network error on POST https://hooks.zapier.com/" in caplog.text
+    assert "SECRET" not in caplog.text and "123456" not in caplog.text
+    assert logging.getLogger("leadgen.http").filters == []      # the mask is only active per request
+
+
 def test_webhook_guards(make_ctx, tmp_path):
     ctx = make_ctx(dry_run=True)
     res = WebhookExporter({}, ctx).export(many(2), tmp_path)
@@ -971,6 +1041,72 @@ def test_webhook_url_env_override(make_ctx, tmp_path):
     ctx.http.add("POST", re.compile(r"clay\.com"), json={"success": True})
     res = WebhookExporter({"url_env": "CLAY_HOOK"}, ctx).export(many(1), tmp_path)
     assert res.count == 1 and "https://api.clay.com" in res.detail
+
+
+# --- one person is handed over once per export ----------------------------------------------
+
+def _same_person_twice() -> List[Lead]:
+    """The group CFO listed under two company records (e.g. acme.com + acme.co.uk)."""
+    return [make_lead(name="Acme UK", domain="acme.co.uk", email="Jane.Doe@acme.com", score=70),
+            make_lead(name="Acme Group", domain="acme.com", email="jane.doe@acme.com", score=90),
+            make_lead(name="Beta Ltd", domain="beta.io", first="Bob", email="bob@beta.io", score=80)]
+
+
+@pytest.mark.parametrize("cls", [InstantlyCsvExporter, SmartleadCsvExporter])
+def test_upload_csv_hands_each_email_over_once(make_ctx, tmp_path, cls):
+    uk, group, beta = _same_person_twice()
+    res = cls({}, make_ctx()).export([uk, group, beta], tmp_path)
+    assert [r["email"] for r in read_csv(res.path)] == ["jane.doe@acme.com", "bob@beta.io"]
+    assert res.exported_ids == [group.id, beta.id] and res.count == 2    # best-scored record wins
+    assert "1 skipped: duplicate email" in res.detail
+
+
+def test_instantly_api_hands_each_email_over_once(make_ctx, tmp_path):
+    ctx = make_ctx(env={"INSTANTLY_API_KEY": "k"})
+    ctx.http.add("POST", INSTANTLY_URL, fn=instantly_ok)
+    uk, group, beta = _same_person_twice()
+    res = InstantlyApiExporter({"campaign_id": "c"}, ctx).export([uk, group, beta], tmp_path)
+    assert [c["json"]["email"] for c in ctx.http.calls] == ["jane.doe@acme.com", "bob@beta.io"]
+    assert ctx.http.calls[0]["json"]["company_name"] == "Acme Group"
+    assert res.exported_ids == [group.id, beta.id] and "1 skipped (duplicate email)" in res.detail
+
+
+def test_smartlead_api_hands_each_email_over_once(make_ctx, tmp_path):
+    ctx = make_ctx(env={"SMARTLEAD_API_KEY": "k"})
+    ctx.http.add("POST", SMARTLEAD_URL, fn=smartlead_ok)
+    uk, group, beta = _same_person_twice()
+    res = SmartleadApiExporter({"campaign_id": "4242"}, ctx).export([uk, group, beta], tmp_path)
+    items = ctx.http.calls[0]["json"]["lead_list"]
+    assert [i["email"] for i in items] == ["jane.doe@acme.com", "bob@beta.io"]
+    assert items[0]["company_name"] == "Acme Group"
+    assert res.exported_ids == [group.id, beta.id] and "1 skipped (duplicate email)" in res.detail
+    assert "uploaded 2/2" in res.detail
+
+
+@pytest.mark.parametrize("per_lead", [True, False])
+def test_webhook_hands_each_email_over_once(make_ctx, tmp_path, per_lead):
+    ctx = make_ctx()
+    ctx.http.add("POST", HOOK_URL, json={})
+    uk, group, beta = _same_person_twice()
+    nobody = make_lead(name="Delta", domain="delta.io", email=None, score=10)
+    res = WebhookExporter({"url": HOOK_URL, "per_lead": per_lead}, ctx).export([uk, group, beta, nobody],
+                                                                                tmp_path)
+    sent = ([c["json"]["lead"] for c in ctx.http.calls] if per_lead
+            else [ld for c in ctx.http.calls for ld in c["json"]["leads"]])
+    assert [ld["contact"]["email"] if ld["contact"] else "" for ld in sent] == [
+        "jane.doe@acme.com", "bob@beta.io", ""]
+    assert res.exported_ids == [group.id, beta.id, nobody.id]
+    assert "1 skipped (duplicate email)" in res.detail
+
+
+@pytest.mark.parametrize("cls,name", [(InstantlyCsvExporter, "instantly_upload"),
+                                      (SmartleadCsvExporter, "smartlead_upload")])
+def test_upload_csv_in_dry_run_is_a_rehearsal_file(make_ctx, tmp_path, cls, name):
+    res = cls({}, make_ctx(dry_run=True)).export([make_lead()], tmp_path)
+    assert res.path == str(tmp_path / f"{name}.dry-run.csv") and res.count == 1
+    assert not (tmp_path / f"{name}.csv").exists() and "do not import" in res.detail
+    res = cls({"filename": "exports/upload.csv"}, make_ctx(dry_run=True)).export([make_lead()], tmp_path)
+    assert res.path == str(tmp_path / "exports" / "upload.dry-run.csv")
 
 
 # --- exporters via the registry, as the pipeline calls them --------------------------------

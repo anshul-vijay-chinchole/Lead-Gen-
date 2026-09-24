@@ -94,6 +94,9 @@ DEFAULTS: Dict[str, Any] = {
         "finders": [],            # e.g. [{type: apollo}, {type: hunter}, {type: pattern}]
         "verifier": {"type": "basic"},
         "accept_statuses": ["valid", "risky"],
+        # guessed addresses (first.last@ built from a name pattern) must be at least this sure;
+        # catch-all "risky" guesses bounce often, so only "valid" by default
+        "accept_guessed_statuses": ["valid"],
         "max_companies": 200,     # enrichment credit guard: only the top-N pre-scored companies
         "min_prescore": 0,        # skip enrichment for companies pre-scoring below this
         "skip_if_contact_present": True,
@@ -229,6 +232,18 @@ class Playbook:
         return {k: getattr(self, k) for k in DEFAULTS}
 
 
+def _fix_yaml_bool_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    """YAML 1.1 parses an unquoted ``on:`` key as boolean True (``off:`` as False).
+    Restore the intended string keys so ``notify.on`` etc. are not silently ignored."""
+    if isinstance(data, dict):
+        out: Dict[Any, Any] = {}
+        for k, v in data.items():
+            key = {True: "on", False: "off"}.get(k, k) if isinstance(k, bool) else k
+            out[key] = _fix_yaml_bool_keys(v) if isinstance(v, dict) else v
+        return out
+    return data
+
+
 def _as_list(v: Any) -> List[Any]:
     if v is None:
         return []
@@ -325,6 +340,7 @@ def from_dict(data: Dict[str, Any], path: Optional[Path] = None,
               env: Optional[Dict[str, str]] = None) -> Playbook:
     if not isinstance(data, dict):
         raise PlaybookError("playbook must be a YAML mapping")
+    data = _fix_yaml_bool_keys(data)
     merged = _deep_merge(DEFAULTS, expand_env(data, env))
     # list-valued sections replace defaults entirely (handled by _deep_merge), but
     # make sure None becomes an empty list/dict.

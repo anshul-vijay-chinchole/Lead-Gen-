@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import pytest
+import yaml
 
 from leadgen import cli
 from leadgen.cli import main
@@ -187,7 +188,8 @@ def test_full_offline_flow(ws, capsys):
         assert store.is_suppressed(email=email)
     assert store.get_verification("priya.natarajan@kestrel-demo.com") == "invalid"
     reasons = sorted(f["reason"] for f in store.due_followups(date.today() + timedelta(days=200), "demo-offline"))
-    assert reasons == ["ooo", "timing"]
+    # one open follow-up per person: Graham's later "next quarter" reply supersedes his OOO one
+    assert reasons == ["timing"]
     funnel = store.funnel("demo-offline")
     assert funnel["stages"]["positive"] == 3 and funnel["lost"] == 3
     assert funnel["replies"][ReplyCategory.POSITIVE] == 3
@@ -221,6 +223,41 @@ def test_dry_run_then_real_run(ws, capsys):
     assert counts["exported"] > 0                              # the dry run did not "use up" anyone
 
 
+def test_same_person_under_two_company_records_is_handed_over_once(ws, capsys):
+    """A group CFO listed under two companies must get one sequence, not two."""
+    tmp = ws["tmp"]
+    signals = tmp / "signals.csv"
+    signals.write_text(
+        "company,domain,location,industry,employees,signal_type,signal_title,signal_date,signal_url,signal_id\n"
+        "Acme Group,acme-demo.com,London,Software,300,job_posting,Financial Controller,2 days ago,"
+        "https://acme-demo.com/jobs/1,a1\n"
+        "Acme UK,acme-uk-demo.com,London,Software,120,job_posting,Senior Financial Analyst,1 day ago,"
+        "https://acme-uk-demo.com/jobs/2,a2\n", encoding="utf-8")
+    contacts = tmp / "contacts.csv"
+    contacts.write_text(
+        "company,domain,first_name,last_name,title,email,email_status\n"
+        "Acme Group,acme-demo.com,Jane,Doe,CFO,jane.doe@acme-demo.com,valid\n"
+        "Acme UK,acme-uk-demo.com,Jane,Doe,CFO,jane.doe@acme-demo.com,valid\n", encoding="utf-8")
+    data = yaml.safe_load((REPO / DEMO).read_text(encoding="utf-8"))
+    data["sources"][0]["path"] = str(signals)
+    data["enrichment"]["finders"] = [{"type": "csv", "path": str(contacts)}]
+    pb = tmp / "dup.yaml"
+    pb.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    assert main(["run", "-p", str(pb), "--out", str(ws["out"]), *ws["g"]]) == 0
+    capsys.readouterr()
+    run_dir = next(ws["out"].iterdir())
+    leads = json.loads((run_dir / "leads.json").read_text(encoding="utf-8"))
+    both = [ld for ld in leads if ld["contact"] and ld["contact"]["email"] == "jane.doe@acme-demo.com"]
+    assert len(both) == 2                                   # the setup: two leads, one person
+    written = [ld for ld in both if ld["messages"]]
+    assert len(written) == 1                                # the writer is not spent on the duplicate
+    assert any("same email" in n for ld in both for n in ld["notes"])
+    for name in ("instantly_upload.csv", "smartlead_upload.csv"):
+        assert [r["email"] for r in read_csv(run_dir / name)] == ["jane.doe@acme-demo.com"], name
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["counts"]["exported"] == 1
+
+
 def test_every_playbook_loads():
     files = sorted((REPO / "playbooks").glob("*.yaml")) + sorted((REPO / "playbooks" / "templates").glob("*.yaml"))
     names = set()
@@ -244,6 +281,24 @@ def test_every_playbook_loads():
     assert {"demo-offline", "my-agency"} <= names
     templates = {p.stem for p in (REPO / "playbooks" / "templates").glob("*.yaml")}
     assert templates == set(cli.TEMPLATES)
+
+
+def test_every_playbook_notify_on_is_read_from_the_file(tmp_path):
+    """YAML 1.1 reads an unquoted ``on:`` key as boolean True, which silently drops the event
+    list (the defaults were used instead). Shipped playbooks + templates quote it."""
+    files = sorted((REPO / "playbooks").glob("*.yaml")) + sorted((REPO / "playbooks" / "templates").glob("*.yaml"))
+    for f in files:
+        text = f.read_text(encoding="utf-8")
+        raw = yaml.safe_load(text)["notify"]
+        assert "on" in raw and not any(isinstance(k, bool) for k in raw), f.name
+        # changing the list in the file changes what the engine alerts on
+        edited = re.sub(r'(?m)^  "on": \[[^\]]*\]', '  "on": [run_summary, unsubscribe, negative]', text)
+        assert edited != text, f.name
+        tmp = tmp_path / f.name
+        tmp.write_text(edited, encoding="utf-8")
+        pb = load_playbook(str(tmp), env={})
+        assert pb.notify["on"] == ["run_summary", "unsubscribe", "negative"], f.name
+        assert not any(isinstance(k, bool) for k in pb.notify), f.name
 
 
 def test_every_playbook_path_resolves_from_repo_root():

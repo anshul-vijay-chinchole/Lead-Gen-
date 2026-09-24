@@ -175,6 +175,24 @@ def test_api_verifiers_dry_run_never_call_provider(make_ctx, cls, env):
     assert ctx.http.calls == []
 
 
+def _network_error(call):
+    """What HttpClient raises when requests fails to connect: the message quotes the full request URL."""
+    query = "&".join(f"{k}={v}" for k, v in call["params"].items())
+    raise HttpError(0, call["url"], f"ConnectionError: HTTPSConnectionPool(host='api.example', port=443): "
+                                    f"Max retries exceeded with url: /x?{query} (Caused by NewConnectionError)")
+
+
+@pytest.mark.parametrize("cls,env", API_VERIFIERS)
+def test_api_verifiers_network_error_does_not_leak_api_key(make_ctx, cls, env):
+    ctx = make_ctx(env={env: "SECRET-KEY-123"})
+    ctx.http.add("GET", "https://", fn=_network_error)
+    with pytest.raises(HttpError) as ei:
+        cls({}, ctx).verify("jane@acme.com")
+    assert ei.value.status == 0 and "Max retries exceeded" in str(ei.value)
+    assert "SECRET-KEY-123" not in str(ei.value) and "SECRET-KEY-123" not in ei.value.body
+    assert ctx.http.calls[0]["params"]  # the key really was in the query string
+
+
 # --- MillionVerifier ------------------------------------------------------------------------
 
 @pytest.mark.parametrize("raw,expected", [

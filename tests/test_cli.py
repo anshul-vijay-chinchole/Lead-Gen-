@@ -365,6 +365,34 @@ def test_run_exit_code_when_every_source_fails(tmp_path, g, capsys):
     assert "every source failed" in captured.err and "file not found" in captured.out
 
 
+def test_run_one_of_two_unlabeled_sources_failing_is_not_every_source(tmp_path, g, capsys):
+    """Both sources are reported as 'source csv: ...'; one failure must not count for both."""
+    data = yaml.safe_load((REPO / DEMO).read_text(encoding="utf-8"))
+    data["sources"] = [{"type": "csv", "path": str(REPO / "examples/data/demo_signals.csv")},
+                       {"type": "csv", "path": "missing-demo.csv"}]
+    data["enrichment"]["finders"][0]["path"] = str(REPO / "examples/data/demo_contacts.csv")
+    pb = write_playbook(tmp_path, data)
+    assert main(["run", "-p", pb, "--out", str(tmp_path / "out"), *g]) == 0
+    captured = capsys.readouterr()
+    assert "every source failed" not in captured.err and "file not found" in captured.out
+    summary = json.loads((latest_run_dir(tmp_path) / "summary.json").read_text(encoding="utf-8"))
+    assert summary["counts"]["sourced"] > 0 and summary["counts"]["exported"] > 0
+    # ...while both failing is still an error
+    data["sources"][0]["path"] = "nope.csv"
+    pb = write_playbook(tmp_path, data)
+    assert main(["run", "-p", pb, "--out", str(tmp_path / "out"), *g]) == 1
+    assert "every source failed (2 of 2)" in capsys.readouterr().err
+
+
+def test_failed_sources_counts_each_source_once():
+    pb = cli.from_dict({"name": "x", "sources": [{"type": "csv", "path": "a.csv"}, {"type": "csv", "path": "b.csv"},
+                                                 {"type": "json", "path": "c.json", "label": "crm"}]}, env={})
+    assert cli._failed_sources(pb, ["source csv: file not found: b.csv"], False) == (3, 1)
+    assert cli._failed_sources(pb, ["source csv: x", "source csv: y"], False) == (3, 2)
+    assert cli._failed_sources(pb, ["source csv: x", "source csv: y", "source crm: z"], False) == (3, 3)
+    assert cli._failed_sources(pb, ["enrich csv: x"], False) == (3, 0)
+
+
 def test_run_limit_and_dry_run(tmp_path, g, capsys):
     assert main(["run", "-p", DEMO, "--out", str(tmp_path / "out"), "--limit", "3", "--dry-run", *g]) == 0
     out = capsys.readouterr().out
@@ -373,6 +401,27 @@ def test_run_limit_and_dry_run(tmp_path, g, capsys):
     assert summary["counts"]["exported"] == 0          # dry run never marks anything handed over
     assert len(summary["top"]) <= 3
     assert main(["run", "-p", DEMO, "--limit", "0", *g]) == 2
+
+
+def test_dry_run_upload_files_are_rehearsals_not_ready_to_import(tmp_path, g, capsys):
+    """A dry run records nobody as handed over, so its upload files must never look importable."""
+    assert main(["run", "-p", DEMO, "--out", str(tmp_path / "dry"), "--dry-run", *g]) == 0
+    out = capsys.readouterr().out
+    run_dir = next((tmp_path / "dry").iterdir())
+    assert not (run_dir / "instantly_upload.csv").exists() and not (run_dir / "smartlead_upload.csv").exists()
+    assert read_rows(run_dir / "instantly_upload.dry-run.csv")               # still previewable
+    assert (run_dir / "smartlead_upload.dry-run.csv").exists()
+    assert "ready to import" not in out and "do NOT import" in out and "without --dry-run" in out
+    assert main(["run", "-p", DEMO, "--out", str(tmp_path / "real"), *g]) == 0   # the real run
+    out = capsys.readouterr().out
+    run_dir = next((tmp_path / "real").iterdir())
+    assert (run_dir / "instantly_upload.csv").exists() and "ready to import into Instantly" in out
+    assert not list(run_dir.glob("*.dry-run.*")) and "do NOT import" not in out
+
+
+def read_rows(path: Path) -> List[dict]:
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
 def test_run_dry_run_with_only_network_sources_explains_empty_result(tmp_path, g, capsys):
@@ -494,6 +543,36 @@ def test_mark(tmp_path, g, capsys):
     store.close()
 
 
+def test_mark_exported_by_hand_is_never_handed_over_again(tmp_path, g, capsys):
+    """Someone contacted by hand and marked 'exported' must count as handed over for dedupe."""
+    data = yaml.safe_load((REPO / DEMO).read_text(encoding="utf-8"))
+    data["outbound"]["exporters"] = [{"type": "csv"}]            # review only: nobody handed over
+    review = write_playbook(tmp_path, data, "review.yaml")
+    assert main(["run", "-p", review, "--out", str(tmp_path / "out"), *g]) == 0
+    store = Store(g[1])
+    lead = store.find_lead_by_email("maya.okafor@brightwave-demo.com")
+    assert lead.stage == Stage.READY and not store.was_exported(lead.id)
+    capsys.readouterr()
+    assert main(["mark", "-p", review, "--email", "maya.okafor@brightwave-demo.com", "--stage", "exported",
+                 *g]) == 0
+    assert "ready -> exported" in capsys.readouterr().out
+    assert store.get_lead(lead.id).stage == Stage.EXPORTED and store.was_exported(lead.id)
+    assert store.recently_contacted("maya.okafor@brightwave-demo.com", 90, exclude_lead_id="other")
+    # marking again keeps the original hand-over time
+    first = store.conn.execute("SELECT exported_at FROM leads WHERE id=?", (lead.id,)).fetchone()[0]
+    assert main(["mark", "--lead", lead.id, "--stage", "exported", *g]) == 0
+    assert "already 'exported'" in capsys.readouterr().out
+    assert store.conn.execute("SELECT exported_at FROM leads WHERE id=?", (lead.id,)).fetchone()[0] == first
+    # the next run with a sending-tool export leaves Maya out
+    data["outbound"]["exporters"] = [{"type": "instantly_csv"}]
+    send = write_playbook(tmp_path, data, "send.yaml")
+    assert main(["run", "-p", send, "--out", str(tmp_path / "out2"), *g]) == 0
+    upload = next((tmp_path / "out2").iterdir()) / "instantly_upload.csv"
+    emails = [r["email"] for r in csv.DictReader(open(upload, encoding="utf-8"))]
+    assert emails and "maya.okafor@brightwave-demo.com" not in emails
+    store.close()
+
+
 def test_suppress(tmp_path, g, capsys):
     assert main(["suppress", "list", *g]) == 0
     assert "empty" in capsys.readouterr().out
@@ -519,6 +598,73 @@ def test_suppress(tmp_path, g, capsys):
     assert main(["suppress", "remove", "never-added-demo.com", *g]) == 0
     assert "Removed 0 value(s) (of 1 given)" in capsys.readouterr().out
     assert main(["suppress", "add", *g]) == 2
+    store.close()
+
+
+def test_suppress_remove_email_keeps_the_domain_block(g, capsys):
+    """Removing one person must not lift a whole-domain 'never contact anyone at acme.com'."""
+    assert main(["suppress", "add", "acme-demo.com", "--reason", "nobody at acme", *g]) == 0
+    assert main(["suppress", "add", "jane@acme-demo.com", *g]) == 0
+    capsys.readouterr()
+    assert main(["suppress", "remove", "jane@acme-demo.com", *g]) == 0
+    assert "Removed 1 value(s) from" in capsys.readouterr().out
+    store = Store(g[1])
+    assert [(r["value"], r["kind"]) for r in store.list_suppressed()] == [("acme-demo.com", "domain")]
+    assert store.is_suppressed(email="bob@acme-demo.com")
+    # --kind is honoured: removing the domain entry leaves an email entry alone
+    assert main(["suppress", "add", "jane@acme-demo.com", *g]) == 0
+    assert main(["suppress", "remove", "acme-demo.com", "--kind", "email", *g]) == 0
+    assert store.is_suppressed(email="bob@acme-demo.com")
+    assert main(["suppress", "remove", "acme-demo.com", *g]) == 0
+    assert not store.is_suppressed(email="bob@acme-demo.com")
+    assert store.is_suppressed(email="jane@acme-demo.com")
+    store.close()
+
+
+def test_suppress_add_understands_blocklist_notations(g, capsys):
+    for v in ("@acme-demo.com", "*@beta-demo.io", "*.eps-demo.io", "Jane Doe <Jane@Gamma-demo.com>",
+              "mailto:zed@delta-demo.io"):
+        assert main(["suppress", "add", v, *g]) == 0, v
+    store = Store(g[1])
+    assert sorted((r["value"], r["kind"]) for r in store.list_suppressed()) == [
+        ("acme-demo.com", "domain"), ("beta-demo.io", "domain"), ("eps-demo.io", "domain"),
+        ("jane@gamma-demo.com", "email"), ("zed@delta-demo.io", "email")]
+    for email in ("bob@acme-demo.com", "x@beta-demo.io", "a@eps-demo.io", "jane@gamma-demo.com",
+                  "zed@delta-demo.io"):
+        assert store.is_suppressed(email=email), email
+    capsys.readouterr()
+    # values that can never match are refused loudly instead of "Added 1 value(s)"
+    assert main(["suppress", "add", "Jane Doe", *g]) == 1
+    captured = capsys.readouterr()
+    assert "Added 0 value(s) (of 1 given)" in captured.out and "skipped 'Jane Doe'" in captured.err
+    assert main(["suppress", "add", "acme-demo.com", "--kind", "email", *g]) == 1
+    assert len(store.list_suppressed()) == 5
+    store.close()
+
+
+@pytest.mark.parametrize("content", [
+    "Name,Email Address,Status\nJane Doe,jane@acme-demo.com,unsubscribed\nBob Roe,bob@x-demo.com,unsubscribed\n",
+    "First;Last;E-mail\nJane;Doe;jane@acme-demo.com\nBob;Roe;BOB@x-demo.com\n",
+    "Mailing list,Work email\nnewsletter,jane@acme-demo.com\nnewsletter,bob@x-demo.com\n",
+    "jane@acme-demo.com,Jane\nbob@x-demo.com,Bob\n",                       # no header row
+])
+def test_suppress_add_file_finds_the_email_column(tmp_path, g, capsys, content):
+    f = tmp_path / "unsubscribes.csv"
+    f.write_text(content, encoding="utf-8")
+    assert main(["suppress", "add", "--file", str(f), *g]) == 0
+    assert "Added 2 value(s) to" in capsys.readouterr().out
+    store = Store(g[1])
+    assert sorted(r["value"] for r in store.list_suppressed()) == ["bob@x-demo.com", "jane@acme-demo.com"]
+    assert all(r["kind"] == "email" for r in store.list_suppressed())
+    store.close()
+
+
+def test_suppress_add_file_website_column(tmp_path, g, capsys):
+    f = tmp_path / "competitors.csv"
+    f.write_text("Company,Website\nAcme,https://www.acme-demo.com/about\n", encoding="utf-8")
+    assert main(["suppress", "add", "--file", str(f), *g]) == 0
+    store = Store(g[1])
+    assert [(r["value"], r["kind"]) for r in store.list_suppressed()] == [("acme-demo.com", "domain")]
     store.close()
 
 

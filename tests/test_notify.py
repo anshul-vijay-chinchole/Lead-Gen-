@@ -295,3 +295,55 @@ def test_notify_broken_channel_does_not_raise(make_ctx, capsys):
     ctx = make_ctx(notify={"channels": [{"type": "slack"}, {"type": "console"}], "on": ["positive"]})
     assert notify(ctx, "positive", "Title", "text") == 1  # slack has no URL; console still works
     assert "Title" in capsys.readouterr().out
+
+
+# --- regressions: secret URLs in network errors -------------------------------------------
+
+def _requests_style_network_error(call):
+    from leadgen.http import HttpError
+    from urllib.parse import urlsplit
+
+    u = urlsplit(call["url"])
+    path = u.path + (f"?{u.query}" if u.query else "")
+    raise HttpError(0, call["url"], f"ConnectionError: HTTPSConnectionPool(host='{u.hostname}', port=443): "
+                                    f"Max retries exceeded with url: {path} (Caused by NewConnectionError(...))")
+
+
+def test_regression_slack_network_error_message_never_contains_the_path(make_ctx, caplog):
+    ctx = make_ctx(notify={"on": ["positive"], "channels": [{"type": "slack", "webhook_url": SLACK_URL}]})
+    ctx.http.add("POST", SLACK_URL, fn=_requests_style_network_error)
+    with pytest.raises(SlackError) as ei:
+        SlackNotifier({"webhook_url": SLACK_URL}, ctx).send("positive", "t", "b", {})
+    msg = str(ei.value)
+    assert "SeCrEtToKeN123" not in msg and "T0001" not in msg and "B0002" not in msg
+    assert "hooks.slack.com" in msg and "ConnectionError" in msg
+    with caplog.at_level("DEBUG"):
+        assert notify(ctx, "positive", "t", "b", {}) == 0
+    assert "SeCrEtToKeN123" not in caplog.text and "slack" in caplog.text
+
+
+def test_regression_webhook_network_error_message_never_contains_path_or_query(make_ctx, caplog):
+    url = "https://hooks.example.com/hook/PATHSECRET?sig=QSECRET"
+    ctx = make_ctx(notify={"on": ["positive"], "channels": [{"type": "webhook", "url": url}]})
+    ctx.http.add("POST", url, fn=_requests_style_network_error)
+    with pytest.raises(WebhookError) as ei:
+        WebhookNotifier({"url": url}, ctx).send("positive", "t", "b", {})
+    assert "PATHSECRET" not in str(ei.value) and "QSECRET" not in str(ei.value)
+    assert "hooks.example.com" in str(ei.value)
+    with caplog.at_level("DEBUG"):
+        notify(ctx, "positive", "t", "b", {})
+    assert "PATHSECRET" not in caplog.text and "QSECRET" not in caplog.text
+
+
+def test_regression_http_error_body_echoing_the_url_is_scrubbed(make_ctx):
+    from leadgen.http import HttpError
+
+    ctx = make_ctx()
+
+    def echo(call):
+        raise HttpError(502, call["url"], f"bad gateway for {call['url']}")
+
+    ctx.http.add("POST", SLACK_URL, fn=echo)
+    with pytest.raises(SlackError) as ei:
+        SlackNotifier({"webhook_url": SLACK_URL}, ctx).send("positive", "t", "b", {})
+    assert "SeCrEtToKeN123" not in str(ei.value) and "502" in str(ei.value)

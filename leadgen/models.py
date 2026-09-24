@@ -159,9 +159,9 @@ class Contact:
         if not self.full_name and (self.first_name or self.last_name):
             self.full_name = f"{self.first_name} {self.last_name}".strip()
         if self.full_name and not (self.first_name or self.last_name):
-            parts = self.full_name.split()
-            self.first_name = parts[0]
-            self.last_name = " ".join(parts[1:])
+            # "Dr. Jane Doe", "Doe, Jane", "Jane Doe, PhD" -> ("Jane", "Doe")
+            from .enrich.pattern import split_full_name  # local import: avoids an import cycle
+            self.first_name, self.last_name = split_full_name(self.full_name)
         if self.email_status not in EmailStatus.ALL:
             self.email_status = EmailStatus.UNKNOWN
 

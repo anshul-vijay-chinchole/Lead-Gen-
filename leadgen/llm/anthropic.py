@@ -31,7 +31,8 @@ the system prompt asking for a single JSON object and nothing else;
 ``complete_json`` (base class) then tolerates stray fences / prose.
 
 Credential: ``ANTHROPIC_API_KEY`` (config ``api_key`` / ``api_key_env`` override),
-resolved lazily at the first request.
+resolved lazily at the first request; surrounding whitespace is stripped and a key
+with embedded whitespace / control characters raises ``MissingCredentialError``.
 
 Config keys
 -----------
@@ -60,7 +61,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils import get_path
 from .base import LLMClient, LLMError
-from .openai import LLMConfigError, LLMTruncatedError, effective_temperature, post_json, timeout_from
+from .openai import (LLMConfigError, LLMTruncatedError, clean_api_key, clean_headers, effective_temperature,
+                     post_json, timeout_from)
 
 DEFAULT_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -91,6 +93,10 @@ class AnthropicClient(LLMClient):
     def endpoint(self) -> str:
         return messages_url(str(self.config.get("base_url") or ""))
 
+    def api_key(self) -> str:
+        """The API key (whitespace-stripped; raises ``MissingCredentialError`` if unusable)."""
+        return clean_api_key(self.secret(), self.name)
+
     def build_request(self, system: str, user: str, *, json_mode: bool = False,
                       max_tokens: int = 1500,
                       temperature: Optional[float] = None) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
@@ -99,13 +105,11 @@ class AnthropicClient(LLMClient):
         if not url.startswith(("http://", "https://")):
             raise LLMConfigError(f"anthropic: base_url must start with http:// or https:// (got {url!r})")
         headers: Dict[str, str] = {
-            "x-api-key": self.secret(),
+            "x-api-key": self.api_key(),
             "anthropic-version": str(self.config.get("anthropic_version") or ANTHROPIC_VERSION),
             "content-type": "application/json",
         }
-        extra_headers = self.config.get("extra_headers")
-        if isinstance(extra_headers, dict):
-            headers.update({str(k): str(v) for k, v in extra_headers.items()})
+        headers.update(clean_headers(self.config.get("extra_headers")))
 
         system = (system or "").strip()
         if json_mode:

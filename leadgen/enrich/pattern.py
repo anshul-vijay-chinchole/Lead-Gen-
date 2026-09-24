@@ -71,6 +71,9 @@ _SHORTHAND_WORDS: Tuple[Tuple[str, str], ...] = (
 )
 _HONORIFICS = frozenset({"dr", "mr", "mrs", "ms", "miss", "mx", "prof", "sir"})
 _CREDENTIALS = frozenset({"jr", "sr", "ii", "iii", "iv", "phd", "md", "mba", "cpa", "cfa", "esq", "pmp"})
+# first words of multi-word surnames ("van der Berg, Anna" is "Last, First")
+_SURNAME_PARTICLES = frozenset({"van", "von", "de", "der", "den", "del", "della", "da", "di", "du", "dos",
+                                "das", "le", "la", "ter", "ten", "zu", "st"})
 
 
 def name_token(raw: Any, *, is_first: bool = False) -> str:
@@ -157,15 +160,54 @@ def render_pattern(template: str, first: str, last: str) -> Optional[str]:
     return local or None
 
 
+def _only_credentials(text: str) -> bool:
+    tokens = [re.sub(r"[^a-z0-9]", "", strip_accents(w).lower()) for w in text.split()]
+    tokens = [t for t in tokens if t]
+    return bool(tokens) and all(t in _CREDENTIALS for t in tokens)
+
+
+def split_full_name(full: Any) -> Tuple[str, str]:
+    """(first, last) of a whole name, original spelling kept.
+
+    Parenthesised text, leading honorifics ("Dr.", "Prof. Dr.", "Ms") and
+    trailing credentials ("Jr", "PhD", ", CPA") are dropped, and "Last, First"
+    is turned around: "Dr. Jane Doe", "Doe, Jane" and "Jane Doe, PhD" all give
+    ("Jane", "Doe"). An honorific + one word ("Dr Doe") is a last name only.
+    """
+    s = re.sub(r"\([^)]*\)", " ", str(full or ""))
+    parts = [p.strip() for p in s.split(",")]
+    head = parts[0].split()
+    rest = [p for p in parts[1:] if p and not _only_credentials(p)]
+    if rest and head and (len(head) == 1 or head[0].lower() in _SURNAME_PARTICLES):
+        words = rest[0].split() + head          # "Doe, Jane" / "van der Berg, Anna"
+    else:
+        words = head or (rest[0].split() if rest else [])
+    honorific = False
+    while words and name_token(words[0]) in _HONORIFICS:
+        words.pop(0)
+        honorific = True
+    while len(words) > 1 and name_token(words[-1]) in _CREDENTIALS:
+        words.pop()
+    if not words:
+        return "", ""
+    if len(words) == 1:
+        return ("", words[0]) if honorific else (words[0], "")
+    return words[0], " ".join(words[1:])
+
+
 def contact_name_parts(contact: Contact) -> Tuple[str, str]:
     """(first, last) name tokens for pattern building.
 
     Recovers a missing last name from ``full_name`` (or from a first-name field
     holding the whole name), skips a first name that is only an honorific
-    ("Dr" + "Jane Doe"), and ignores provider-obfuscated last names ("Sm***h").
+    ("Dr" + "Jane Doe", also stacked: "Prof." + "Dr. Hans Meier"), turns a
+    "Last, First" split around ("Doe," + "Jane"), and ignores
+    provider-obfuscated last names ("Sm***h").
     """
     first_raw = re.sub(r"\([^)]*\)", " ", contact.first_name or "").strip()
     last_raw = (contact.last_name or "").strip()
+    if first_raw.endswith(",") and last_raw:  # Contact split "Doe, Jane" into "Doe," + "Jane"
+        first_raw, last_raw = split_full_name(f"{first_raw} {last_raw}")
     full = [w for w in re.sub(r"\([^)]*\)", " ", contact.full_name or "").split() if w]
     if not first_raw and full:
         last_words = last_raw.split()
@@ -188,8 +230,10 @@ def contact_name_parts(contact: Contact) -> Tuple[str, str]:
             last_raw = " ".join(full[1:])
     if name_token(first_raw) in _HONORIFICS:  # "Dr" + "Jane Doe" -> Jane Doe; "Dr" + "Doe" -> no first name
         rest = last_raw.split()
+        while rest and name_token(rest[0]) in _HONORIFICS:  # stacked: "Prof." + "Dr. Hans Meier"
+            rest.pop(0)
         first_raw = rest[0] if len(rest) > 1 else ""
-        last_raw = " ".join(rest[1:]) if len(rest) > 1 else last_raw
+        last_raw = " ".join(rest[1:]) if len(rest) > 1 else " ".join(rest)
     if "*" in last_raw:
         last_raw = ""
     return name_token(first_raw, is_first=True), name_token(last_raw)
@@ -267,4 +311,4 @@ class PatternFinder(ContactFinder):
 
 
 __all__ = ["DEFAULT_PATTERNS", "PatternFinder", "contact_name_parts", "name_token", "normalize_pattern",
-           "render_pattern"]
+           "render_pattern", "split_full_name"]

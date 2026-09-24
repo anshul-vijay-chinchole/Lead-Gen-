@@ -491,3 +491,80 @@ def test_json_multiline_jsonl_without_extension(make_ctx, tmp_path):
     p = tmp_path / "export.json"
     p.write_text('{"company": "A", "website": "a.com"}\n{"company": "B", "website": "b.com"}\n', encoding="utf-8")
     assert [c.name for c in make_source(JsonSource, make_ctx, path=str(p)).fetch()] == ["A", "B"]
+
+
+# --- regressions (verifier/fixer pass) --------------------------------------------------------
+
+def test_csv_with_cr_only_line_endings(make_ctx, tmp_path):
+    # Excel for Mac "CSV (Macintosh)": rows end in a bare \r
+    path = tmp_path / "mac.csv"
+    path.write_bytes(b'Company,Website,signal_title\rAcme,acme.com,Controller\r"Beta, Inc",beta.io,"CFO\nsearch"\r')
+    headers, rows = make_source(CsvSource, make_ctx, path=str(path)).read_rows()
+    assert headers == ["Company", "Website", "signal_title"]
+    assert rows == [{"Company": "Acme", "Website": "acme.com", "signal_title": "Controller"},
+                    {"Company": "Beta, Inc", "Website": "beta.io", "signal_title": "CFO\nsearch"}]
+
+
+def test_skip_rows_keeps_unicode_line_separators_inside_cells(make_ctx, tmp_path):
+    path = tmp_path / "u2028.csv"
+    path.write_text("Exported 2026-09-24\nCompany,Website,First Name,Last Name,Email\n"
+                    "Acme,acme.com,Jane ,Doe\x0c,jane@acme.com\n", encoding="utf-8")
+    headers, rows = make_source(CsvSource, make_ctx, path=str(path), skip_rows=1).read_rows()
+    assert headers == ["Company", "Website", "First Name", "Last Name", "Email"]
+    assert len(rows) == 1 and rows[0]["Last Name"] == "Doe" and rows[0]["Email"] == "jane@acme.com"
+
+
+def test_jsonl_record_with_raw_line_separator_in_a_string(make_ctx, tmp_path):
+    items = [{"companyName": "Acme", "website": "acme.com", "title": "Controller",
+              "description": "Own the close. Report to CFO. Hybrid.\x85"},
+             {"companyName": "Beta", "website": "beta.io", "title": "CFO"}]
+    path = tmp_path / "items.jsonl"
+    path.write_text("\r\n".join(json.dumps(it, ensure_ascii=False) for it in items) + "\n", encoding="utf-8")
+    src = make_source(JsonSource, make_ctx, path=str(path))
+    assert [r["companyName"] for r in src.read_records()] == ["Acme", "Beta"]
+    assert [c.name for c in src.fetch()] == ["Acme", "Beta"]
+
+
+def test_one_bracketed_website_cell_does_not_fail_the_file(make_ctx, tmp_path):
+    rows = [["Weird Co", "[weirdco.com]", "Controller"], ["Odd Co", "acme.com]", "CFO"],
+            ["Good Co", "good.io", "Controller"]]
+    path = write_csv(tmp_path / "b.csv", ["Company", "Website", "Job Title"], rows)
+    companies = make_source(CsvSource, make_ctx, path=str(path)).fetch()
+    assert [(c.name, c.domain) for c in companies] == [("Weird Co", "weirdco.com"), ("Odd Co", "acme.com"),
+                                                        ("Good Co", "good.io")]
+
+
+def test_us_dates_are_read_month_first_for_the_whole_column(make_ctx, tmp_path):
+    rows = [["Fresh Co", "fresh-demo.com", "Controller", "9/5/2026"],
+            ["Fresh Two", "fresh2-demo.com", "Controller", "9/20/2026"],
+            ["Stale Co", "stale-demo.com", "Controller", "1/9/2026"]]
+    path = write_csv(tmp_path / "us.csv", ["Company", "Website", "Job Title", "Date Posted"], rows)
+    got = {c.name: c.signals[0].posted_at for c in make_source(CsvSource, make_ctx, path=str(path)).fetch()}
+    assert got == {"Fresh Co": date(2026, 9, 5), "Fresh Two": date(2026, 9, 20), "Stale Co": date(2026, 1, 9)}
+    # explicit order for files without a deciding value
+    path = write_csv(tmp_path / "us2.csv", ["Company", "Website", "Job Title", "Date Posted"], rows[:1])
+    [c] = make_source(CsvSource, make_ctx, path=str(path), date_order="mdy").fetch()
+    assert c.signals[0].posted_at == date(2026, 9, 5)
+    [c] = make_source(CsvSource, make_ctx, path=str(path), date_order="dmy").fetch()
+    assert c.signals[0].posted_at == date(2026, 5, 9)
+
+
+def test_google_maps_csv_export_title_is_the_business(make_ctx, tmp_path):
+    rows = [["Blue Door Dental", "4.8", "212", "12 High St", "Bristol", "GB", "https://www.bluedoordental.co.uk/",
+             "Dentist", "https://www.google.com/maps/place/?q=place_id:abc"]]
+    path = write_csv(tmp_path / "maps.csv", ["title", "totalScore", "reviewsCount", "street", "city", "countryCode",
+                                             "website", "categoryName", "url"], rows)
+    [c] = make_source(CsvSource, make_ctx, path=str(path)).fetch()
+    assert c.name == "Blue Door Dental" and c.domain == "bluedoordental.co.uk" and c.industry == "Dentist"
+    assert all(s.type != SignalType.JOB_POSTING and s.title != "Blue Door Dental" for s in c.signals)
+
+
+def test_csv_email_status_not_valid_and_shared_isp_mailboxes(make_ctx, tmp_path):
+    rows = [["Bob's HVAC", "Bob", "Smith", "Owner", "bob@sbcglobal.net", "Valid"],
+            ["Joe's Plumbing", "Joe", "Jones", "Owner", "joe@sbcglobal.net", "Not valid"]]
+    path = write_csv(tmp_path / "isp.csv", ["Company", "First Name", "Last Name", "Title", "Email", "Email Status"],
+                     rows)
+    bob, joe = make_source(CsvSource, make_ctx, path=str(path)).fetch()
+    assert (bob.name, bob.domain, [c.first_name for c in bob.contacts]) == ("Bob's HVAC", "", ["Bob"])
+    assert (joe.name, joe.domain, [c.first_name for c in joe.contacts]) == ("Joe's Plumbing", "", ["Joe"])
+    assert joe.contacts[0].email_status == EmailStatus.INVALID

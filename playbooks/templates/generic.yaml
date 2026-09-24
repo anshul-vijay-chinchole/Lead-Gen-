@@ -302,7 +302,9 @@ notify:
   channels:
     - type: console
     # - type: slack
-  on: [positive, referral, question, run_summary]
+  # Which events alert. Keep the quotes around "on": unquoted, YAML reads the
+  # key as true/false and the list would be ignored.
+  "on": [positive, referral, question, run_summary]
 
 # -----------------------------------------------------------------------------
 # STORAGE - the engine's memory (a single SQLite file, created automatically).

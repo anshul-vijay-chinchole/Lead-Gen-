@@ -49,6 +49,9 @@ Custom field values are sent as strings. Documented response::
      "duplicate_count": 0, "invalid_email_count": 0, "unsubscribed_leads": [],
      "is_lead_limit_exhausted": false, "lead_import_stopped_count": 0}
 
+A lead whose email already appeared earlier in the same upload (the same
+person under two company records) is skipped; the highest-scored one is sent.
+
 The per-batch numbers are summed into ``detail`` (e.g. ``uploaded 5/6 to
 campaign 123; already in campaign 1``). A batch counts as handed over when
 the call succeeds and ``ok`` is not false; addresses Smartlead lists back as
@@ -64,8 +67,10 @@ else a partial result with the reason in ``detail``.
 In ``ctx.dry_run`` no request is made: ``count=0, detail="dry-run"``.
 
 Credential: ``SMARTLEAD_API_KEY`` (or config ``api_key`` / ``api_key_env``),
-sent as the ``api_key`` query parameter (``leadgen.http`` redacts it from
-logs), resolved at the first real push.
+sent as the ``api_key`` query parameter, resolved at the first real push.
+Every error text this exporter logs, raises or puts in ``detail`` is scrubbed
+of the key first (a network error's text carries the full request URL,
+query string included).
 
 Config keys (``type: smartlead``)
 ---------------------------------
@@ -84,6 +89,7 @@ label               Name reported in ``ExportResult.exporter`` (default ``smartl
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -93,7 +99,7 @@ from ..utils import chunks, to_int
 from .base import Exporter, ExportResult
 from .csv_export import (BODY_FORMATS, FATAL_STATUSES, UploadCsvExporter, _bool, config_int,
                          followup_subject_steps, max_steps, outbound_row, response_error,
-                         sequence_keys, sorted_by_score)
+                         sequence_keys, sorted_by_score, unique_by_email)
 
 DEFAULT_BASE_URL = "https://server.smartlead.ai/api/v1"
 DEFAULT_LEADS_PATH = "/campaigns/{campaign_id}/leads"
@@ -104,6 +110,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 DEFAULT_REJECTED_KEYS = ("unsubscribed_leads", "invalid_emails", "invalid_email_leads",
                          "blocked_leads", "bounced_leads")
+#: ``api_key=<value>`` inside an error text (value ends at & / whitespace / quote / bracket).
+_KEY_QS = re.compile(r"(api_?key=)[^&\s'\")]+", re.I)
 #: Smartlead documents a cap on custom fields per lead.
 MAX_CUSTOM_FIELDS = 20
 
@@ -131,6 +139,18 @@ def _count(value: Any) -> int:
         return len(value)
     n = to_int(value)
     return n or 0
+
+
+def scrub(text: str, secret: str) -> str:
+    """``text`` without ``secret`` or any ``api_key=...`` query value (safe to log / raise).
+
+    Only the value is masked, so e.g. a network error's cause ("Connection
+    refused") stays readable.
+    """
+    text = str(text or "")
+    if secret:
+        text = text.replace(secret, "***")
+    return _KEY_QS.sub(r"\1***", text)
 
 
 def _emails_in(value: Any) -> Set[str]:
@@ -235,8 +255,11 @@ class SmartleadApiExporter(Exporter):
             return ExportResult(exporter=self.label, count=0, detail="dry-run")
         campaign = self.campaign_id
         fmt = self._body_format()
-        with_email = [ld for ld in ordered if ld.contact and ld.contact.email]
-        skipped = len(ordered) - len(with_email)
+        with_email, dups = unique_by_email(ld for ld in ordered if ld.contact and ld.contact.email)
+        skipped = len(ordered) - len(with_email) - len(dups)
+        if dups:
+            self.log.warning("smartlead: skipped %d lead(s) whose email is already in this upload",
+                             len(dups))
         if not with_email:
             detail = "no leads to upload" + (f" ({skipped} skipped: no email)" if skipped else "")
             return ExportResult(exporter=self.label, count=0, detail=detail)
@@ -268,8 +291,9 @@ class SmartleadApiExporter(Exporter):
                                          timeout=timeout, raise_for_status=False)
                 status, ok = resp.status, resp.ok
                 err = "" if ok else response_error(resp)
-            except HttpError as e:
+            except HttpError as e:  # network failure after retries: its text contains the URL
                 resp, status, ok, err = None, e.status, False, e.body or str(e)
+            err = scrub(err, api_key)
             data: Dict[str, Any] = {}
             if ok and resp is not None:
                 try:
@@ -278,7 +302,7 @@ class SmartleadApiExporter(Exporter):
                     parsed = None
                 data = parsed if isinstance(parsed, dict) else {}
                 if data.get("ok") is False:
-                    ok, err = False, response_error(resp)
+                    ok, err = False, scrub(response_error(resp), api_key)
             if not ok:
                 failed_batches += 1
                 failed_leads += len(batch)
@@ -314,6 +338,8 @@ class SmartleadApiExporter(Exporter):
             parts.append(f"{failed_batches} failed batch(es) ({failed_leads} leads)")
         if skipped:
             parts.append(f"{skipped} skipped (no email)")
+        if dups:
+            parts.append(f"{len(dups)} skipped (duplicate email)")
         if limit_hit:
             parts.append("lead limit exhausted")
         not_sent = len(with_email) - sent
@@ -328,4 +354,4 @@ class SmartleadApiExporter(Exporter):
                             exported_ids=exported)
 
 
-__all__ = ["SmartleadCsvExporter", "SmartleadApiExporter", "SmartleadError"]
+__all__ = ["SmartleadCsvExporter", "SmartleadApiExporter", "SmartleadError", "scrub"]

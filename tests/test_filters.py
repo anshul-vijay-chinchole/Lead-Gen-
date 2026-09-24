@@ -6,8 +6,8 @@ from datetime import timedelta
 
 import pytest
 
-from leadgen.filters import (apply_icp, canonical_place, check_icp, fit_checks, fit_report,
-                             is_placeless, match_location, place_ids)
+from leadgen.filters import (apply_icp, canonical_place, check_icp, excluded_domain, fit_checks,
+                             fit_report, is_placeless, match_location, place_ids)
 from leadgen.models import Company, Signal
 from tests.conftest import TODAY
 
@@ -318,3 +318,56 @@ def test_codes_that_look_like_filler_words_are_places():
     assert not is_placeless("IN", country_field=True)
     assert not is_placeless("OR")          # Oregon, as a whole-value state code
     assert is_placeless("in")              # lower case free text: not a place
+
+
+# --- regressions (verifier findings) -----------------------------------------------------
+
+@pytest.mark.parametrize("location,country,iso", [
+    ("Berlin, DE", "DE", "germany"),
+    ("Bangalore, IN", "India", "india"),
+    ("Tel Aviv, IL", "IL", "israel"),
+    ("Toronto, CA", "Canada", "canada"),
+])
+def test_state_like_iso_code_follows_the_company_country(make_ctx, location, country, iso):
+    company = co(domain="acme.example", location=location, country=country)
+    inc = make_ctx(icp={"locations": ["United States"]})
+    assert check_icp(company, inc) is not None  # not accepted as a US company
+    exc = make_ctx(icp={"exclude_locations": ["United States"]})
+    assert check_icp(company, exc) is None  # not rejected as a US company
+    assert check_icp(company, make_ctx(icp={"locations": [iso]})) is None
+
+
+@pytest.mark.parametrize("text,expected,not_expected", [
+    ("Toronto, ON, CA", "canada", "united states"),
+    ("Toronto, Ontario, CA", "canada", "united states"),
+    ("Bangalore, Karnataka, IN", "india", "united states"),
+    ("Tel Aviv, IL, Israel", "israel", "united states"),
+    ("Berlin, DE, Europe", "germany", "united states"),
+    ("Chicago, IL", "illinois", "israel"),
+    ("San Francisco, CA", "california", "canada"),
+    ("Wilmington, DE, US", "delaware", "germany"),
+    ("Chicago, Illinois, IL", "illinois", "israel"),
+    ("Springfield, Sangamon County, IL", "illinois", "israel"),
+])
+def test_state_like_iso_code_read_from_the_string(text, expected, not_expected):
+    ids = place_ids(text)
+    assert expected in ids and not_expected not in ids
+
+
+def test_us_company_country_keeps_state_reading(make_ctx):
+    ctx = make_ctx(icp={"locations": ["United States"]})
+    assert check_icp(co(location="Wilmington, DE", country="US"), ctx) is None
+    assert check_icp(co(location="Chicago, IL"), ctx) is None
+    assert place_ids("CA", False, "canada") == place_ids("Canada")
+
+
+def test_excluded_domain_helper(make_ctx):
+    ctx = make_ctx(icp={"exclude_domains": ["bigclient.com", "https://www.rival.io/"]})
+    assert excluded_domain("jane@bigclient.com", ctx) == "bigclient.com"
+    assert excluded_domain("Jane@EU.BigClient.com", ctx) == "bigclient.com"
+    assert excluded_domain("https://rival.io/about", ctx) == "rival.io"
+    assert excluded_domain("jane@notbigclient.com", ctx) is None
+    assert excluded_domain("", ctx) is None and excluded_domain(None, ctx) is None
+    assert excluded_domain("jane@bigclient.com", make_ctx()) is None
+    ctx.playbook.icp["exclude_domains"].append("late.example")  # edited in place (e.g. a server)
+    assert excluded_domain("x@late.example", ctx) == "late.example"

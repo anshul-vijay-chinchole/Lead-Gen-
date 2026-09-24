@@ -32,6 +32,10 @@ signal_title_template
     Build the signal title from the row, e.g. ``"Hiring {Role} in {City}"``.
 signal_requires
     Columns / paths that must be non-empty for a row's own signal to be created.
+date_order
+    How numeric dates such as ``9/5/2026`` are read: ``mdy`` (US: Sep 5) or
+    ``dmy`` (9 May). Default ``auto``: inferred from the file (a value like
+    ``9/20/2026`` proves m/d/y), else day/month with a warning.
 default_signal
     ``{type, title, description?, url?, date?}`` attached to rows without a
     signal of their own - use it for static lists (e.g. an event attendee list).
@@ -74,6 +78,7 @@ from .mapping import (
 
 _DELIMITER_NAMES = {"tab": "\t", "\\t": "\t", "comma": ",", "semicolon": ";", "pipe": "|"}
 _DELIMITER_CANDIDATES = (",", ";", "\t", "|")
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 _FALLBACK_ENCODINGS = ("cp1252", "latin-1")
 _WRAPPER_KEYS = ("items", "data", "results", "records", "rows", "companies", "leads", "jobs",
                  "organizations", "accounts", "people", "contacts")
@@ -81,7 +86,7 @@ _WRAPPER_KEYS = ("items", "data", "results", "records", "rows", "companies", "le
 
 def sniff_delimiter(text: str) -> str:
     """Pick the delimiter that occurs most often in the header line (outside quotes)."""
-    header = next((line for line in text.splitlines() if line.strip()), "")
+    header = next((line for line in _LINE_BREAK.split(text) if line.strip()), "")
     unquoted = re.sub(r'"[^"]*"', "", header)
     counts = {d: unquoted.count(d) for d in _DELIMITER_CANDIDATES}
     best = max(_DELIMITER_CANDIDATES, key=lambda d: counts[d])
@@ -155,6 +160,7 @@ class _FileSource(Source):
             default_signal=self.config.get("default_signal"), people=self.config.get("people"),
             location_from_signal=bool(self.config.get("location_from_signal", True)),
             signal_requires=self.config.get("signal_requires"), log=self.log,
+            date_order=self.config.get("date_order"),
         )
 
 
@@ -181,8 +187,12 @@ class CsvSource(_FileSource):
         except (TypeError, ValueError):
             raise ValueError(f"source {self.label}: skip_rows must be an integer") from None
         if skip:
-            text = "\n".join(text.splitlines()[skip:])
-        reader = csv.reader(io.StringIO(text), delimiter=self._delimiter(text))
+            # split on real line breaks only (not U+2028, form feeds, ... that splitlines() uses)
+            parts = _LINE_BREAK.split(text, maxsplit=skip)
+            text = parts[skip] if len(parts) > skip else ""
+        # newline="": the csv module handles \n, \r\n and bare \r (Excel for Mac) line endings
+        # and keeps quoted multi-line cells intact
+        reader = csv.reader(io.StringIO(text, newline=""), delimiter=self._delimiter(text))
         headers: List[str] = []
         rows: List[Dict[str, str]] = []
         try:
@@ -248,7 +258,9 @@ class JsonSource(_FileSource):
 
     def _jsonl(self, text: str, path: Path) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        for n, line in enumerate(text.splitlines(), 1):
+        # JSON Lines records end at "\n" only: splitlines() would also cut records at
+        # U+2028/U+2029/\x85/... which JSON allows raw inside strings
+        for n, line in enumerate(text.split("\n"), 1):
             line = line.strip()
             if not line:
                 continue

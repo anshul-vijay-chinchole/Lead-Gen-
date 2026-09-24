@@ -289,3 +289,14 @@ def test_idle_client_does_not_block_other_requests(serve):
         assert s.request("GET", "/health")[0] == 200
     finally:
         idle.close()
+
+
+def test_regression_query_token_is_not_logged(serve, caplog):
+    s = serve()
+    seed_lead(s.ctx)
+    with caplog.at_level("DEBUG", logger=s.ctx.log.name):
+        status, _, _ = s.request("POST", f"/webhook?token={TOKEN}", instantly_payload())
+        s.request("POST", "/webhook?a=1&token=wrong-guess-XYZ", instantly_payload())
+    assert status == 200
+    assert "POST /webhook?token=***" in caplog.text     # the request is still logged ...
+    assert TOKEN not in caplog.text and "wrong-guess-XYZ" not in caplog.text  # ... without the secret

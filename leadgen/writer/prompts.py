@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from ..models import Lead
 from ..utils import truncate
-from .template import nice_name, sequence_steps
+from .template import contact_first_name, sequence_steps
 
 COMPANY_DESCRIPTION_CHARS = 600
 SIGNAL_DESCRIPTION_CHARS = 400
@@ -155,7 +155,7 @@ def build_user_prompt(lead: Lead, ctx: Any) -> str:
             _field(lines, "description", truncate(s.description, SIGNAL_DESCRIPTION_CHARS), indent="   - ")
 
     lines += ["", "CONTACT (the person you are writing to)"]
-    first_name = nice_name(contact.first_name) if contact else ""
+    first_name = contact_first_name(contact)
     _field(lines, "first name", first_name)
     _field(lines, "title", contact.title if contact else "")
     if not first_name:

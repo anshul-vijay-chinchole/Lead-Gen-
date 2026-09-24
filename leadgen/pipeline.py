@@ -15,8 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import registry
 from .context import Context, MissingCredentialError
 from .contacts import ContactWaterfall, select_contacts
-from .filters import apply_icp
-from .http import HttpError
+from .filters import apply_icp, excluded_domain
+from .http import HttpError, redact
 from .models import Company, Contact, EmailStatus, Lead, Stage, Tier
 from .notify import notify
 from .outbound.base import ExportResult
@@ -94,7 +94,7 @@ class Pipeline:
 
     # --- helpers --------------------------------------------------------------
     def _err(self, where: str, e: Exception) -> None:
-        msg = f"{where}: {e}"
+        msg = redact(f"{where}: {e}")
         self.errors.append(msg)
         self.ctx.log.error(msg)
 
@@ -140,6 +140,19 @@ class Pipeline:
             v = registry.create("verifier", {"type": "basic"}, self.ctx)
         return v
 
+    def email_ok(self, contact: Optional[Contact]) -> bool:
+        """Deliverable enough to hand over: status in ``enrichment.accept_statuses``;
+        a *guessed* address (built from a name pattern) must also be in
+        ``enrichment.accept_guessed_statuses`` (default: valid only)."""
+        if not contact or not contact.email:
+            return False
+        enr = self.pb.enrichment
+        if contact.email_status not in set(enr.get("accept_statuses") or []):
+            return False
+        if contact.data.get("email_guessed"):
+            return contact.email_status in set(enr.get("accept_guessed_statuses") or [EmailStatus.VALID])
+        return True
+
     def verify_contact(self, contact: Contact, verifier: Any) -> None:
         """Set contact.email/email_status, trying guessed candidates if needed."""
         store = self.ctx.store
@@ -170,6 +183,8 @@ class Pipeline:
             if email == contact.email and status in accept:
                 break
         if best:
+            if best[0] != contact.email:
+                contact.data["email_guessed"] = True
             contact.email, contact.email_status = best
 
     def run(self) -> RunResult:
@@ -220,15 +235,20 @@ class Pipeline:
                     self._err(f"enrich {company.name}", e)
             chosen = select_contacts(company, ctx, limit=per_company * 3)
             accepted: List[Contact] = []
+            good = 0
             for contact in chosen:
+                if good >= per_company:
+                    break  # enough deliverable people: don't spend verification credits on the rest
                 if store.is_suppressed(email=contact.email):
                     continue
                 if not contact.email or contact.email_status == EmailStatus.UNKNOWN:
                     self.verify_contact(contact, verifier)
+                    if contact.email and store.is_suppressed(email=contact.email):
+                        continue
                 accepted.append(contact)
-            # verified contacts first, keep ranking order otherwise
-            ok = set(enr.get("accept_statuses") or [])
-            accepted.sort(key=lambda ct: 0 if (ct.email and ct.email_status in ok) else 1)
+                good += 1 if self.email_ok(contact) else 0
+            # deliverable contacts first, keep ranking order otherwise
+            accepted.sort(key=lambda ct: 0 if self.email_ok(ct) else 1)
             accepted = accepted[:per_company]
             if accepted:
                 enriched_n += 1
@@ -247,8 +267,10 @@ class Pipeline:
             ct = lead.contact
             if ct:
                 lead.stage = Stage.ENRICHED
-                if ct.email and ct.email_status in accept:
+                if self.email_ok(ct):
                     lead.stage = Stage.VERIFIED
+                elif ct.email and ct.data.get("email_guessed") and ct.email_status in accept:
+                    lead.notes.append(f"guessed email only {ct.email_status} (needs valid)")
                 elif ct.email:
                     lead.notes.append(f"email {ct.email_status}")
                 else:
@@ -268,13 +290,17 @@ class Pipeline:
         w_tiers = set(pb.writer.get("tiers") or [Tier.HOT, Tier.NORMAL])
         max_write = int(pb.writer.get("max_leads") or 0) or len(leads)
         writer = build_writer(ctx)
+        written_emails: set = set()
         for lead in leads:
             if written >= max_write:
                 break
-            if lead.tier not in w_tiers or not lead.contact or not lead.contact.email:
+            if lead.tier not in w_tiers or not self.email_ok(lead.contact):
                 continue
-            if lead.contact.email_status not in accept:
+            em = lead.contact.email.strip().lower()
+            if em in written_emails:  # same person under two company records: keep the best-scored
+                lead.notes.append("same email as a higher-scored lead in this run")
                 continue
+            written_emails.add(em)
             try:
                 out = writer.write(lead)
             except Exception as e:  # noqa: BLE001
@@ -344,7 +370,7 @@ class Pipeline:
         """Leads that may be handed to a sending tool."""
         pb, store, ctx = self.pb, self.ctx.store, self.ctx
         tiers = set(pb.outbound.get("tiers") or [Tier.HOT, Tier.NORMAL])
-        accept = set(pb.enrichment.get("accept_statuses") or [])
+        seen_emails: set = set()
         dedupe_days = int(pb.outbound.get("dedupe_days") or 0)
         cooldown = int(pb.outbound.get("company_cooldown_days") or 0)
         engaged_stages = {Stage.REPLIED, Stage.POSITIVE, Stage.BOOKED, Stage.WON, Stage.LOST}
@@ -366,16 +392,22 @@ class Pipeline:
             if cooldown and last and (ctx.today - last).days < cooldown and not store.was_exported(lead.id):
                 lead.notes.append(f"company contacted {(ctx.today - last).days}d ago (cooldown {cooldown}d)")
                 continue
-            if pb.outbound.get("require_email", True):
-                if not ct or not ct.email or ct.email_status not in accept:
-                    continue
+            if pb.outbound.get("require_email", True) and not self.email_ok(ct):
+                continue
             if ct and ct.email:
                 if store.is_suppressed(email=ct.email, domain=lead.company.domain):
+                    continue
+                if excluded_domain(ct.email, ctx):
                     continue
                 if store.was_exported(lead.id):
                     continue
                 if store.recently_contacted(ct.email, dedupe_days, ctx.today, exclude_lead_id=lead.id):
                     continue
+                em = ct.email.strip().lower()
+                if em in seen_emails:
+                    lead.notes.append("same email as a higher-scored lead in this run - not re-contacted")
+                    continue
+                seen_emails.add(em)
             out.append(lead)
         return out
 

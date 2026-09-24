@@ -434,3 +434,39 @@ def test_anthropic_optional_config(make_ctx):
 ])
 def test_anthropic_messages_url(base, expected):
     assert messages_url(base) == expected
+
+
+# --- regressions: credential hygiene -------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", ["sk-secret-123\n", " sk-secret-123", "sk-secret-123\r\n", "\tsk-secret-123 "])
+def test_api_keys_are_stripped_before_use(make_ctx, raw):
+    # mounted secrets often end in a newline; requests would reject the header and echo the key
+    oa, _ = openai_client(make_ctx, env={"OPENAI_API_KEY": raw})
+    assert oa.build_request("s", "u")[1]["Authorization"] == "Bearer sk-secret-123"
+    an, _ = anthropic_client(make_ctx, env={"ANTHROPIC_API_KEY": raw})
+    assert an.build_request("s", "u")[1]["x-api-key"] == "sk-secret-123"
+
+
+@pytest.mark.parametrize("raw", ["sk-secret\n123", "sk-secret 123", "sk-secret\x00123", "sk-sécret123"])
+def test_malformed_api_keys_are_refused_without_echoing_them(make_ctx, raw):
+    for client, ctx in (openai_client(make_ctx, env={"OPENAI_API_KEY": raw}),
+                        anthropic_client(make_ctx, env={"ANTHROPIC_API_KEY": raw})):
+        with pytest.raises(MissingCredentialError, match="whitespace, control or non-ASCII") as ei:
+            client.complete("s", "u")
+        assert "secret" not in str(ei.value) and "123" not in str(ei.value)
+        assert ctx.http.calls == []
+
+
+def test_openai_type_with_custom_base_url_never_sends_openai_key(make_ctx):
+    client, ctx = openai_client(make_ctx, {"base_url": "https://openrouter.ai/api/v1", "model": "x"},
+                                env={"OPENAI_API_KEY": "sk-openai-secret"})
+    with pytest.raises(MissingCredentialError, match="api_key_env") as ei:
+        client.complete("s", "u")
+    assert "sk-openai-secret" not in str(ei.value) and ctx.http.calls == []
+    # naming the key explicitly is a deliberate opt-in (e.g. an OpenAI proxy)
+    client2, _ = openai_client(make_ctx, {"base_url": "https://oai.proxy.example/v1", "api_key_env": "OPENAI_API_KEY"},
+                               env={"OPENAI_API_KEY": "sk-openai-secret"})
+    assert client2.build_request("s", "u")[1]["Authorization"] == "Bearer sk-openai-secret"
+    # the default / official host keeps working without extra config
+    client3, _ = openai_client(make_ctx, {"base_url": "https://api.openai.com/v1/"})
+    assert client3.build_request("s", "u")[1]["Authorization"] == "Bearer sk-test"

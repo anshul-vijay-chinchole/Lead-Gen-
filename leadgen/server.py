@@ -40,12 +40,14 @@ The server is single-threaded (one request at a time), which keeps SQLite
 access simple and is plenty for reply volumes. Every response closes its
 connection and a client has ``WebhookHandler.timeout`` seconds to send its
 request, so one slow or idle client cannot block the others. Request logging is quiet: it
-goes to ``ctx.log`` at debug level (``leadgen -vv serve`` shows it).
+goes to ``ctx.log`` at debug level (``leadgen -vv serve`` shows it), with the value of a
+``?token=`` parameter masked.
 """
 from __future__ import annotations
 
 import hmac
 import json
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional, Tuple, Type
 from urllib.parse import parse_qs, urlsplit
@@ -63,6 +65,13 @@ MAX_EVENTS_PER_REQUEST = 100
 #: An oversized body up to this size is read and discarded before answering 413, so
 #: the client sees the answer instead of a connection reset; beyond it we just close.
 MAX_DRAIN_BYTES = 8 * MAX_BODY_BYTES
+
+_TOKEN_IN_URL = re.compile(r"((?:[?&;]|%3f|%26)token(?:=|%3d))[^&;\s\"']*", re.I)
+
+
+def _redact_token(text: str) -> str:
+    """Mask the value of a ``token=`` query parameter (the webhook secret)."""
+    return _TOKEN_IN_URL.sub(r"\1***", text)
 
 
 class WebhookServer(HTTPServer):
@@ -100,7 +109,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         return self.server.ctx
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
-        self.ctx.log.debug("webhook %s - " + format, self.address_string(), *args)
+        # The request line carries ``?token=<secret>`` when the token is sent in the URL.
+        safe = tuple(_redact_token(a) if isinstance(a, str) else a for a in args)
+        self.ctx.log.debug("webhook %s - " + format, self.address_string(), *safe)
 
     def _send_json(self, status: int, payload: Dict[str, Any],
                    headers: Optional[Dict[str, str]] = None) -> None:

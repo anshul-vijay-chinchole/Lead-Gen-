@@ -37,8 +37,15 @@ location       location, city, person location
 
 ``email_status`` values are mapped: valid / verified / deliverable / ok ->
 valid; risky / catch-all / accept-all -> risky; invalid / bounced /
-undeliverable -> invalid; anything else -> unknown. Unmapped non-empty columns
-are kept in ``contact.data['csv']``. Rows with neither a name nor an email are
+undeliverable and the "never mail" verdicts of list cleaners (spamtrap,
+do_not_mail, abuse, disposable, hard bounce, unsubscribed, ...) -> invalid;
+anything else -> unknown. The raw value is kept in
+``contact.data['csv_email_status']``. Unmapped non-empty columns are kept in
+``contact.data['csv']``. Null placeholders (``N/A``, ``null``, ``none``,
+``-`` ...) count as empty cells; a domain/website cell that is not a hostname
+is ignored. A name given only as a whole (``full_name``) is split without
+honorifics or credentials, "Last, First" turned around (``Dr. Jane Doe`` /
+``Doe, Jane`` -> Jane + Doe). Rows with neither a name nor an email are
 skipped.
 
 The file is read and indexed once (on the first ``find``) and each call
@@ -59,12 +66,14 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..models import Company, Contact, EmailStatus
 from ..utils import is_personal_email, is_valid_email, normalize_company_name, normalize_domain, normalize_text
 from .base import ContactFinder
+from .pattern import split_full_name
 
 FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "company": ("company", "company name", "companyname", "organization", "organization name",
@@ -94,7 +103,23 @@ STATUS_VALUES: Dict[str, str] = {
     "accept all": EmailStatus.RISKY, "acceptall": EmailStatus.RISKY,
     "invalid": EmailStatus.INVALID, "bounced": EmailStatus.INVALID, "bounce": EmailStatus.INVALID,
     "undeliverable": EmailStatus.INVALID, "bad": EmailStatus.INVALID,
+    # verifier verdicts that mean "never mail this address" (ZeroBounce, NeverBounce, MillionVerifier ...)
+    "spamtrap": EmailStatus.INVALID, "spam trap": EmailStatus.INVALID, "do not mail": EmailStatus.INVALID,
+    "donotmail": EmailStatus.INVALID, "do not email": EmailStatus.INVALID, "do not contact": EmailStatus.INVALID,
+    "abuse": EmailStatus.INVALID, "disposable": EmailStatus.INVALID, "hard bounce": EmailStatus.INVALID,
+    "hard bounced": EmailStatus.INVALID, "hardbounce": EmailStatus.INVALID, "complainer": EmailStatus.INVALID,
+    "toxic": EmailStatus.INVALID, "unsubscribed": EmailStatus.INVALID, "opted out": EmailStatus.INVALID,
+    "not valid": EmailStatus.INVALID, "non deliverable": EmailStatus.INVALID,
+    "not deliverable": EmailStatus.INVALID,
 }
+# Words that make any status a "do not mail" one ("Invalid - mailbox not found", "Spamtrap detected").
+_INVALID_STATUS_WORDS = frozenset({"invalid", "bounced", "bounce", "undeliverable", "spamtrap", "disposable",
+                                   "abuse", "complainer", "toxic", "unsubscribed", "hardbounce"})
+_INVALID_STATUS_PHRASES = ("spam trap", "do not mail", "do not email", "do not contact", "hard bounce",
+                           "opted out")
+# Cell values that mean "no value" in exported / purchased lists.
+_NULL_TOKENS = frozenset({"n/a", "null", "none", "nan", "-", "--", "—", "undefined", "#n/a",
+                          "not available"})
 
 # Hosts that identify a profile page, never the employer.
 _NOT_COMPANY_DOMAINS = frozenset({"linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com",
@@ -102,22 +127,49 @@ _NOT_COMPANY_DOMAINS = frozenset({"linkedin.com", "facebook.com", "twitter.com",
 _DELIMITER_NAMES = {"tab": "\t", "\\t": "\t", "comma": ",", "semicolon": ";", "pipe": "|"}
 _DELIMITER_CANDIDATES = ",;\t|"
 _FALLBACK_ENCODINGS = ("cp1252", "latin-1")
+_LABEL_RE = re.compile(r"[^\W_](?:[\w-]*[^\W_])?")
 
 
 def _header_key(header: Any) -> str:
     return normalize_text(str(header or "").replace("_", " "))
 
 
+def _cell(value: Any) -> str:
+    """Trimmed cell text, '' for empty and null placeholders ('N/A', 'null', '-', ...)."""
+    text = str(value or "").strip()
+    return "" if text.lower() in _NULL_TOKENS else text
+
+
+def _safe_domain(value: Any) -> str:
+    """``normalize_domain`` that returns '' instead of raising on junk ('[x]', 'acme.com]') or
+    returning a non-hostname ('n' from 'N/A', 'none')."""
+    try:
+        domain = normalize_domain(value)
+    except ValueError:
+        return ""
+    labels = domain.split(".")
+    if len(labels) < 2 or not all(_LABEL_RE.fullmatch(label) for label in labels):
+        return ""
+    return domain
+
+
 def _company_domain(value: Any) -> str:
-    """Domain of a domain/website cell, '' for profile hosts (linkedin.com/company/..., ...)."""
-    domain = normalize_domain(value)
+    """Domain of a domain/website cell, '' for profile hosts (linkedin.com/company/..., ...) and junk."""
+    domain = _safe_domain(value)
     if not domain or any(domain == d or domain.endswith("." + d) for d in _NOT_COMPANY_DOMAINS):
         return ""
     return domain
 
 
 def map_status(value: Any) -> str:
-    return STATUS_VALUES.get(normalize_text(value), EmailStatus.UNKNOWN)
+    key = normalize_text(value)
+    if key in STATUS_VALUES:
+        return STATUS_VALUES[key]
+    padded = f" {key} "
+    if any(w in _INVALID_STATUS_WORDS for w in key.split()) \
+            or any(f" {p} " in padded for p in _INVALID_STATUS_PHRASES):
+        return EmailStatus.INVALID
+    return EmailStatus.UNKNOWN
 
 
 class CsvFinder(ContactFinder):
@@ -222,17 +274,17 @@ class CsvFinder(ContactFinder):
         by_name: Dict[str, List[Dict[str, Any]]] = {}
         rows = 0
         for raw in reader:
-            record = {f: str(raw.get(h) or "").strip() for f, h in cols.items()}
+            record = {f: _cell(raw.get(h)) for f, h in cols.items()}
             if not (record.get("email") or record.get("full_name") or record.get("first_name")
                     or record.get("last_name")):
                 continue
-            extra = {_header_key(k): str(v).strip() for k, v in raw.items()
-                     if k is not None and k not in used and v not in (None, "") and str(v).strip()}
+            extra = {_header_key(k): _cell(v) for k, v in raw.items()
+                     if k is not None and k not in used and _cell(v)}
             record["_extra"] = extra
             domain = _company_domain(record.get("domain")) or _company_domain(record.get("website"))
             email = record.get("email", "").lower()
             if not domain and is_valid_email(email) and not is_personal_email(email):
-                domain = normalize_domain(email)
+                domain = _safe_domain(email)
             record["_domain"] = domain
             name_key = normalize_company_name(record.get("company"))
             if domain:
@@ -249,10 +301,14 @@ class CsvFinder(ContactFinder):
         if email and not is_valid_email(email):
             self.log.debug("csv finder: ignoring malformed email %r", email)
             email = ""
+        first, last, full = rec.get("first_name", ""), rec.get("last_name", ""), rec.get("full_name", "")
+        if full and not (first or last):  # "Dr. Jane Doe" / "Doe, Jane" -> Jane + Doe, not "Dr." / "Doe,"
+            first, last = split_full_name(full)
+            full = " ".join(x for x in (first, last) if x)  # '' when it was only "Dr." / "(n/a)"
         contact = Contact(
-            first_name=rec.get("first_name", ""),
-            last_name=rec.get("last_name", ""),
-            full_name=rec.get("full_name", ""),
+            first_name=first,
+            last_name=last,
+            full_name=full,
             title=rec.get("title", ""),
             email=email,
             email_status=map_status(rec.get("email_status")) if email else EmailStatus.UNKNOWN,
@@ -265,6 +321,8 @@ class CsvFinder(ContactFinder):
         )
         if rec.get("_extra"):
             contact.data["csv"] = dict(rec["_extra"])
+        if email and rec.get("email_status"):
+            contact.data["csv_email_status"] = rec["email_status"]
         return contact
 
     def find(self, company: Company) -> List[Contact]:

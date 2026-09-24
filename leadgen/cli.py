@@ -53,6 +53,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from datetime import date, timedelta
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -64,7 +65,7 @@ from .http import HttpClient
 from .models import Lead, ReplyCategory, Stage, Tier
 from .playbook import DEFAULTS, Playbook, PlaybookError, from_dict, load_playbook
 from .store import Store
-from .utils import parse_date
+from .utils import is_valid_email, normalize_domain, parse_date
 
 EXIT_OK = 0
 EXIT_PROBLEM = 1
@@ -627,11 +628,16 @@ def _failed_sources(pb: Playbook, errors: Sequence[str], dry_run: bool) -> Tuple
             except Exception:  # noqa: BLE001 - unknown type: it "ran" and failed
                 return True
         active = [s for s in active if runs_offline(s)]
-    failed = 0
+    # The pipeline reports at most one "source <label>: ..." error per source, and
+    # unlabeled sources of one type share a label: count errors per label, capped at
+    # the number of sources carrying it (one failing csv of two is not "both failed").
+    per_label: Dict[str, int] = {}
     for cfg in active:
-        label = cfg.get("label") or cfg.get("type")
-        if any(e.startswith(f"source {label}:") for e in errors):
-            failed += 1
+        label = str(cfg.get("label") or cfg.get("type"))
+        per_label[label] = per_label.get(label, 0) + 1
+    failed = 0
+    for label, n in per_label.items():
+        failed += min(n, sum(1 for e in errors if e.startswith(f"source {label}:")))
     return len(active), failed
 
 
@@ -651,14 +657,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             _out(result.summary())
         _out("")
         _out(f"Files in {result.out_dir}:")
+        rehearsal = "dry-run rehearsal only - nobody was recorded as handed over: do NOT import it"
         for name, what in (("opportunities.csv", "every lead with score, reasons and emails (review / Google Sheets)"),
                            ("instantly_upload.csv", "ready to import into Instantly"),
                            ("smartlead_upload.csv", "ready to import into Smartlead"),
+                           ("instantly_upload.dry-run.csv", rehearsal),
+                           ("smartlead_upload.dry-run.csv", rehearsal),
                            ("leads.json", "everything, for other tools"),
                            ("rejected.csv", "companies filtered out, with the reason"),
                            ("summary.json", "run counts + top leads")):
             if (result.out_dir / name).exists():
-                _out(f"  {name:<22} {what}")
+                _out(f"  {name:<28} {what}")
+        if args.dry_run and any(result.out_dir.glob("*.dry-run.*")):
+            _out("  (run without --dry-run for the real upload files: only a real run records who was "
+                 "handed over, so nobody gets the sequence twice)")
         _out("")
         _out("Next:")
         _out(f"  leadgen leads{_pb_hint(session)}      # the leads of this run")
@@ -668,7 +680,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             _out("Note: nothing was found because every source uses the network and --dry-run skips "
                  "them. Add a csv/json source to rehearse offline, or run without --dry-run.")
         active, failed = _failed_sources(pb, result.errors, args.dry_run)
-        if active and failed >= active:
+        if active and failed >= active and not result.counts.get("sourced"):
             sys.stderr.write(f"error: every source failed ({failed} of {active}) - see the errors above\n")
             return EXIT_PROBLEM
         if not active:
@@ -891,7 +903,19 @@ def cmd_mark(args: argparse.Namespace) -> int:
         if lead is None:
             raise CliError(f"no {what} found in {store.path}", EXIT_PROBLEM)
         before = lead.stage
-        changed = store.set_stage(lead.id, args.stage, note=args.note or "manual", force=args.force)
+        note = args.note or "manual"
+        order = Stage.ORDER
+        contacted = args.stage in order and order.index(args.stage) >= order.index(Stage.EXPORTED)
+        if contacted and not store.was_exported(lead.id):
+            # Dedupe (was_exported / recently_contacted / company cooldown) keys off the
+            # hand-over time, not the stage: record it as an exporter would, or the next
+            # run hands this person to the sending tool again.
+            store.mark_exported(lead.id, note)
+        now = store.get_lead(lead.id).stage
+        if now == args.stage and now != before:
+            changed = True
+        else:
+            changed = store.set_stage(lead.id, args.stage, note=note, force=args.force)
         who = (lead.contact.full_name or lead.contact.email) if lead.contact else "-"
         desc = f"{lead.company.name} / {who} ({lead.id})"
         if changed:
@@ -906,19 +930,94 @@ def cmd_mark(args: argparse.Namespace) -> int:
         session.close()
 
 
+# host names: dot-separated labels (letters incl. IDN, digits, inner hyphens), TLD: 2+ chars, starts with a letter
+_DOMAIN_RE = re.compile(r"^(?=.{3,253}$)(?:[^\W_](?:[\w-]{0,61}[^\W_])?\.)+[^\W\d_][\w-]{1,62}$")
+_CSV_DELIMITERS = (",", ";", "\t", "|")
+# header words that mark a do-not-contact column (compared without case / punctuation)
+_EMAIL_HEADER_WORDS = ("mail",)                      # email, e-mail, Email Address, E-Mail-Adresse ...
+_DOMAIN_HEADER_WORDS = ("domain", "website", "url", "site", "value")
+
+
+def suppression_value(raw: Any, kind: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    """One do-not-contact entry -> ``(value, kind)`` as the store matches it, or None.
+
+    Understands the usual blocklist notations: ``Jane Doe <jane@x.com>`` and
+    ``mailto:jane@x.com`` (-> the address), ``@acme.com`` / ``*@acme.com`` /
+    ``*.acme.com`` (-> the whole domain) and URLs (-> their domain). ``kind``
+    forces email / domain; without it a value with an ``@`` is an email.
+    Returns None for anything that is neither a valid email nor a plausible
+    domain (a name, a header cell, ``n/a`` ...), so it is never stored as an
+    entry that can't match.
+    """
+    v = str(raw or "").strip().strip("'\"").strip()
+    if not v:
+        return None
+    if ("<" in v and ">" in v) or v.lower().startswith("mailto:"):
+        v = parseaddr(v)[1].strip() or v
+    whole_domain = False
+    if v.startswith("*"):                       # *@acme.com, *.acme.com
+        v, whole_domain = v.lstrip("*"), True
+    if v.startswith("@"):                       # @acme.com
+        v, whole_domain = v[1:], True
+    elif whole_domain and v.startswith("."):
+        v = v[1:]
+    k = kind or ("email" if "@" in v and "://" not in v and not whole_domain else "domain")
+    if k == "email":
+        v = v.lower()
+        return (v, "email") if is_valid_email(v) else None
+    d = normalize_domain(v)
+    return (d, "domain") if _DOMAIN_RE.match(d) else None
+
+
+def _norm_header(h: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(h or "").lower())
+
+
+def _pick_column(rows: List[List[str]]) -> Tuple[int, bool]:
+    """``(column, has_header)`` holding the emails / domains of a do-not-contact CSV.
+
+    A header naming an email column wins (``email``, ``E-mail``, ``Email Address``
+    ...), then one naming a domain / website column; among several candidates
+    the one with the most valid entries is used. Without a matching header the
+    column with the most valid entries is used, and the first row counts as a
+    header when its cell there is not a valid entry.
+    """
+    header = [_norm_header(h) for h in rows[0]]
+    body = rows[1:]
+    width = max(len(r) for r in rows)
+
+    def valid(col: int, rs: List[List[str]]) -> int:
+        return sum(1 for r in rs if len(r) > col and suppression_value(r[col]))
+
+    for words in (_EMAIL_HEADER_WORDS, _DOMAIN_HEADER_WORDS):
+        cands = [i for i, h in enumerate(header) if h and any(w in h for w in words)]
+        if cands:
+            return max(cands, key=lambda i: (valid(i, body), -i)), True
+    col = max(range(width), key=lambda i: (valid(i, rows), -i))
+    first = rows[0][col] if len(rows[0]) > col else ""
+    return col, suppression_value(first) is None
+
+
 def _read_values_file(path: Path) -> List[str]:
-    """Values from a TXT (one per line, # comments) or CSV (column email/domain/value, else first)."""
+    """Values from a TXT (one per line, # comments) or a CSV / TSV export.
+
+    CSV: the delimiter (``, ; tab |``) is taken from the header line and the
+    column is found by ``_pick_column`` (so a Mailchimp-style ``Name,Email
+    Address,Status`` export yields the addresses, not the names)."""
     text = path.read_text(encoding="utf-8-sig")
     if path.suffix.lower() in (".csv", ".tsv"):
-        delim = "\t" if path.suffix.lower() == ".tsv" else ","
-        rows = list(csv.reader(text.splitlines(), delimiter=delim))
+        lines = text.splitlines()
+        first = next((ln for ln in lines if ln.strip()), "")
+        if not first:
+            return []
+        delim = "\t" if path.suffix.lower() == ".tsv" else max(_CSV_DELIMITERS, key=first.count)
+        if not first.count(delim):
+            delim = ","
+        rows = [r for r in csv.reader(lines, delimiter=delim) if any(c.strip() for c in r)]
         if not rows:
             return []
-        header = [h.strip().lower() for h in rows[0]]
-        col = next((header.index(h) for h in ("email", "domain", "value", "email_address", "website")
-                    if h in header), None)
-        body = rows[1:] if col is not None else rows
-        col = col or 0
+        col, has_header = _pick_column(rows)
+        body = rows[1:] if has_header else rows
         return [r[col].strip() for r in body if len(r) > col and r[col].strip()]
     out = []
     for line in text.splitlines():
@@ -926,6 +1025,25 @@ def _read_values_file(path: Path) -> List[str]:
         if line:
             out.append(line)
     return out
+
+
+def _unsuppress(store: Store, raw: str, kind: Optional[str] = None) -> int:
+    """Remove exactly one entry: an email removes only that address, a domain only the
+    domain entry (``jane@acme.com`` never lifts a whole-domain block on ``acme.com``).
+    The value as typed is removed too, so malformed legacy entries can be cleaned up."""
+    targets = set()
+    parsed = suppression_value(raw, kind)
+    if parsed:
+        targets.add(parsed)
+    exact = str(raw or "").strip().lower()
+    if exact:
+        targets.update((exact, k) for k in ([kind] if kind else ["email", "domain"]))
+    removed = 0
+    for value, k in sorted(targets):
+        cur = store.conn.execute("DELETE FROM suppression WHERE value=? AND kind=?", (value, k))
+        removed += max(0, cur.rowcount)
+    store.conn.commit()
+    return removed
 
 
 def cmd_suppress(args: argparse.Namespace) -> int:
@@ -952,16 +1070,29 @@ def cmd_suppress(args: argparse.Namespace) -> int:
         if not values:
             raise CliError(f"suppress {args.action}: give a VALUE or --file")
         done = 0
+        invalid: List[str] = []
         for v in values:
             if args.action == "add":
-                kind = args.kind or ("email" if "@" in v else "domain")
-                store.suppress(v, kind, args.reason or "manual")
+                parsed = suppression_value(v, args.kind)
+                if parsed is None:
+                    invalid.append(v)
+                    continue
+                store.suppress(parsed[0], parsed[1], args.reason or "manual")
                 done += 1
             else:
-                done += store.unsuppress(v)
+                done += _unsuppress(store, v, args.kind)
+        for v in invalid[:10]:
+            sys.stderr.write(f"warning: skipped {v!r} - not a valid "
+                             f"{args.kind or 'email address or domain'}\n")
+        if len(invalid) > 10:
+            sys.stderr.write(f"warning: ... and {len(invalid) - 10} more invalid value(s)\n")
         verb = "Added" if args.action == "add" else "Removed"
         _out(f"{verb} {done} value(s)" + (f" (of {len(values)} given)" if done != len(values) else "")
              + f" {'to' if args.action == 'add' else 'from'} the suppression list in {store.path}.")
+        if invalid:
+            sys.stderr.write(f"error: {len(invalid)} value(s) were not added - fix them and add them "
+                             f"again (e.g. jane@acme.com or acme.com)\n")
+            return EXIT_PROBLEM
         return EXIT_OK
     finally:
         session.close()
@@ -1118,10 +1249,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("suppress", cmd_suppress, "manage the do-not-contact list")
     sp.add_argument("action", choices=("add", "remove", "list"))
-    sp.add_argument("value", nargs="?", help="an email address or a domain")
+    sp.add_argument("value", nargs="?", help="an email address or a domain (also 'Name <email>', "
+                                             "'@domain' / '*@domain' for a whole domain)")
     sp.add_argument("--kind", choices=("email", "domain"), help="default: email if it contains @, else domain")
     sp.add_argument("--reason", help="why (shown in the list)")
-    sp.add_argument("--file", metavar="CSV/TXT", help="many values: one per line, or a CSV column email/domain")
+    sp.add_argument("--file", metavar="CSV/TXT", help="many values: one per line, or a CSV / TSV export "
+                                                      "(its email - else domain / website - column is used)")
 
     sp = add("followups", cmd_followups, "list follow-ups that are due (from timing / out-of-office replies)")
     sp.add_argument("--done", type=int, metavar="ID", help="mark this follow-up as done")

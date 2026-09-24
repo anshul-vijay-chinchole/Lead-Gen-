@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any, FrozenSet, Iterable, Optional
 
+from ..http import HttpError, redact
 from ..models import EmailStatus
 from ..utils import is_valid_email, normalize_domain
 from .base import VerificationResult, Verifier
@@ -124,7 +125,8 @@ class ApiVerifier(Verifier):
     ``precheck_disposable: false``) -> dry-run short-circuit -> ``check(email)``
     (implemented by subclasses; may raise ``VerifierError`` / ``HttpError`` /
     ``MissingCredentialError`` for provider-level failures, never for a bad
-    address).
+    address). API keys quoted in an ``HttpError`` message (network errors
+    repeat the request URL) are redacted before it propagates.
     """
 
     offline = False
@@ -140,7 +142,16 @@ class ApiVerifier(Verifier):
             self.log.debug("dry-run: not calling %s for %s", self.name, addr)
             return VerificationResult(email=addr, status=EmailStatus.UNKNOWN, raw_status="dry_run",
                                       provider=self.name, detail=f"dry-run: {self.name} not called")
-        return self.check(addr)
+        try:
+            return self.check(addr)
+        except HttpError as e:
+            # network errors quote the request URL, API key query parameter included
+            # ("... Max retries exceeded with url: /api/v3/?api=KEY&email=..."): the
+            # message ends up in logs, summary.json and notifications
+            body = redact(e.body or "")
+            if body != (e.body or ""):
+                raise HttpError(e.status, e.url, body) from None
+            raise
 
     def check(self, email: str) -> VerificationResult:  # pragma: no cover - interface
         raise NotImplementedError

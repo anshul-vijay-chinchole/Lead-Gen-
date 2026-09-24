@@ -95,9 +95,10 @@ _DANGLING_WORDS = ("including", "such as", "like", "for", "about", "with", "at",
                    "into", "to", "from", "and", "or", "by")
 # A connector word left hanging where an emptied placeholder used to be:
 # "roles, including a ." / "expanding into ." / "hiring a ." -> dropped.
+# Punctuation glued to a following word/number (".NET", ".5") is not orphaned.
 _DANGLING_RE = re.compile(
     r"(?:,[ \t]*)?[ \t]+(?:(?:" + "|".join(w.replace(" ", r"[ \t]+") for w in _DANGLING_WORDS) +
-    r")(?:[ \t]+(?:a|an|the))?|(?:a|an|the))[ \t]+(?=[.,;:!?]|$)",
+    r")(?:[ \t]+(?:a|an|the))?|(?:a|an|the))[ \t]+(?=[.,;:!?](?!\w)|$)",
     re.I | re.M)
 
 
@@ -120,11 +121,12 @@ def tidy(text: Any) -> str:
         line = re.sub(r"[ \t]+", " ", line)
         line = _DANGLING_RE.sub("", line)
         line = re.sub(r"\(\s*\)|\[\s*\]", "", line)
-        line = re.sub(r"\s+([,.;:!?])", r"\1", line)
-        line = re.sub(r",+(?=[.!?;:])", "", line)
+        # punctuation directly followed by a word character (".NET", ".5") is part of that word
+        line = re.sub(r"\s+([,.;:!?])(?!\w)", r"\1", line)
+        line = re.sub(r",+(?=[.!?;:](?!\w))", "", line)
         line = re.sub(r",{2,}", ",", line)
         line = re.sub(r"(?<!\.)\.\.(?!\.)", ".", line)
-        line = re.sub(r"^\s*(?:[,;:]+|\.(?!\.))\s*", "", line)
+        line = re.sub(r"^\s*(?:[,;:]+|\.(?![.\w]))\s*", "", line)
         line = re.sub(r"[ \t]+", " ", line).strip()
         if re.fullmatch(r"[,.;:\-–—]+", line):
             line = ""
@@ -215,14 +217,57 @@ def company_display_name(name: str) -> str:
     return out or (name or "").strip()
 
 
+HONORIFICS = frozenset({"dr", "mr", "mrs", "ms", "miss", "mx", "prof", "professor", "sir", "dame",
+                        "rev", "revd", "fr", "herr", "frau", "mme", "mlle", "sr", "sra", "srta"})
+
+
+def _is_honorific(word: str) -> bool:
+    return word.strip(".,;").lower() in HONORIFICS
+
+
 def nice_name(first_name: str) -> str:
-    """Tidy a first name ('JANE' -> 'Jane'); '' for junk (emails, digits, initials)."""
-    n = re.sub(r"\s+", " ", (first_name or "").strip()).strip(".,;")
+    """Tidy a first name ('JANE' -> 'Jane'); '' for junk (emails, digits, initials, honorifics)."""
+    words = re.sub(r"\s+", " ", (first_name or "").strip()).split(" ")
+    while words and _is_honorific(words[0]):  # "Dr." / "Dr. Jane" -> "" / "Jane"
+        words = words[1:]
+    n = " ".join(words).strip(".,;")
     if not n or "@" in n or any(ch.isdigit() for ch in n) or len(n.replace(".", "")) < 2:
         return ""
     if n.isupper() or n.islower():
         n = "-".join(" ".join(w.capitalize() for w in part.split(" ")) for part in n.split("-"))
     return n
+
+
+def _first_from_full(full_name: str) -> str:
+    """Given name from a full name: skips honorifics, understands 'Last, First' (CRM order).
+
+    'Dr. Jane Smith' -> 'Jane', 'Smith, Jane' -> 'Jane', 'Dr. Smith' -> '' (only a surname left).
+    """
+    tokens = (full_name or "").split()
+    reversed_order = len(tokens) > 1 and tokens[0].endswith(",")
+    rest = tokens[1:] if reversed_order else tokens
+    skipped = False
+    while rest and _is_honorific(rest[0]):
+        rest, skipped = rest[1:], True
+    if not rest or (skipped and not reversed_order and len(rest) < 2):
+        return ""
+    return rest[0]
+
+
+def contact_first_name(contact: Any) -> str:
+    """The name to greet ``contact`` with ('' when unknown), see ``nice_name``.
+
+    When ``first_name`` is just the first word of ``full_name`` (how a contact
+    built from a full name gets it), it is re-derived so that 'Dr. Jane Smith'
+    greets 'Jane' and 'Smith, Jane' greets 'Jane' instead of 'Dr' / 'Smith'.
+    """
+    if contact is None:
+        return ""
+    first = (getattr(contact, "first_name", "") or "").strip()
+    full = re.sub(r"\s+", " ", (getattr(contact, "full_name", "") or "")).strip()
+    if full and (not first or full.split(" ")[0] == first):
+        return nice_name(_first_from_full(full))
+    return nice_name(first)
 
 
 def clean_title(title: str, max_words: int = 6) -> str:
@@ -260,6 +305,8 @@ def article(phrase: str) -> str:
     """'a' or 'an' for the phrase that follows."""
     words = (phrase or "").split()
     if not words:
+        return "a"
+    if words[0].startswith("."):  # ".NET" is read "dot net"
         return "a"
     w = re.sub(r"[^A-Za-z]", "", words[0])
     if not w:
@@ -450,7 +497,7 @@ def build_values(lead: Lead, ctx: Any) -> Dict[str, str]:
         return str(offer.get(key) or "").strip()
 
     v: Dict[str, str] = {}
-    v["first_name"] = nice_name(contact.first_name if contact else "") or "there"
+    v["first_name"] = contact_first_name(contact) or "there"
     v["last_name"] = (contact.last_name if contact else "").strip()
     v["full_name"] = (contact.full_name if contact else "").strip()
     v["contact_title"] = (contact.title if contact else "").strip()
@@ -489,15 +536,18 @@ def build_values(lead: Lead, ctx: Any) -> Dict[str, str]:
 
     # signal-driven copy
     phrase_key = _type_key(sig, plural, stale, SIGNAL_PHRASES)
-    v["signal_phrase"] = render(_pick("signal_phrases", phrase_key, sig, SIGNAL_PHRASES, ctx, "phrase"), v)
+    phrase_tpl = _pick("signal_phrases", phrase_key, sig, SIGNAL_PHRASES, ctx, "phrase")
+    v["signal_phrase"] = render(phrase_tpl, v)
     hyp_key = _type_key(sig, plural, stale, HYPOTHESES)
     v["hypothesis"] = sentence(render(_pick("hypotheses", hyp_key, sig, HYPOTHESES, ctx, "hypothesis"), v))
     topic_key = _type_key(sig, plural, stale, TOPICS)
     v["signal_topic"] = render(_pick("topics", topic_key, sig, TOPICS, ctx, "topic"), v) or \
         render(TOPICS["none"], v)
     opener = v["signal_phrase"]
-    if phrase_key == "job_posting" and age is not None and age <= 6 and not stale and not \
-            (isinstance(sig.data, dict) and sig.data.get("phrase")):
+    # "... this week" only extends the built-in phrase: a custom phrase (writer.templates or
+    # signal data) may already end a sentence or place {signal_age_phrase} itself.
+    if phrase_key == "job_posting" and phrase_tpl == SIGNAL_PHRASES["job_posting"] and \
+            age is not None and age <= 6 and not stale:
         opener = f"{opener} {v['signal_age_phrase']}"
     v["opener"] = sentence(tidy(opener))
 
@@ -634,4 +684,5 @@ class TemplateWriter(Writer):
 
 
 __all__ = ["TemplateWriter", "append_signoff", "build_values", "clean_title", "company_display_name",
-           "default_subject", "fill", "render", "sequence_steps", "signoff_for", "strip_signoff", "tidy"]
+           "contact_first_name", "default_subject", "fill", "render", "sequence_steps", "signoff_for",
+           "strip_signoff", "tidy"]

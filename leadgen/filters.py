@@ -8,7 +8,9 @@ Playbook keys read (section ``icp``):
 
 ``exclude_domains``
     Domains never to contact (competitors, clients). A domain also excludes
-    its subdomains (``acme.com`` excludes ``eu.acme.com``).
+    its subdomains (``acme.com`` excludes ``eu.acme.com``). ``excluded_domain``
+    applies the same rule to a contact's email address after enrichment (a
+    company without a website can still turn out to be an excluded one).
 ``exclude_company_patterns``
     Regular expressions searched (case-insensitively) in the company name.
 ``require_domain``
@@ -29,7 +31,13 @@ Playbook keys read (section ``icp``):
     UK, not the other way round); US state names <-> 2-letter codes (a code
     is recognised in upper case after a comma - ``Austin, TX`` - or as the
     whole value) and states count as United States; a ``country`` field that
-    is an ISO code (``DE``, ``GBR``) is read as that country; a few regions
+    is an ISO code (``DE``, ``GBR``) is read as that country. ``CA``, ``DE``,
+    ``IL`` and ``IN`` are both states and ISO countries: they are read as the
+    country when the company's ``country`` field names it (``Berlin, DE`` +
+    ``DE``), when the same string names it or another non-US place
+    (``Tel Aviv, IL, Israel``), or when the code closes a ``City, Region,
+    Country`` string whose region is not a US state (``Toronto, ON, CA``);
+    otherwise as the state (``Chicago, IL``). A few regions
     (``Europe``, ``North America``, ``DACH``, ``Nordics``, ``Benelux``,
     ``ANZ``) cover their member countries. Anything else is a plain phrase
     match (``London``, ``Bay Area``). Nothing ever matches inside a word:
@@ -173,6 +181,9 @@ def _build_tables() -> Tuple[Dict[Tuple[str, ...], str], Dict[str, str], Dict[st
 _PHRASES, _CODES, _PARENTS = _build_tables()
 _MAX_PHRASE = max(len(p) for p in _PHRASES)
 _STATE_AFTER_COMMA = re.compile(r",\s*([A-Z]{2})(?![A-Za-z])")
+# Codes that are both a US state and an ISO country (CA, DE, IL, IN).
+_AMBIGUOUS_CODES = frozenset(c for c in _US_STATES if c in _CODES)
+_US_REGION_WORDS = re.compile(r"\b(?:county|parish|borough)\b", re.IGNORECASE)
 
 
 def _with_parents(ids: Set[str]) -> FrozenSet[str]:
@@ -186,25 +197,64 @@ def _with_parents(ids: Set[str]) -> FrozenSet[str]:
     return frozenset(out)
 
 
+def _resolve_code(code: str, s: str, end: int, others: Set[str], hint: str) -> Optional[str]:
+    """State or country for an ambiguous code (``CA``, ``DE``, ``IL``, ``IN``) in ``s``.
+
+    ``others``: places named elsewhere in the string; ``hint``: the country
+    the company's own ``country`` field names ('' when unknown).
+    """
+    iso, state = _CODES[code], _US_STATES[code]
+    if hint:
+        if hint == "united states":
+            return state
+        return iso if iso == hint else None
+    named = _with_parents(others)
+    countries = {p for p in named if p in _COUNTRIES}
+    if countries:
+        if countries == {"united states"}:
+            return state
+        return iso if iso in countries else None
+    regions = {p for p in named if p in _REGIONS}
+    if regions & _with_parents({iso}) and not regions & _with_parents({state}):
+        return iso
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) >= 3 and not s[end:].strip(" .") and parts[-2]:
+        region = parts[-2]
+        us_region = (region.upper() in _US_STATES or normalize_text(region) in _PARTS
+                     or _US_REGION_WORDS.search(region) is not None)
+        if not us_region:
+            return iso  # "Toronto, ON, CA", "Bangalore, Karnataka, IN"
+    return state
+
+
 @lru_cache(maxsize=4096)
-def place_ids(text: str, country_field: bool = False) -> FrozenSet[str]:
+def place_ids(text: str, country_field: bool = False, country_hint: str = "") -> FrozenSet[str]:
     """Canonical places mentioned in a location string (plus what they imply).
 
     'Austin, TX' -> {texas, united states, north america};
     'Manchester, England' -> {england, united kingdom, europe}.
+    ``country_hint`` (a canonical country, e.g. from the company's ``country``
+    field) settles codes that are both a state and a country: 'Berlin, DE'
+    with hint 'germany' -> {germany, dach, europe}.
     """
     s = str(text or "").strip()
     if not s:
         return frozenset()
     ids: Set[str] = set()
+    ambiguous: List[Tuple[str, int]] = []
     compact = re.sub(r"[\s.]", "", s).upper()
     if country_field and compact in _CODES:
         ids.add(_CODES[compact])
     elif re.fullmatch(r"[A-Z]{2}", s) and s in _US_STATES:
-        ids.add(_US_STATES[s])
+        if s in _AMBIGUOUS_CODES and country_hint:
+            ambiguous.append((s, len(s)))
+        else:
+            ids.add(_US_STATES[s])
     for m in _STATE_AFTER_COMMA.finditer(s):
         code = m.group(1)
-        if code in _US_STATES:
+        if code in _AMBIGUOUS_CODES:
+            ambiguous.append((code, m.end()))
+        elif code in _US_STATES:
             ids.add(_US_STATES[code])
         elif code in _CODES:
             ids.add(_CODES[code])
@@ -219,6 +269,11 @@ def place_ids(text: str, country_field: bool = False) -> FrozenSet[str]:
                 break
         else:
             i += 1
+    others = set(ids)
+    for code, end in ambiguous:
+        hit = _resolve_code(code, s, end, others, country_hint)
+        if hit is not None:
+            ids.add(hit)
     return _with_parents(ids)
 
 
@@ -244,11 +299,14 @@ def is_placeless(text: Any, country_field: bool = False) -> bool:
     return not (tokens and place_ids(str(text), country_field))
 
 
-def match_location(criteria: Sequence[str], text: str, country_field: bool = False) -> Optional[str]:
-    """First configured location (as written) that ``text`` is in, else None."""
+def match_location(criteria: Sequence[str], text: str, country_field: bool = False,
+                   country_hint: str = "") -> Optional[str]:
+    """First configured location (as written) that ``text`` is in, else None.
+
+    ``country_hint``: see ``place_ids``."""
     if not text:
         return None
-    ids = place_ids(str(text), country_field)
+    ids = place_ids(str(text), country_field, country_hint)
     for crit in criteria:
         canon = canonical_place(crit)
         if canon is not None:
@@ -278,6 +336,14 @@ def _company_keywords(company: Company) -> List[str]:
     return as_str_list(company.keywords)
 
 
+def _country_hint(country: Any) -> str:
+    """The one country a ``country`` field names ('DE' -> 'germany'), else ''."""
+    if not country or not str(country).strip():
+        return ""
+    found = {p for p in place_ids(str(country), True) if p in _COUNTRIES}
+    return found.pop() if len(found) == 1 else ""
+
+
 def _location_fit(company: Company, ctx: Any) -> FitResult:
     icp = ctx.playbook.icp
     include = as_str_list(icp.get("locations"))
@@ -286,6 +352,8 @@ def _location_fit(company: Company, ctx: Any) -> FitResult:
         return FitResult(True, False, "")
     home: List[Tuple[str, bool]] = [(str(t), cf) for t, cf in ((company.location, False), (company.country, True))
                                     if t and not is_placeless(t, cf)]
+    # the company's own country settles "Berlin, DE" (Germany, not Delaware)
+    hint = _country_hint(company.country)
     ptypes = primary_types(ctx)
     sig_places: List[Tuple[str, bool]] = []
     for sig in company.signals or []:
@@ -298,7 +366,7 @@ def _location_fit(company: Company, ctx: Any) -> FitResult:
 
     if exclude:
         for text, cf in home:
-            hit = match_location(exclude, text, cf)
+            hit = match_location(exclude, text, cf, "" if cf else hint)
             if hit is not None:
                 return FitResult(False, True, f"excluded location {hit!r} ({text})")
         if not home and sig_places:
@@ -308,7 +376,11 @@ def _location_fit(company: Company, ctx: Any) -> FitResult:
                 return FitResult(False, True, f"excluded location {hits[0]!r} (signals in {where})")
 
     if include:
-        for text, cf in home + sig_places:
+        for text, cf in home:
+            hit = match_location(include, text, cf, "" if cf else hint)
+            if hit is not None:
+                return FitResult(True, True, f"location match ({hit})")
+        for text, cf in sig_places:
             hit = match_location(include, text, cf)
             if hit is not None:
                 return FitResult(True, True, f"location match ({hit})")
@@ -392,6 +464,41 @@ def _domain_excluded(domain: str, excluded: Sequence[str]) -> Optional[str]:
     return None
 
 
+_EXCLUDED_SETS: Dict[int, Tuple[Any, int, FrozenSet[str]]] = {}
+
+
+def _excluded_set(raw: Any) -> FrozenSet[str]:
+    """Normalised ``icp.exclude_domains``, cached per config object (the entry
+    keeps ``raw`` alive so its id is not reused; a changed length rebuilds it)."""
+    size = len(raw) if isinstance(raw, (list, tuple, set, frozenset)) else -1
+    hit = _EXCLUDED_SETS.get(id(raw))
+    if hit is not None and hit[0] is raw and hit[1] == size:
+        return hit[2]
+    value = frozenset(d for d in (normalize_domain(r) for r in as_str_list(raw)) if d)
+    if len(_EXCLUDED_SETS) >= 64:
+        _EXCLUDED_SETS.clear()
+    _EXCLUDED_SETS[id(raw)] = (raw, size, value)
+    return value
+
+
+def excluded_domain(value: Any, ctx: Any) -> Optional[str]:
+    """The ``icp.exclude_domains`` entry that ``value`` (a domain, URL or email
+    address) falls under, else None: ``jane@eu.bigclient.com`` -> ``bigclient.com``.
+    Cheap enough to call for every contact and email candidate."""
+    domain = normalize_domain(value)
+    if not domain:
+        return None
+    excluded = _excluded_set(ctx.playbook.icp.get("exclude_domains"))
+    if not excluded:
+        return None
+    labels = domain.split(".")
+    for i in range(len(labels)):
+        suffix = ".".join(labels[i:])
+        if suffix in excluded:
+            return suffix
+    return None
+
+
 def check_icp(company: Company, ctx: Any) -> Optional[str]:
     """Return why ``company`` is outside the ICP, or None when it fits."""
     icp = ctx.playbook.icp
@@ -459,6 +566,6 @@ def apply_icp(companies: List[Company], ctx: Any) -> Tuple[List[Company], List[T
 
 
 __all__ = [
-    "FitResult", "apply_icp", "canonical_place", "check_icp", "fit_checks", "fit_report",
-    "is_placeless", "match_location", "place_ids",
+    "FitResult", "apply_icp", "canonical_place", "check_icp", "excluded_domain", "fit_checks",
+    "fit_report", "is_placeless", "match_location", "place_ids",
 ]

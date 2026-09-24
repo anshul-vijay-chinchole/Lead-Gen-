@@ -80,12 +80,13 @@ class Adapter:
     def secret(self, config_key: str = "api_key", env_key: Optional[str] = None,
                required: bool = True) -> str:
         """Resolve a credential: config value > config '<key>_env' var > default env var."""
-        val = self.config.get(config_key)
+        val = str(self.config.get(config_key) or "").strip()
         if val:
-            return str(val)
+            return val
         env_name = self.config.get(f"{config_key}_env") or env_key or self.env_key
-        if env_name and self.ctx.env.get(env_name):
-            return self.ctx.env[env_name]
+        env_val = str(self.ctx.env.get(env_name) or "").strip() if env_name else ""
+        if env_val:
+            return env_val
         if required:
             hint = f"set ${env_name}" if env_name else f"set '{config_key}' in the playbook"
             raise MissingCredentialError(f"{self.name}: missing credential ({hint})")

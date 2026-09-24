@@ -55,6 +55,7 @@ Shared helpers used by the other exporters
 ``UploadCsvExporter``              -> base class for sending-tool upload CSVs
                                      (Instantly, Smartlead).
 ``response_error`` / ``FATAL_STATUSES`` / ``config_int`` -> shared by the API senders.
+``unique_by_email``                -> one lead per email for hand-over exporters.
 """
 from __future__ import annotations
 
@@ -95,6 +96,9 @@ _LEGAL_SUFFIX_RE = re.compile(
     re.I,
 )
 
+# "Tiffany & Co." / "Marks and Co": the "Co" is part of the brand, not a legal suffix.
+_DANGLING_AND_RE = re.compile(r"(?:&|\band)$", re.I)
+
 BODY_FORMATS = ("text", "html")
 
 
@@ -118,6 +122,28 @@ def _cell(value: Any) -> Any:
 def sorted_by_score(leads: Iterable[Lead]) -> List[Lead]:
     """Stable sort, highest score first (ties keep their input order)."""
     return sorted(leads, key=lambda ld: -(ld.score or 0))
+
+
+def unique_by_email(leads: Iterable[Lead]) -> Tuple[List[Lead], List[Lead]]:
+    """``(kept, duplicates)``: only the first lead per contact email (case-insensitive) is kept.
+
+    Hand-over exporters use it so one person is never handed to a sending tool
+    twice in the same export (e.g. a group CFO listed under two company
+    records). Pass leads sorted by score so the best-scored one wins. Leads
+    without an email are always kept.
+    """
+    seen = set()
+    kept: List[Lead] = []
+    dups: List[Lead] = []
+    for ld in leads:
+        email = ((ld.contact.email if ld.contact else "") or "").strip().lower()
+        if email and email in seen:
+            dups.append(ld)
+            continue
+        if email:
+            seen.add(email)
+        kept.append(ld)
+    return kept, dups
 
 
 def ordered_messages(lead: Lead) -> List[Message]:
@@ -172,12 +198,16 @@ def website_url(company: Company) -> str:
 
 
 def display_company_name(name: str) -> str:
-    """'Acme Holdings Ltd.' -> 'Acme Holdings'; keeps the original if stripping empties it."""
+    """'Acme Holdings Ltd.' -> 'Acme Holdings'; keeps the original if stripping empties it.
+
+    A suffix is never stripped when that would leave a dangling ``&`` / ``and``
+    ('Merck & Co., Inc.' -> 'Merck & Co.', not 'Merck &').
+    """
     original = (name or "").strip()
     cleaned = original
     for _ in range(3):  # "Acme Pty Ltd" needs two passes
         new = _LEGAL_SUFFIX_RE.sub("", cleaned).strip().rstrip(",").strip()
-        if new == cleaned:
+        if new == cleaned or _DANGLING_AND_RE.search(new):
             break
         cleaned = new
     return cleaned or original
@@ -500,7 +530,12 @@ class UploadCsvExporter(_FileExporter):
     (default true; plain phone numbers are never prefixed), ``body_format``
     (``text`` default | ``html`` = ``<br>`` line breaks), ``clean_company_name``
     (default true: ``Acme Inc.`` -> ``Acme``).
-    Leads without an email are skipped (reported in ``detail``).
+    Leads without an email are skipped, and so is every lead after the first
+    (highest score) with the same email (both reported in ``detail``).
+
+    In ``ctx.dry_run`` the file is written as ``<name>.dry-run.csv``: the
+    pipeline does not record a dry run's leads as handed over, so importing
+    that file and then running for real would hand the same people over twice.
     """
 
     scope = "outbound"
@@ -525,8 +560,8 @@ class UploadCsvExporter(_FileExporter):
 
     def export(self, leads: List[Lead], out_dir: Path) -> ExportResult:
         ordered = sorted_by_score(leads)
-        sendable = [ld for ld in ordered if ld.contact and ld.contact.email]
-        skipped = len(ordered) - len(sendable)
+        sendable, dups = unique_by_email(ld for ld in ordered if ld.contact and ld.contact.email)
+        skipped = len(ordered) - len(sendable) - len(dups)
         # size the sequence columns from the rows actually written
         steps = max(1, max_steps(sendable))
         subject_steps = followup_subject_steps(sendable)
@@ -540,14 +575,24 @@ class UploadCsvExporter(_FileExporter):
             rows.append([row.get(key, "") for _, key in cols])
             ids.append(lead.id)
         path = self.output_path(out_dir)
+        if self.ctx.dry_run:  # a rehearsal must never look like (or overwrite) a real upload file
+            path = path.with_name(f"{path.stem}.dry-run{path.suffix}")
         header = [c for c, _ in cols]
         phone_cols = [c for c, k in cols if k == "phone"]
         n = write_csv(path, header, rows, guard=_bool(self.config.get("formula_guard"), True),
                       phone_columns=phone_cols, encoding=self.encoding)
         detail = f"{n} leads"
+        notes = []
         if skipped:
-            detail += f" ({skipped} skipped: no email)"
+            notes.append(f"{skipped} skipped: no email")
             self.log.warning("%s: skipped %d lead(s) without an email address", self.name, skipped)
+        if dups:
+            notes.append(f"{len(dups)} skipped: duplicate email")
+            self.log.warning("%s: skipped %d lead(s) whose email is already in this file", self.name, len(dups))
+        if notes:
+            detail += f" ({'; '.join(notes)})"
+        if self.ctx.dry_run:
+            detail += " - dry-run rehearsal: not recorded as handed over, do not import"
         self.log.info("%s: wrote %d leads to %s", self.name, n, path)
         return ExportResult(exporter=self.label, count=n, path=str(path), detail=detail,
                             exported_ids=ids)
@@ -556,7 +601,7 @@ class UploadCsvExporter(_FileExporter):
 __all__ = [
     "CsvExporter", "JsonExporter", "UploadCsvExporter", "lead_rows", "outbound_row",
     "sequence_keys", "sequence_fields", "write_csv", "guard_cell", "resolve_output_path",
-    "max_steps", "followup_subject_steps", "ordered_messages", "sorted_by_score",
+    "max_steps", "followup_subject_steps", "ordered_messages", "sorted_by_score", "unique_by_email",
     "display_company_name", "website_url", "company_location", "format_body", "review_header",
     "rows_as_dicts", "REVIEW_COLUMNS_HEAD", "REVIEW_COLUMNS_TAIL", "BODY_FORMATS",
     "FATAL_STATUSES", "response_error", "config_int",

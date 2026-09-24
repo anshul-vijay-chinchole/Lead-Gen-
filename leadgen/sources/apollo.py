@@ -136,12 +136,31 @@ def employee_range(value: Any) -> Optional[str]:
     return f"{lo},{hi}"
 
 
+def _is_single_range_pair(value: Any) -> bool:
+    """[11, 50] / ["11", "50"]: two bare numbers form one range (each alone is not a range)."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    for v in value:
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            continue
+        if not (isinstance(v, str) and v.strip().isdigit()):  # "11,50" is itself a range
+            return False
+    return True
+
+
 def _as_list(value: Any) -> List[Any]:
     if is_blank(value):
         return []
     if isinstance(value, (list, tuple)):
         return [v for v in value if not is_blank(v)]
     return [value]
+
+
+def _stage_key(value: Any) -> str:
+    """'Series B' / 'series_b' / 'SERIES-B' -> 'seriesb' (to compare funding round names)."""
+    return "".join(ch for ch in as_text(value).lower() if ch.isalnum())
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -206,8 +225,8 @@ class ApolloSource(Source):
         raw = self.config.get("employee_ranges")
         ranges: List[str] = []
         try:
-            if isinstance(raw, dict):
-                raw = [raw]
+            if isinstance(raw, dict) or _is_single_range_pair(raw):
+                raw = [raw]  # {min: 11, max: 50} / [11, 50] is one range, not two
             for r in _as_list(raw):
                 rng = employee_range(r)
                 if rng:
@@ -257,14 +276,24 @@ class ApolloSource(Source):
             def when(e: Dict[str, Any]) -> date:
                 return parse_date(e.get("date")) or date.min
 
-            same_day = [e for e in events if target and when(e) == target]
-            latest = same_day[0] if same_day else max(events, key=when)
-            rec["_latest_funding_amount"] = latest.get("amount")
-            rec["_latest_funding_currency"] = latest.get("currency")
-            rec["_latest_funding_url"] = latest.get("news_url")
-            rec["_latest_funding_date"] = latest.get("date")
-            if is_blank(rec.get("latest_funding_stage")) and latest.get("type"):
-                rec["latest_funding_stage"] = latest.get("type")
+            latest: Optional[Dict[str, Any]]
+            if target:
+                # only the event of the latest round itself: an older round's amount / news
+                # URL must not be attached to the latest stage ("Series B ($5M)" + Series A link)
+                latest = next((e for e in events if when(e) == target), None)
+            else:
+                latest = max(events, key=when)
+                stage = rec.get("latest_funding_stage")
+                if (latest is not None and not is_blank(stage) and not is_blank(latest.get("type"))
+                        and _stage_key(stage) != _stage_key(latest.get("type"))):
+                    latest = None  # the newest event is not the round named as the latest stage
+            if latest is not None:
+                rec["_latest_funding_amount"] = latest.get("amount")
+                rec["_latest_funding_currency"] = latest.get("currency")
+                rec["_latest_funding_url"] = latest.get("news_url")
+                rec["_latest_funding_date"] = latest.get("date")
+                if is_blank(rec.get("latest_funding_stage")) and latest.get("type"):
+                    rec["latest_funding_stage"] = latest.get("type")
         return rec
 
     def growth_signal(self, record: Dict[str, Any]) -> Optional[Signal]:

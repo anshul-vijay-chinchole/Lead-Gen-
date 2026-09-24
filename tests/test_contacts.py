@@ -453,3 +453,224 @@ def test_waterfall_ignores_non_contacts_and_accepts_dicts(make_ctx):
 def test_missing_credential_error_type_is_what_secret_raises(make_ctx):
     with pytest.raises(MissingCredentialError):
         FakeFinder({"api_key_env": "NOPE"}, make_ctx()).secret()
+
+
+# --- regressions (verifier findings) -----------------------------------------------------
+
+from leadgen.contacts import fill_contact, merge_contacts  # noqa: E402
+
+
+class NetErrorFinder(ContactFinder):
+    """Fails like requests does when the host is unreachable: the message quotes the full URL."""
+
+    name = "fake_neterr"
+
+    def find(self, company: Company) -> List[Contact]:
+        raise HttpError(0, "https://api.fake.test/v2/domain-search?domain=acme.com&api_key=hk_SECRET_123",
+                        "ConnectionError: Max retries exceeded with url: /v2/domain-search?"
+                        "domain=acme.com&limit=10&api_key=hk_SECRET_123 (Caused by NewConnectionError())")
+
+
+registry.register("finder", "fake_neterr", "tests.test_contacts:NetErrorFinder")
+
+
+def test_waterfall_errors_never_contain_api_keys(make_ctx, caplog):
+    ctx = make_ctx(buyers=BUYERS, enrichment=finders({"type": "fake_neterr", "label": "hunter"}))
+    errors: List[str] = []
+    with caplog.at_level(logging.ERROR, logger="leadgen.test"):
+        ContactWaterfall(ctx, errors=errors).enrich(Company(name="Acme", domain="acme.com"))
+    assert len(errors) == 1 and errors[0].startswith("finder hunter: HTTP 0")
+    assert "hk_SECRET_123" not in errors[0] and "api_key=***" in errors[0]
+    assert "hk_SECRET_123" not in caplog.text
+
+
+EXCLUDED = {"exclude_domains": ["bigclient.com"]}
+
+
+def test_select_drops_contacts_at_excluded_domains(make_ctx):
+    ctx = make_ctx(buyers=BUYERS, icp=EXCLUDED)
+    company = Company(name="BigClient", contacts=[
+        Contact(full_name="Jane Doe", title="CFO", email="jane@bigclient.com", email_status="valid"),
+        Contact(full_name="Vic", title="VP Finance", email="vic@eu.bigclient.com", email_status="valid"),
+        Contact(full_name="Cara", title="Controller",
+                email_candidates=["cara@bigclient.com", "cara@bigclient-group.com"]),
+    ])
+    chosen = select_contacts(company, ctx, limit=None)
+    assert [(c.full_name, c.email, c.email_candidates) for c in chosen] == [
+        ("Cara", "", ["cara@bigclient-group.com"])]
+    assert company.contacts[2].email_candidates == ["cara@bigclient.com", "cara@bigclient-group.com"]
+
+
+def test_waterfall_excluded_domain_email_is_not_reachable(make_ctx):
+    ctx = make_ctx(buyers=BUYERS, icp=EXCLUDED, enrichment=finders(
+        {"type": "fake_x", "label": "first", "people": [person("Jane Doe", "CFO", "jane@bigclient.com",
+                                                                email_status="valid")]},
+        {"type": "fake_x", "label": "second", "people": [person("Vic", "VP Finance", "vic@acme.com")]},
+    ))
+    wf = ContactWaterfall(ctx)
+    company = Company(name="Acme")
+    assert wf.enrich(company) == ["first", "second"]
+    assert ("complete", "Jane Doe") not in wf.finders[0].calls  # no lookups for an excluded person
+    assert [c.email for c in select_contacts(company, ctx, limit=None)] == ["vic@acme.com"]
+
+
+def test_waterfall_skips_and_stops_at_excluded_company_domains(make_ctx):
+    ctx = make_ctx(buyers=BUYERS, icp=EXCLUDED, enrichment=finders(
+        {"type": "fake_x", "label": "first"}, {"type": "fake_x", "label": "second"}))
+    wf = ContactWaterfall(ctx)
+    assert wf.enrich(Company(name="BigClient", domain="eu.bigclient.com")) == []
+    resolved = Company(name="BigClient")
+
+    class Resolver(FakeFinder):
+        def find(self, company: Company) -> List[Contact]:
+            company.data["email_domain"] = "bigclient.com"  # as the Hunter finder does
+            return []
+
+    wf.slots[0].finder = Resolver({}, ctx)
+    assert wf.enrich(resolved) == ["first"]
+    assert wf.finders[1].calls == []
+
+
+def test_pipeline_never_hands_over_contact_at_excluded_domain(make_ctx, tmp_path):
+    from leadgen.models import Signal
+    from leadgen.pipeline import Pipeline
+    from tests.conftest import TODAY
+
+    ctx = make_ctx(icp=EXCLUDED, buyers={"titles": ["CFO"]}, enrichment=finders(
+        {"type": "fake_x", "people": [person("Jane Doe", "CFO", "jane@bigclient.com", email_status="valid")]}))
+
+    class P(Pipeline):
+        def collect(self):
+            return [Company(name="BigClient", signals=[Signal(type="job_posting", title="Accountant",
+                                                              posted_at=TODAY)])]
+
+    p = P(ctx, out_dir=tmp_path)
+    result = p.run()
+    assert all(ld.contact is None or "bigclient.com" not in ld.contact.email for ld in result.leads)
+    assert p.outbound_leads(result.leads) == []
+
+
+def test_fill_contact_replaces_generic_or_invalid_email():
+    target = Contact(full_name="Jane Doe", title="CFO", email="careers@acme.com")
+    fill_contact(target, Contact(full_name="Jane Doe", email="jane.doe@acme.com", email_status="valid"))
+    assert (target.email, target.email_status) == ("jane.doe@acme.com", "valid")
+    target = Contact(full_name="Jane Doe", email="jd@acme.com", email_status="invalid")
+    fill_contact(target, Contact(full_name="Jane Doe", email="jane.doe@acme.com", email_status="risky"))
+    assert (target.email, target.email_status) == ("jane.doe@acme.com", "risky")
+
+
+def test_fill_contact_keeps_usable_email_and_records_other_as_candidate():
+    target = Contact(full_name="Jane Doe", email="jane@acme.com")
+    fill_contact(target, Contact(full_name="Jane Doe", email="jane.doe@acme.com", email_status="valid"))
+    assert target.email == "jane@acme.com" and target.email_candidates == ["jane.doe@acme.com"]
+    # an INVALID or generic source address is not worth keeping, nor one at another
+    # domain (a stale address at a previous employer must never be verified and used)
+    fill_contact(target, Contact(email="jd@acme.com", email_status="invalid"))
+    fill_contact(target, Contact(email="info@acme.com"))
+    fill_contact(target, Contact(email="jane@oldjob.com", email_status="valid"))
+    assert target.email_candidates == ["jane.doe@acme.com"]
+    # the same address never upgrades its own status
+    target = Contact(email="jd@acme.com", email_status="invalid")
+    fill_contact(target, Contact(email="jd@acme.com", email_status="valid"))
+    assert target.email_status == "invalid"
+
+
+def test_fill_contact_respects_allow_generic(make_ctx):
+    ctx = make_ctx(buyers={"allow_generic_emails": True})
+    target = Contact(full_name="Jane Doe", email="finance@acme.com")
+    fill_contact(target, Contact(email="jane.doe@acme.com"), ctx)
+    assert target.email == "finance@acme.com" and target.email_candidates == ["jane.doe@acme.com"]
+
+
+def test_waterfall_finder_email_replaces_generic_address_of_same_person(make_ctx):
+    ctx = make_ctx(buyers={"titles": ["CFO"]}, enrichment=finders(
+        {"type": "fake_x", "people": [person("Jane Doe", "CFO", "jane.doe@acme.com", email_status="valid",
+                                             linkedin_url="https://www.linkedin.com/in/janedoe")]},
+        {"type": "fake_x", "label": "never"},
+    ))
+    wf = ContactWaterfall(ctx)
+    company = Company(name="Acme", domain="acme.com", contacts=[
+        Contact(full_name="Jane Doe", title="CFO", email="careers@acme.com",
+                linkedin_url="https://linkedin.com/in/janedoe")])
+    assert wf.enrich(company) == ["fake_x"]  # satisfied after the first finder
+    assert [(c.email, c.email_status) for c in company.contacts] == [("jane.doe@acme.com", "valid")]
+    assert [c.email for c in select_contacts(company, ctx)] == ["jane.doe@acme.com"]
+
+
+def test_waterfall_completes_target_with_generic_or_invalid_email(make_ctx):
+    ctx = make_ctx(buyers={"titles": ["CFO", "Controller"]}, enrichment=finders(
+        {"type": "fake_x", "emails": {"Jane Doe": "jane.doe@acme.com", "Val": "val@acme.com"},
+         "status": "valid"}))
+    wf = ContactWaterfall(ctx)
+    company = Company(name="Acme", domain="acme.com", contacts=[
+        Contact(full_name="Jane Doe", title="CFO", email="jobs@acme.com")])
+    wf.enrich(company)
+    assert ("complete", "Jane Doe") in wf.finders[0].calls
+    assert company.contacts[0].email == "jane.doe@acme.com"
+    company = Company(name="Acme", domain="acme.com", contacts=[
+        Contact(full_name="Val", title="Controller", email="v@acme.com", email_status="invalid")])
+    wf.enrich(company)
+    assert (company.contacts[0].email, company.contacts[0].email_status) == ("val@acme.com", "valid")
+
+
+def test_waterfall_pattern_finder_guesses_for_generic_address(make_ctx):
+    ctx = make_ctx(buyers={"titles": ["CFO"]}, enrichment=finders({"type": "pattern"}))
+    company = Company(name="Acme", domain="acme.com", contacts=[
+        Contact(full_name="Jane Doe", title="CFO", email="careers@acme.com")])
+    ContactWaterfall(ctx).enrich(company)
+    chosen = select_contacts(company, ctx)
+    assert chosen[0].email == "" and "jane.doe@acme.com" in chosen[0].email_candidates
+
+
+def test_merge_contacts_passes_ctx(make_ctx):
+    ctx = make_ctx(icp=EXCLUDED)
+    company = Company(name="Acme", contacts=[
+        Contact(full_name="Jane", email="jane@bigclient.com", linkedin_url="https://linkedin.com/in/j")])
+    merge_contacts(company, [Contact(full_name="Jane", email="jane@acme.com",
+                                     linkedin_url="https://linkedin.com/in/j")], ctx)
+    assert company.contacts[0].email == "jane@acme.com"
+
+
+@pytest.mark.parametrize("title", [
+    "Founder's Associate", "Founders Associate", "Founders' Associate", "Former CEO", "Ex-CEO",
+    "Deputy CEO", "CEO's Office Manager", "CEO Office Manager", "Chief of Staff, Office of the CEO",
+    "Associate Founder", "Retired Founder",
+])
+def test_titles_that_belong_to_someone_else_do_not_rank(make_ctx, title):
+    ctx = make_ctx(buyers={"titles": ["Founder", "CEO"]})
+    assert title_rank(title, ctx) is None
+
+
+@pytest.mark.parametrize("title,rank", [
+    ("Founder & CEO", 0), ("CEO & Founder", 0), ("Co-Founder", 0), ("Founder, ex-Google", 0),
+    ("CEO, former CFO", 1), ("Interim CEO", 1), ("Acting CEO", 1), ("Chief Executive Officer", 1),
+])
+def test_qualified_titles_still_rank(make_ctx, title, rank):
+    ctx = make_ctx(buyers={"titles": ["Founder", "CEO"]})
+    assert title_rank(title, ctx) == rank
+
+
+@pytest.mark.parametrize("title,wanted,expected", [
+    ("Former Director of Finance", "Finance Director", False),
+    ("Associate Director, Finance", "Finance Director", False),
+    ("Finance Director's Assistant", "Finance Director", False),
+    ("Deputy CFO", "CFO", False),
+    ("Vice Chair", "Chair", False),
+    ("Director, Children's Services", "Director", True),
+    ("Director of Finance", "Finance Director", True),
+    ("Director, Office of Finance", "Finance Director", True),
+    ("Director, Office of the CFO", "CFO", False),
+    ("Deputy CFO", "Deputy CFO", True),
+])
+def test_title_qualifiers(title, wanted, expected):
+    assert title_matches(title, wanted) is expected
+
+
+def test_select_prefers_real_founder_over_founders_associate(make_ctx):
+    ctx = make_ctx(buyers={"titles": ["Founder", "CEO"]})
+    company = Company(name="Acme", domain="acme.com", contacts=[
+        Contact(full_name="Sam Lee", title="Founder & CEO"),
+        Contact(full_name="Alex Kim", title="Founder's Associate", email="alex@acme.com", email_status="valid"),
+    ])
+    assert select_contacts(company, ctx)[0].full_name == "Sam Lee"
+    assert not ContactWaterfall(ctx).satisfied(company)

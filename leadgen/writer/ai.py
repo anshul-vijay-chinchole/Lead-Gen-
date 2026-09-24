@@ -13,15 +13,22 @@ Flow per lead::
 Model output is cleaned before the checks: markdown emphasis and code
 fences are removed, a sign-off the model added anyway ("Best,\\nSam") is
 dropped (the code appends the real signature), literal ``\\n`` sequences are
-turned into line breaks. ``personalization`` / ``hypothesis`` come from the
-JSON (``personalization_line`` / ``pain_hypothesis``), falling back to the
-first line of email 1. ``WriterOutput.writer`` is ``"ai:<model>"``.
+turned into line breaks. A ``body`` sent as a list of strings is joined as
+paragraphs; any other non-string subject/body is a guardrail problem.
+``personalization`` / ``hypothesis`` come from the JSON (``personalization_line`` /
+``pain_hypothesis``) and must pass ``guardrails.check_snippet`` (exporters send
+them as merge variables); a missing or rejected personalization falls back to
+the first sentence of email 1, a rejected hypothesis to ``""``.
+``WriterOutput.writer`` is ``"ai:<model>"``.
 
 Failure handling
 ----------------
 * ``ctx.llm`` is None (no provider / key), or ``ctx.dry_run`` -> template
   output with warning ``ai fallback: <reason>``.
 * ``LLMError`` / ``HttpError`` / unparseable JSON -> fallback for that lead.
+  A network-level failure (``HttpError`` status 0) is reported by exception
+  type only: its text can echo request headers (the API key), and fallback
+  reasons end up in lead notes and exports.
   A truncated answer (``LLMTruncatedError``) is retried once with twice the
   token budget instead.
 * Errors that will not go away - missing credential, HTTP 401/403/404, a
@@ -50,7 +57,7 @@ from ..llm.base import LLMError
 from ..models import Lead, Message
 from ..utils import to_int
 from .base import Writer, WriterOutput
-from .guardrails import check_message, check_sequence
+from .guardrails import check_message, check_sequence, check_snippet
 from .prompts import build_feedback_prompt, build_system_prompt, build_user_prompt
 from .template import TemplateWriter, append_signoff, build_values, sequence_steps, tidy
 
@@ -108,6 +115,43 @@ def clean_body(value: Any, sender_name: str = "") -> str:
     return tidy("\n".join(lines))
 
 
+def _as_text(value: Any, list_joiner: Optional[str] = None) -> Optional[str]:
+    """A model JSON field as text: '' for missing, None for an unusable type.
+
+    With ``list_joiner`` a list of strings (paragraphs) is joined instead of
+    being rendered as a Python list repr.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if list_joiner is not None and isinstance(value, list) and all(isinstance(x, str) for x in value):
+        return list_joiner.join(x.strip() for x in value if x.strip())
+    return None
+
+
+def _one_line(value: Any) -> str:
+    """A short side field (personalization line / hypothesis) as one clean line; '' if not text."""
+    text = _as_text(value)
+    if not text:
+        return ""
+    text = text.replace("\\n", " ").replace("**", "").replace("__", "").replace("`", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":  # wrapped in quotes
+        text = text[1:-1].strip()
+    return text
+
+
+def _error_reason(e: BaseException) -> str:
+    """Readable reason for a failed LLM call, safe to put into lead notes / exports."""
+    if isinstance(e, HttpError) and e.status == 0:
+        # A network-level failure: requests' message can echo request details - e.g. an
+        # InvalidHeader error quotes the header value, i.e. the API key. Keep the type only.
+        m = re.match(r"\s*([A-Za-z_][\w.]*)", e.body or "")
+        return f"HttpError: LLM request failed without a response ({m.group(1) if m else 'network error'})"
+    return f"{type(e).__name__}: {e}"
+
+
 def _first_sentence(body: str) -> str:
     for line in body.split("\n"):
         ln = line.strip()
@@ -163,7 +207,7 @@ class AIWriter(Writer):
 
     def _on_request_error(self, e: BaseException) -> str:
         """Record an LLM call failure (maybe switching the AI off); returns the reason text."""
-        reason = f"{type(e).__name__}: {e}"
+        reason = _error_reason(e)
         if isinstance(e, MissingCredentialError) or getattr(e, "permanent", False):
             self._disable(str(e))
         elif isinstance(e, HttpError) and e.status in PERMANENT_HTTP_STATUSES:
@@ -244,12 +288,21 @@ class AIWriter(Writer):
         signature, footer = values.get("signature", ""), values.get("footer", "")
         sender = values.get("sender_name", "")
         messages: List[Message] = []
+        first_body = ""
         for i, (step, item) in enumerate(zip(seq, ordered)):
             if item is None:
                 problems.append(f"step {i + 1}: missing")
                 continue
-            body = clean_body(item.get("body") or item.get("text") or "", sender)
-            subject = clean_subject(item.get("subject")) if i == 0 else ""
+            raw_body = _as_text(item.get("body") or item.get("text") or "", list_joiner="\n\n")
+            raw_subject = _as_text(item.get("subject")) if i == 0 else ""
+            if raw_body is None or raw_subject is None:
+                what = "body" if raw_body is None else "subject"
+                problems.append(f"step {i + 1}: {what} must be a plain string")
+                continue
+            body = clean_body(raw_body, sender)
+            if i == 0:
+                first_body = body
+            subject = clean_subject(raw_subject) if i == 0 else ""
             messages.append(Message(step=i + 1, day=step["day"], subject=subject,
                                     body=append_signoff(body, signature, footer)))
         if problems:  # incomplete: still report per-email problems so one retry can fix everything
@@ -258,11 +311,25 @@ class AIWriter(Writer):
         else:
             problems = check_sequence(messages, lead, self.ctx)
 
-        personalization = str(data.get("personalization_line") or data.get("personalization") or "").strip()
-        if not personalization and messages:
-            personalization = _first_sentence(clean_body(ordered[0].get("body") if ordered[0] else "", sender))
-        hypothesis = str(data.get("pain_hypothesis") or data.get("hypothesis") or "").strip()
+        # Exporters send these as merge variables ({{personalization}}), so they get the same
+        # content checks as the emails; a bad one is replaced, not passed through.
+        personalization = self._side_field(data.get("personalization_line") or data.get("personalization"),
+                                           lead, "personalization_line")
+        if not personalization:
+            personalization = _first_sentence(first_body)
+        hypothesis = self._side_field(data.get("pain_hypothesis") or data.get("hypothesis"), lead,
+                                      "pain_hypothesis")
         return messages, personalization, hypothesis, problems
+
+    def _side_field(self, value: Any, lead: Lead, label: str) -> str:
+        text = _one_line(value)
+        if not text:
+            return ""
+        bad = check_snippet(text, lead, self.ctx)
+        if bad:
+            self.log.info("ai writer: %s for %s dropped (%s)", label, lead.company.name, "; ".join(bad[:3]))
+            return ""
+        return text
 
 
 __all__ = ["AIWriter", "WriterError", "clean_body", "clean_subject"]

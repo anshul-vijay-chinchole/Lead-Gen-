@@ -49,6 +49,9 @@ always scalars (str / number / bool / null) as Instantly requires. Any 2xx
 response counts as added (with ``skip_if_in_*`` Instantly may silently skip a
 duplicate; that still counts as handed over, which is what dedupe wants).
 
+A lead whose email already appeared earlier in the same push (the same
+person under two company records) is skipped; the highest-scored one is sent.
+
 Per-lead failures (e.g. HTTP 400 for a rejected address) are logged and
 counted in ``detail``; they are not fatal and those leads are left out of
 ``exported_ids`` so a later run retries them. HTTP 401 / 403 / 404 (bad key,
@@ -87,7 +90,7 @@ from ..models import Lead
 from .base import Exporter, ExportResult
 from .csv_export import (BODY_FORMATS, FATAL_STATUSES, UploadCsvExporter, _bool, config_int,
                          followup_subject_steps, max_steps, outbound_row, response_error,
-                         sequence_keys, sorted_by_score)
+                         sequence_keys, sorted_by_score, unique_by_email)
 
 DEFAULT_BASE_URL = "https://api.instantly.ai"
 DEFAULT_LEADS_PATH = "/api/v2/leads"
@@ -188,13 +191,16 @@ class InstantlyApiExporter(Exporter):
 
     # --- export ---------------------------------------------------------------------
     def export(self, leads: List[Lead], out_dir: Path) -> ExportResult:
-        ordered = sorted_by_score(leads)
+        ordered, dups = unique_by_email(sorted_by_score(leads))
         if self.ctx.dry_run:
             self.log.info("instantly: dry-run - not adding %d lead(s) to campaign %s",
                           len(ordered), self.config.get("campaign_id") or "(campaign_id not set)")
             return ExportResult(exporter=self.label, count=0, detail="dry-run")
         campaign = self.campaign_id
         fmt = self._body_format()
+        if dups:
+            self.log.warning("instantly: skipped %d lead(s) whose email is already in this push",
+                             len(dups))
         if not ordered:
             return ExportResult(exporter=self.label, count=0, detail="no leads to add")
         headers = {"Authorization": f"Bearer {self.secret()}", "Content-Type": "application/json"}
@@ -248,6 +254,8 @@ class InstantlyApiExporter(Exporter):
             parts.append(f"{failed} failed")
         if skipped:
             parts.append(f"{skipped} skipped (no email)")
+        if dups:
+            parts.append(f"{len(dups)} skipped (duplicate email)")
         if abort:
             parts.append(f"stopped: {abort}")
             self.log.error("instantly: stopped early - %s", abort)

@@ -319,3 +319,109 @@ def test_signal_stats_stale_threshold(make_ctx, age, stale, expected):
     ctx = make_ctx(signals={"stale_after_days": stale})
     c = Company(name="Acme", signals=[job("Accountant", age)])
     assert signal_stats(c, ctx)["persistent"] is expected
+
+
+# --- regressions (verifier findings) -----------------------------------------------------
+
+def test_match_description_false_requires_title_hit(make_ctx):
+    ctx = make_ctx(signals={"match_keywords": ["accountant"], "match_description": False})
+    c = Company(name="Acme", signals=[
+        job("Sales Manager", 1, description="You will work closely with our accountant"),
+        job("Staff Accountant", 1),
+    ])
+    process_signals([c], ctx)
+    assert [s.title for s in c.signals] == ["Staff Accountant"]
+    # default (true) keeps the description fallback
+    ctx2 = make_ctx(signals={"match_keywords": ["accountant"]})
+    c2 = Company(name="Acme", signals=[job("Sales Manager", 1, description="work with our accountant")])
+    kept, _ = process_signals([c2], ctx2)
+    assert kept == [c2]
+
+
+def test_match_description_false_rejects_company_with_description_only_hit(make_ctx):
+    ctx = make_ctx(signals={"match_keywords": ["accountant"], "match_description": "false"})
+    c = Company(name="Acme", signals=[job("Sales Manager", 1, description="our accountant")])
+    kept, rejected = process_signals([c], ctx)
+    assert kept == [] and len(rejected) == 1
+
+
+@pytest.mark.parametrize("text,kw", [
+    ("We build new homes in Texas", "news"),
+    ("Competitive rates", "rat"),
+    ("Our team really cares", "car"),
+    ("Release notes", "not"),
+    ("Good people", "goods"),
+])
+def test_plural_rule_does_not_make_other_words(text, kw):
+    assert keyword_match(text, [kw]) is None
+
+
+def test_plural_rule_still_handles_real_plurals():
+    assert tokens_equal("tax", "taxes") and tokens_equal("church", "churches")
+    assert tokens_equal("wish", "wishes") and tokens_equal("hero", "heroes")
+    assert tokens_equal("business", "businesses") and tokens_equal("rate", "rates")
+    assert not tokens_equal("rat", "rates") and not tokens_equal("new", "news")
+    assert keyword_match("Latest news", ["news"]) == "news"
+
+
+def test_acronym_keywords_only_match_capitals():
+    assert keyword_match("Account Executive - make it grow", ["IT"]) is None
+    assert keyword_match("Get in touch with us today", ["US"]) is None
+    assert keyword_match("make it grow", ["it"]) is None
+    assert keyword_match("Head of IT", ["IT"]) == "IT"
+    assert keyword_match("IT Support Engineer", ["it"]) == "it"
+    assert keyword_match("Offices across the US", ["US"]) == "US"
+    assert keyword_match("Head of IT, EMEA", ["Head of IT"]) == "Head of IT"
+    assert keyword_match("we are the head of it all", ["Head of IT"]) is None
+    # an all-caps phrase keyword does not make its small words case-sensitive
+    assert keyword_match("Head of Finance", ["HEAD OF FINANCE"]) == "HEAD OF FINANCE"
+    # other short keywords stay case-insensitive
+    assert keyword_match("hr business partner", ["HR"]) == "HR"
+
+
+def test_acronym_keyword_in_signal_match_keywords(make_ctx):
+    ctx = make_ctx(signals={"match_keywords": ["developer", "IT"]})
+    c = Company(name="Acme", signals=[
+        job("Account Executive", 1, description="Help us make it grow"),
+        job("IT Manager", 2),
+    ])
+    process_signals([c], ctx)
+    assert [s.title for s in c.signals] == ["IT Manager"]
+
+
+def test_same_role_in_two_locations_is_not_a_repost_on_first_sighting(make_ctx):
+    ctx = make_ctx()
+    c = Company(name="Acme", domain="acme.com", signals=[
+        job("Staff Accountant", 4, external_id="li-111", location="New York, NY"),
+        job("Staff Accountant", 1, external_id="li-222", location="Boston, MA"),
+    ])
+    kept, _ = process_signals([c], ctx)
+    assert [s.reposted for s in kept[0].signals] == [False, False]
+    assert signal_stats(kept[0], ctx)["persistent"] is False
+    # still both live on the next run: concurrent openings, not a re-post
+    again = Company(name="Acme", domain="acme.com", signals=[
+        job("Staff Accountant", 5, external_id="li-111", location="New York, NY"),
+        job("Staff Accountant", 2, external_id="li-222", location="Boston, MA"),
+    ])
+    process_signals([again], ctx)
+    assert not any(s.reposted for s in again.signals)
+
+
+def test_same_ad_from_two_sources_is_not_a_repost(make_ctx):
+    ctx = make_ctx()
+    c = Company(name="Acme", domain="acme.com", signals=[
+        job("Staff Accountant", 1, external_id="adzuna-1", url="https://acme.com/jobs/1"),
+        job("Staff Accountant", 1, external_id="gh-99", url="https://acme.com/jobs/1"),
+    ])
+    process_signals([c], ctx)
+    assert not any(s.reposted for s in c.signals)
+
+
+def test_source_supplied_repost_flag_is_kept_with_siblings(make_ctx):
+    ctx = make_ctx()
+    c = Company(name="Acme", domain="acme.com", signals=[
+        job("Staff Accountant", 1, external_id="a1", reposted=True),
+        job("Staff Accountant", 2, external_id="a2"),
+    ])
+    process_signals([c], ctx)
+    assert [(s.external_id, s.reposted) for s in c.signals] == [("a1", True), ("a2", False)]
