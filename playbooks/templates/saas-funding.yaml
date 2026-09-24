@@ -92,7 +92,7 @@ scoring:
 writer:
   type: ai
   provider: anthropic
-  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  model: claude-sonnet-5        # or claude-opus-5-5 (best quality, costs more) / claude-haiku-4-5 (cheapest)
   max_words: 80
   extra_instructions: >-
     Congratulate them on the round in a few words, then connect it to the growth plan the round

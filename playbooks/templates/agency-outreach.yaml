@@ -103,7 +103,7 @@ scoring:
 writer:
   type: ai
   provider: anthropic           # or: openai (model gpt-5-mini, key OPENAI_API_KEY)
-  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  model: claude-sonnet-5        # or claude-opus-5-5 (best quality, costs more) / claude-haiku-4-5 (cheapest)
   max_words: 85
   extra_instructions: >-
     The job post is the reason for writing: they are hiring for sales / business development,

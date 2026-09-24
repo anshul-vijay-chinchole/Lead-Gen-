@@ -108,7 +108,7 @@ scoring:
 writer:
   type: ai
   provider: anthropic           # or: openai (then model: gpt-5-mini, key OPENAI_API_KEY)
-  model: claude-opus-5          # claude-sonnet-5 is cheaper
+  model: claude-sonnet-5        # or claude-opus-5-5 (best quality, costs more) / claude-haiku-4-5 (cheapest)
   tone: friendly, direct, peer-to-peer; no hype
   max_words: 90
   extra_instructions: >-

@@ -291,10 +291,15 @@ class Pipeline:
         max_write = int(pb.writer.get("max_leads") or 0) or len(leads)
         writer = build_writer(ctx)
         written_emails: set = set()
+        write_state: Dict[str, Dict[str, Any]] = {}
         for lead in leads:
             if written >= max_write:
                 break
             if lead.tier not in w_tiers or not self.email_ok(lead.contact):
+                continue
+            reason = self.block_reason(lead, write_state)
+            if reason:  # would never be handed over: don't spend the writer (LLM) on it
+                lead.notes.append(reason)
                 continue
             em = lead.contact.email.strip().lower()
             if em in written_emails:  # same person under two company records: keep the best-scored
@@ -366,43 +371,54 @@ class Pipeline:
                {"run_id": run_id, "counts": counts})
         return result
 
-    def outbound_leads(self, leads: List[Lead]) -> List[Lead]:
-        """Leads that may be handed to a sending tool."""
+    def block_reason(self, lead: Lead, company_state: Dict[str, Dict[str, Any]]) -> Optional[str]:
+        """Why this lead must NOT be handed over (None = it may be).
+
+        Shared by the WRITE stage (so no copy - and no LLM spend - is produced for
+        people who will never be emailed) and by ``outbound_leads``.
+        """
         pb, store, ctx = self.pb, self.ctx.store, self.ctx
-        tiers = set(pb.outbound.get("tiers") or [Tier.HOT, Tier.NORMAL])
-        seen_emails: set = set()
-        dedupe_days = int(pb.outbound.get("dedupe_days") or 0)
+        ct = lead.contact
+        if pb.outbound.get("require_email", True) and not self.email_ok(ct):
+            return "no deliverable email"
+        key = lead.company.key
+        if key not in company_state:
+            company_state[key] = store.company_engagement(key, pb.name, exclude_run_id=getattr(self, "run_id", ""))
+        eng = company_state[key]
+        if eng["stages"] & {Stage.REPLIED, Stage.POSITIVE, Stage.BOOKED, Stage.WON, Stage.LOST}:
+            return "company already engaged (replied / lost) - not re-contacted"
+        if ct and ct.email:
+            if store.is_suppressed(email=ct.email, domain=lead.company.domain):
+                return "suppressed"
+            if excluded_domain(ct.email, ctx):
+                return "email at an excluded domain"
+            if store.was_exported(lead.id):
+                return "already handed over"
+            dedupe_days = int(pb.outbound.get("dedupe_days") or 0)
+            if store.recently_contacted(ct.email, dedupe_days, ctx.today, exclude_lead_id=lead.id):
+                return f"contacted in the last {dedupe_days} days"
         cooldown = int(pb.outbound.get("company_cooldown_days") or 0)
-        engaged_stages = {Stage.REPLIED, Stage.POSITIVE, Stage.BOOKED, Stage.WON, Stage.LOST}
-        run_id = getattr(self, "run_id", "")
+        last = eng["last_exported"]
+        if cooldown and last and (ctx.today - last).days < cooldown:
+            return f"company contacted {(ctx.today - last).days}d ago (cooldown {cooldown}d)"
+        return None
+
+    def outbound_leads(self, leads: List[Lead]) -> List[Lead]:
+        """Leads that may be handed to a sending tool (best score first, one per email)."""
+        tiers = set(self.pb.outbound.get("tiers") or [Tier.HOT, Tier.NORMAL])
         company_state: Dict[str, Dict[str, Any]] = {}
+        seen_emails: set = set()
         out = []
         for lead in leads:
-            ct = lead.contact
             if lead.tier not in tiers or not lead.messages:
                 continue
-            key = lead.company.key
-            if key not in company_state:
-                company_state[key] = store.company_engagement(key, pb.name, exclude_run_id=run_id)
-            eng = company_state[key]
-            if eng["stages"] & engaged_stages:
-                lead.notes.append("company already engaged (replied / lost) - not re-contacted")
+            reason = self.block_reason(lead, company_state)
+            if reason:
+                if reason not in lead.notes:
+                    lead.notes.append(reason)
                 continue
-            last = eng["last_exported"]
-            if cooldown and last and (ctx.today - last).days < cooldown and not store.was_exported(lead.id):
-                lead.notes.append(f"company contacted {(ctx.today - last).days}d ago (cooldown {cooldown}d)")
-                continue
-            if pb.outbound.get("require_email", True) and not self.email_ok(ct):
-                continue
+            ct = lead.contact
             if ct and ct.email:
-                if store.is_suppressed(email=ct.email, domain=lead.company.domain):
-                    continue
-                if excluded_domain(ct.email, ctx):
-                    continue
-                if store.was_exported(lead.id):
-                    continue
-                if store.recently_contacted(ct.email, dedupe_days, ctx.today, exclude_lead_id=lead.id):
-                    continue
                 em = ct.email.strip().lower()
                 if em in seen_emails:
                     lead.notes.append("same email as a higher-scored lead in this run - not re-contacted")

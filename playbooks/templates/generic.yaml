@@ -227,7 +227,7 @@ writer:
   type: template
   # For type ai: provider anthropic | openai | openai_compatible, plus a model.
   provider: ""          # e.g. anthropic (key: ANTHROPIC_API_KEY) or openai (OPENAI_API_KEY)
-  model: ""             # e.g. claude-opus-5 (claude-sonnet-5 costs less) / gpt-5-mini
+  model: ""             # e.g. claude-sonnet-5 (or claude-opus-5-5 / claude-haiku-4-5) or gpt-5-mini
   base_url: ""          # only for openai_compatible, e.g. https://openrouter.ai/api/v1
   api_key_env: ""       # env var holding the key, when not the provider's default
   temperature: null     # leave empty; many current models ignore or reject it

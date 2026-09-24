@@ -57,6 +57,8 @@ def test_run_exports_and_review_sheet_shows_final_stage(make_ctx, tmp_path):
     # second run: nobody is handed over twice
     res2 = Pipeline(ctx, out_dir=tmp_path / "out").run()
     assert res2.counts["exported"] == 0
+    assert res2.counts["written"] == 0            # no copy (no LLM spend) for people already handed over
+    assert any("already handed over" in n for ld in res2.leads for n in ld.notes)
 
 
 def test_colleague_not_emailed_after_unsubscribe_or_within_cooldown(make_ctx, tmp_path):
