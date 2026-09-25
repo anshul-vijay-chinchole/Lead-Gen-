@@ -281,6 +281,8 @@ class _Drops:
         self.excluded: Counter = Counter()
         self.no_match = 0
         self.too_old = 0
+        self.reposted = 0
+        self.undated = 0
 
     def reason(self, match_keywords: List[str], max_age: Optional[int], types: List[str]) -> str:
         if self.total == 0:
@@ -305,6 +307,10 @@ class _Drops:
             parts.append(f"{self.no_match} not matching")
         if self.too_old:
             parts.append(f"{self.too_old} older than {max_age} days")
+        if self.reposted:
+            parts.append(f"{self.reposted} re-posted (stale listing)")
+        if self.undated:
+            parts.append(f"{self.undated} without a posting date")
         if not parts:
             return base
         found = f"{self.total} signal{'s' if self.total != 1 else ''} found"
@@ -327,7 +333,9 @@ def process_signals(companies: List[Company], ctx: Any) -> Tuple[List[Company], 
     ``signals.match_keywords`` hit in the title (description as fallback
     unless ``signals.match_description`` is off); record the survivors in the
     store (sets ``first_seen`` / ``reposted``); drop signals older than
-    ``max_age_days``; sort primary first, then freshest (undated last).
+    ``max_age_days``; with ``signals.allow_undated`` off, drop primary signals
+    without a posting date; with ``signals.drop_reposts`` on, drop primary
+    signals detected as re-posted; sort primary first, then freshest (undated last).
 
     Several distinct postings with the same type + title that are live in the
     same batch (one role in several locations, or one ad seen by two sources)
@@ -346,6 +354,8 @@ def process_signals(companies: List[Company], ctx: Any) -> Tuple[List[Company], 
     match_desc = _flag(cfg.get("match_description"), True)
     exclude_kw = as_str_list(cfg.get("exclude_keywords"))
     max_age = _max_age(cfg)
+    drop_reposts = _flag(cfg.get("drop_reposts"), False)
+    allow_undated = _flag(cfg.get("allow_undated"), True)
     require = bool(cfg.get("require", True))
     store = getattr(ctx, "store", None)
 
@@ -390,9 +400,16 @@ def process_signals(companies: List[Company], ctx: Any) -> Tuple[List[Company], 
 
         live: List[Signal] = []
         for sig in survivors:
+            is_primary = _norm_type(sig.type) in primary
+            if is_primary and not allow_undated and sig.posted_at is None:
+                drops.undated += 1
+                continue
             age = sig.age_days(ctx.today)
             if max_age is not None and age is not None and age > max_age:
                 drops.too_old += 1
+                continue
+            if is_primary and drop_reposts and sig.reposted:
+                drops.reposted += 1
                 continue
             live.append(sig)
         live.sort(key=lambda s: _sort_key(s, primary, ctx.today))

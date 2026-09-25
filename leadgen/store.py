@@ -15,7 +15,29 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .models import Lead, Reply, Signal, Stage
-from .utils import normalize_domain
+from .utils import normalize_company_name, normalize_domain
+
+SUPPRESSION_KINDS = ("email", "domain", "company", "linkedin")
+
+
+def normalize_suppression(value: str, kind: str) -> str:
+    """Canonical form of a suppression value: emails lowercased, domains bare,
+    company names normalised ('The Acme Group, Inc.' -> 'acme'), LinkedIn URLs
+    lowercased without scheme / query / trailing slash."""
+    v = (value or "").strip()
+    if kind == "email":
+        return v.lower()
+    if kind == "domain":
+        return normalize_domain(v)
+    if kind == "company":
+        return normalize_company_name(v)
+    if kind == "linkedin":
+        v = v.lower().split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        for prefix in ("https://", "http://"):
+            if v.startswith(prefix):
+                v = v[len(prefix):]
+        return v[4:] if v.startswith("www.") else v
+    raise ValueError(f"kind must be one of {', '.join(SUPPRESSION_KINDS)}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -378,9 +400,10 @@ class Store:
 
     # --- suppression ----------------------------------------------------------------
     def suppress(self, value: str, kind: str = "email", reason: str = "") -> None:
-        if kind not in ("email", "domain"):
-            raise ValueError("kind must be 'email' or 'domain'")
-        v = value.strip().lower() if kind == "email" else normalize_domain(value)
+        """Global do-not-contact / do-not-list entry (kinds: email, domain, company, linkedin)."""
+        if kind not in SUPPRESSION_KINDS:
+            raise ValueError(f"kind must be one of {', '.join(SUPPRESSION_KINDS)}")
+        v = normalize_suppression(value, kind)
         if not v:
             return
         self.conn.execute("INSERT OR REPLACE INTO suppression (value, kind, reason, added_at) "
@@ -391,18 +414,23 @@ class Store:
         """Remove one suppression entry. ``kind`` defaults to email if the value has an '@'."""
         v = value.strip().lower()
         k = kind or ("email" if "@" in v else "domain")
-        v = v if k == "email" else normalize_domain(v)
+        v = normalize_suppression(v, k)
         cur = self.conn.execute("DELETE FROM suppression WHERE value=? AND kind=?", (v, k))
         self.conn.commit()
         return cur.rowcount
 
-    def is_suppressed(self, email: str = "", domain: str = "") -> bool:
+    def is_suppressed(self, email: str = "", domain: str = "", company: str = "",
+                      linkedin: str = "") -> bool:
         checks: List[tuple] = []
         if email:
             checks.append((email.strip().lower(), "email"))
             checks.append((normalize_domain(email), "domain"))
         if domain:
             checks.append((normalize_domain(domain), "domain"))
+        if company:
+            checks.append((normalize_company_name(company), "company"))
+        if linkedin:
+            checks.append((normalize_suppression(linkedin, "linkedin"), "linkedin"))
         for v, k in checks:
             if v and self.conn.execute("SELECT 1 FROM suppression WHERE value=? AND kind=?",
                                        (v, k)).fetchone():

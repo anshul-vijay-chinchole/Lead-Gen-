@@ -524,6 +524,8 @@ def check_icp(company: Company, ctx: Any) -> Optional[str]:
 
     if domain and store is not None and store.is_suppressed(domain=domain):
         return f"domain {domain} is on the suppression list"
+    if company.name and store is not None and store.is_suppressed(company=company.name):
+        return f"company {company.name} is on the suppression list"
 
     if domain:
         hit_domain = _domain_excluded(domain, as_str_list(icp.get("exclude_domains")))

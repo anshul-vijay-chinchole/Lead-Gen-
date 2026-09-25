@@ -334,7 +334,7 @@ def test_anthropic_request_shape_and_text(make_ctx):
     assert h["x-api-key"] == "sk-ant-test" and h["anthropic-version"] == "2023-06-01"
     assert h["content-type"] == "application/json" and "Authorization" not in h
     body = call["json"]
-    assert body == {"model": "claude-sonnet-5", "max_tokens": 800, "system": "You are a copywriter.",
+    assert body == {"model": "claude-opus-5", "max_tokens": 800, "system": "You are a copywriter.",
                     "messages": [{"role": "user", "content": "Write one line."}]}
     assert ctx.http.timeouts == [120.0]
 

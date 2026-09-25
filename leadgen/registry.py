@@ -16,6 +16,7 @@ _REGISTRY: Dict[str, Dict[str, str]] = {
         "csv": "leadgen.sources.csv_source:CsvSource",
         "json": "leadgen.sources.csv_source:JsonSource",
         "apify": "leadgen.sources.apify:ApifySource",
+        "linkedin_jobs": "leadgen.sources.apify:LinkedInJobsSource",
         "apollo": "leadgen.sources.apollo:ApolloSource",
         "adzuna": "leadgen.sources.adzuna:AdzunaSource",
         "theirstack": "leadgen.sources.theirstack:TheirStackSource",
@@ -63,6 +64,42 @@ _REGISTRY: Dict[str, Dict[str, str]] = {
 }
 
 
+# Adapter types whose requests cost money / credits ("paid lookups", see usage.py).
+PAID = frozenset({
+    ("source", "apollo"), ("source", "theirstack"), ("source", "apify"), ("source", "linkedin_jobs"),
+    ("finder", "apollo"), ("finder", "hunter"),
+    ("verifier", "millionverifier"), ("verifier", "zerobounce"), ("verifier", "neverbounce"),
+    ("verifier", "hunter"),
+    ("llm", "openai"), ("llm", "openai_compatible"), ("llm", "anthropic"),
+})
+
+# Adapters that scrape sites whose terms forbid it. Shown by `leadgen adapters`,
+# warned about by `validate` / at run time, and never used by the shipped default
+# playbooks. Apify is flagged per config (see risk_note).
+RISK_USE_AT_OWN_RISK = "use at own risk: scrapes a site whose terms forbid scraping"
+RISKS = {
+    ("source", "linkedin_jobs"): "use at own risk: scrapes LinkedIn via Apify (against LinkedIn's terms)",
+}
+_RISKY_APIFY_PRESETS = {"linkedin_jobs": "LinkedIn", "indeed_jobs": "Indeed"}
+
+
+def risk_note(kind: str, name: str, config: Any = None) -> str:
+    """'' or a 'use at own risk' note for this adapter (+ config)."""
+    if (kind, name) in RISKS:
+        return RISKS[(kind, name)]
+    if kind == "source" and name == "apify":
+        cfg = config if isinstance(config, dict) else {}
+        preset = str(cfg.get("preset") or "").lower()
+        actor = str(cfg.get("actor") or "").lower()
+        site = _RISKY_APIFY_PRESETS.get(preset) or next(
+            (label for key, label in (("linkedin", "LinkedIn"), ("indeed", "Indeed")) if key in actor), "")
+        if site:
+            return f"use at own risk: scrapes {site} via Apify (against {site}'s terms)"
+        if config is None:
+            return "scraper platform: the linkedin_jobs / indeed_jobs presets are use-at-own-risk"
+    return ""
+
+
 class UnknownAdapterError(KeyError):
     pass
 
@@ -92,5 +129,9 @@ def resolve(kind: str, name: str) -> Any:
 
 def create(kind: str, config: Dict[str, Any], ctx: Any) -> Any:
     """Instantiate the adapter named by ``config['type']``."""
-    cls = resolve(kind, str(config.get("type")))
-    return cls(dict(config), ctx)
+    name = str(config.get("type"))
+    cls = resolve(kind, name)
+    adapter = cls(dict(config), ctx)
+    adapter.adapter_kind, adapter.type_name = kind, name
+    adapter.paid = (kind, name) in PAID
+    return adapter

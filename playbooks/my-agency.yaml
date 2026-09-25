@@ -21,6 +21,10 @@
 # =============================================================================
 
 name: my-agency
+# Your OWN prospecting (finding agencies to sell the Hiring Signal Report to):
+# outbound mode keeps the email writer + Instantly/Smartlead hand-over available.
+# Switch to 'mode: delivery' if you only want the lead list.
+mode: outbound
 description: My agency's own outbound - B2B service firms hiring sales/BD -> founders and MDs.
 
 offer:
@@ -120,7 +124,7 @@ scoring:
 writer:
   type: ai
   provider: anthropic           # or: openai (model gpt-5-mini, key OPENAI_API_KEY)
-  model: claude-sonnet-5        # or claude-opus-5-5 (best quality, costs more) / claude-haiku-4-5 (cheapest)
+  model: claude-opus-5          # or claude-sonnet-5 / claude-haiku-4-5 (cheaper), claude-opus-5-5
   max_words: 85
   extra_instructions: >-
     The job post is the reason for writing: they are hiring for sales / business development,

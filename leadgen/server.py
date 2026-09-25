@@ -240,7 +240,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def make_server(ctx: Any, host: str = "127.0.0.1", port: int = 8787,
                 token: Optional[str] = None) -> WebhookServer:
     """Create (and bind) the webhook server. ``port=0`` picks a free port
-    (read it back from ``server.server_address``). Call ``serve_forever()`` to run it."""
+    (read it back from ``server.server_address``). Call ``serve_forever()`` to run it.
+    Outbound mode only: raises ``modes.OutboundOnlyError`` for a delivery-mode playbook."""
+    from .modes import require_outbound
+    require_outbound(ctx, "The reply webhook server")
     if ctx.store is None:
         raise RuntimeError("make_server needs ctx.store (a leadgen.store.Store)")
     return WebhookServer((host, int(port)), WebhookHandler, ctx, token=token)

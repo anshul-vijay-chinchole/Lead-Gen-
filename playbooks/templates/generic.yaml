@@ -34,6 +34,12 @@
 # A short name: letters, digits, "-", "_" and "." only. Used to tag everything
 # this playbook stores, and as the output folder name.
 name: generic
+# Run mode (default: delivery).
+#   delivery - find -> filter -> decision-maker -> email check -> score -> lead files.
+#              Nothing is written or sent; replies / serve / followups are off.
+#   outbound - adds the email writer, hand-over to Instantly / Smartlead / webhooks,
+#              reply handling, follow-ups and the reply webhook server.
+mode: delivery
 description: Reference playbook - copy it and replace the example values.
 
 # -----------------------------------------------------------------------------

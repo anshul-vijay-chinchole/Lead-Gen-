@@ -3,6 +3,16 @@
 ``Pipeline(ctx).run()`` executes one full run for the playbook in ``ctx`` and
 returns a ``RunResult``. Every stage is defensive: one broken source or a
 missing API key logs an error and the run carries on with what it has.
+
+Modes (``playbook.mode``):
+  * ``delivery`` (default) - the run stops after SCORE + review export: no email
+    copy is written (WRITE is skipped) and hand-over exporters (Instantly,
+    Smartlead, upload CSVs, webhooks) are never built. Lead files only.
+  * ``outbound`` - the full outreach line, WRITE + hand-over included.
+
+``PipelineHooks`` let a caller (the client delivery layer) drop companies /
+jobs / contacts that must not appear - e.g. already delivered to this client -
+right after the ICP filter, before any paid enrichment is spent on them.
 """
 from __future__ import annotations
 
@@ -14,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import registry
 from .context import Context, MissingCredentialError
+from .modes import is_outbound
 from .contacts import ContactWaterfall, select_contacts
 from .filters import apply_icp, excluded_domain
 from .http import HttpError, redact
@@ -22,6 +33,7 @@ from .notify import notify
 from .outbound.base import ExportResult
 from .scoring import score, tier_for
 from .signals import process_signals
+from .usage import BudgetExceeded
 from .utils import normalize_company_name
 from .writer import build_writer
 
@@ -38,9 +50,35 @@ class RunResult:
     rejected: List[Dict[str, str]] = field(default_factory=list)
     exports: List[ExportResult] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    mode: str = "delivery"
+    usage: List[str] = field(default_factory=list)   # UsageMeter.summary_lines()
 
     def summary(self) -> str:
         c = self.counts
+        if self.mode != "outbound":
+            lines = [
+                f"Run {self.run_id} ({self.playbook}, delivery mode: lead files only - nothing is written or sent)",
+                f"  sourced companies ....... {c.get('sourced', 0)}",
+                f"  with a live signal ...... {c.get('with_signal', 0)}",
+                f"  match the ICP ........... {c.get('qualified', 0)}",
+            ]
+            if c.get("hook_rejected"):
+                lines.append(f"  removed (already delivered / suppressed) ... {c.get('hook_rejected', 0)}")
+            lines += [
+                f"  decision-maker found .... {c.get('enriched', 0)}",
+                f"  email verified .......... {c.get('verified', 0)}",
+                f"  hot / normal / skip ..... {c.get('hot', 0)} / {c.get('normal', 0)} / {c.get('skip', 0)}",
+                f"  output .................. {self.out_dir}",
+            ]
+            for e in self.exports:
+                lines.append(f"    - {e.exporter}: {e.count} {e.path or e.detail}".rstrip())
+            lines += [f"  {u}" for u in self.usage]
+            lines += [f"  warning: {w}" for w in self.warnings]
+            if self.errors:
+                lines.append(f"  errors ({len(self.errors)}):")
+                lines += [f"    ! {e}" for e in self.errors]
+            return "\n".join(lines)
         lines = [
             f"Run {self.run_id} ({self.playbook})",
             f"  sourced companies ....... {c.get('sourced', 0)}",
@@ -55,10 +93,29 @@ class RunResult:
         ]
         for e in self.exports:
             lines.append(f"    - {e.exporter}: {e.count} {e.path or e.detail}".rstrip())
+        lines += [f"  {u}" for u in self.usage]
+        lines += [f"  warning: {w}" for w in self.warnings]
         if self.errors:
             lines.append(f"  errors ({len(self.errors)}):")
             lines += [f"    ! {e}" for e in self.errors]
         return "\n".join(lines)
+
+
+class PipelineHooks:
+    """Optional per-run filters. Subclass and override; the defaults keep everything.
+
+    ``filter_company`` runs right after the ICP filter (before enrichment, so no
+    paid lookups are spent on companies that will be dropped). It may remove
+    signals from ``company.signals`` (e.g. jobs already delivered); return a
+    reason to drop the whole company. ``filter_contact`` runs before a contact
+    is verified and again once its email is known; return a reason to skip it.
+    """
+
+    def filter_company(self, company: Company) -> Optional[str]:
+        return None
+
+    def filter_contact(self, company: Company, contact: Contact) -> Optional[str]:
+        return None
 
 
 def merge_companies(companies: List[Company]) -> List[Company]:
@@ -84,13 +141,22 @@ def merge_companies(companies: List[Company]) -> List[Company]:
 
 
 class Pipeline:
-    def __init__(self, ctx: Context, out_dir: Optional[Path] = None, limit: Optional[int] = None):
+    def __init__(self, ctx: Context, out_dir: Optional[Path] = None, limit: Optional[int] = None,
+                 hooks: Optional[PipelineHooks] = None):
         self.ctx = ctx
         self.pb = ctx.playbook
         self.limit = limit
+        self.hooks = hooks
         self.base_out = Path(out_dir) if out_dir else Path("output") / self.pb.name
         self.errors: List[str] = []
+        self.warnings: List[str] = []
         self.rejected: List[Dict[str, str]] = []
+        self.outbound = is_outbound(ctx)
+
+    def _warn(self, msg: str) -> None:
+        if msg not in self.warnings:
+            self.warnings.append(msg)
+            self.ctx.log.warning(msg)
 
     # --- helpers --------------------------------------------------------------
     def _err(self, where: str, e: Exception) -> None:
@@ -123,6 +189,8 @@ class Pipeline:
                 got = src.fetch()
                 self.ctx.log.info("source %s: %d companies", label, len(got))
                 companies.extend(got)
+            except BudgetExceeded as e:
+                self._warn(f"source {label} stopped: {e}")
             except (MissingCredentialError, HttpError, registry.UnknownAdapterError, OSError, ValueError) as e:
                 self._err(f"source {label}", e)
         return merge_companies(companies)
@@ -162,8 +230,12 @@ class Pipeline:
         if not candidates or verifier is None:
             return
         best: Optional[Tuple[str, str]] = None
+        meter = getattr(self.ctx, "usage", None)
         for email in candidates[: max(1, MAX_CANDIDATES_TO_VERIFY)]:
             status = store.get_verification(email, today=self.ctx.today) if store else None
+            if status is None and meter is not None and meter.exhausted and getattr(verifier, "paid", False):
+                self._warn("paid-lookup budget reached: remaining emails checked with the free basic checker")
+                verifier = registry.create("verifier", {"type": "basic"}, self.ctx)
             if status is None:
                 try:
                     res = verifier.verify(email)
@@ -212,6 +284,18 @@ class Pipeline:
             self._reject(c, "icp", reason)
         counts["qualified"] = len(companies)
 
+        # 3b. HOOKS (e.g. already delivered to this client) - before any paid lookup
+        if self.hooks is not None:
+            kept: List[Company] = []
+            for c in companies:
+                reason = self.hooks.filter_company(c)
+                if reason:
+                    self._reject(c, "delivery", reason)
+                else:
+                    kept.append(c)
+            counts["hook_rejected"] = len(companies) - len(kept)
+            companies = kept
+
         # 4. PRE-SCORE + enrichment budget (spend credits on the best accounts first)
         prescored = sorted(((score(c, None, ctx).total, c) for c in companies),
                            key=lambda t: t[0], reverse=True)
@@ -227,10 +311,16 @@ class Pipeline:
         per_company = int(pb.buyers.get("max_contacts_per_company") or 1)
         leads: List[Lead] = []
         enriched_n = 0
+        meter = getattr(ctx, "usage", None)
         for i, (pre, company) in enumerate(prescored):
             if i < budget and pre >= min_pre:
+                if meter is not None and meter.exhausted:
+                    self._warn(f"paid-lookup budget of {meter.max_paid_lookups} reached: "
+                               f"no more contact lookups this run")
                 try:
                     waterfall.enrich(company)
+                except BudgetExceeded as e:
+                    self._warn(f"enrichment stopped: {e}")
                 except Exception as e:  # noqa: BLE001 - never lose the run to one company
                     self._err(f"enrich {company.name}", e)
             chosen = select_contacts(company, ctx, limit=per_company * 3)
@@ -239,11 +329,16 @@ class Pipeline:
             for contact in chosen:
                 if good >= per_company:
                     break  # enough deliverable people: don't spend verification credits on the rest
-                if store.is_suppressed(email=contact.email):
+                if store.is_suppressed(email=contact.email, linkedin=contact.linkedin_url):
+                    continue
+                if self.hooks is not None and self.hooks.filter_contact(company, contact):
                     continue
                 if not contact.email or contact.email_status == EmailStatus.UNKNOWN:
                     self.verify_contact(contact, verifier)
                     if contact.email and store.is_suppressed(email=contact.email):
+                        continue
+                    if (contact.email and self.hooks is not None
+                            and self.hooks.filter_contact(company, contact)):
                         continue
                 accepted.append(contact)
                 good += 1 if self.email_ok(contact) else 0
@@ -276,7 +371,7 @@ class Pipeline:
                 else:
                     lead.notes.append("no email found")
                 note = f"contacted in the last {dedupe_days} days"
-                if ct.email and note not in lead.notes and store.recently_contacted(
+                if self.outbound and ct.email and note not in lead.notes and store.recently_contacted(
                         ct.email, dedupe_days, ctx.today, exclude_lead_id=lead.id):
                     lead.notes.append(note)
             else:
@@ -286,14 +381,14 @@ class Pipeline:
         for t in (Tier.HOT, Tier.NORMAL, Tier.SKIP):
             counts[t] = sum(1 for ld in leads if ld.tier == t)
 
-        # 8. WRITE
+        # 8. WRITE (outbound mode only: delivery mode never writes email copy)
         written = 0
         w_tiers = set(pb.writer.get("tiers") or [Tier.HOT, Tier.NORMAL])
         max_write = int(pb.writer.get("max_leads") or 0) or len(leads)
-        writer = build_writer(ctx)
+        writer = build_writer(ctx) if self.outbound else None
         written_emails: set = set()
         write_state: Dict[str, Dict[str, Any]] = {}
-        for lead in leads:
+        for lead in (leads if self.outbound else []):
             if written >= max_write:
                 break
             if lead.tier not in w_tiers or not lead.contact:
@@ -328,13 +423,18 @@ class Pipeline:
             store.save_lead(lead)
 
         # 9. EXPORT / SEND - hand-over exporters first, so review sheets written
-        # afterwards show the final stage of every lead.
-        outbound = self.outbound_leads(leads)
+        # afterwards show the final stage of every lead. Delivery mode: review
+        # exporters only - a hand-over exporter is never even constructed.
+        outbound = self.outbound_leads(leads) if self.outbound else []
         exports: List[ExportResult] = []
         handed: set = set()
         built = []
         for cfg in pb.outbound.get("exporters") or []:
             if cfg.get("enabled") is False:
+                continue
+            if not self.outbound and self._is_handover_type(str(cfg.get("type"))):
+                self._warn(f"exporter '{cfg.get('type')}' hands leads to a sending tool - skipped "
+                           f"(delivery mode; set 'mode: outbound' to use it)")
                 continue
             try:
                 exp = self._make("exporter", cfg)
@@ -342,6 +442,9 @@ class Pipeline:
                 self._err(f"exporter {cfg.get('type')}", e)
                 continue
             if exp is not None:
+                if not self.outbound and getattr(exp, "scope", "all") == "outbound":
+                    self._warn(f"exporter '{cfg.get('type')}' skipped (delivery mode)")
+                    continue
                 built.append((cfg, exp))
         built.sort(key=lambda t: 0 if getattr(t[1], "scope", "all") == "outbound" else 1)
         for cfg, exp in built:
@@ -367,14 +470,27 @@ class Pipeline:
                 lead.stage = Stage.EXPORTED
         counts["exported"] = len(handed)
         counts["outbound_eligible"] = len(outbound)
+        if meter is not None:
+            counts["paid_lookups"] = meter.paid_lookups
 
-        self._write_run_files(out_dir, leads, counts)
+        usage_lines = meter.summary_lines() if meter is not None else []
+        self._write_run_files(out_dir, leads, counts, usage=meter.rows() if meter is not None else [])
         store.finish_run(run_id, counts)
         result = RunResult(run_id=run_id, playbook=pb.name, out_dir=out_dir, counts=counts,
-                           leads=leads, rejected=self.rejected, exports=exports, errors=self.errors)
+                           leads=leads, rejected=self.rejected, exports=exports, errors=self.errors,
+                           warnings=self.warnings, mode=pb.mode, usage=usage_lines)
         notify(ctx, "run_summary", f"Run finished: {pb.name}", result.summary(),
                {"run_id": run_id, "counts": counts})
         return result
+
+    @staticmethod
+    def _is_handover_type(name: str) -> bool:
+        """Exporter types that hand leads to a sending tool (checked without importing them)."""
+        try:
+            cls = registry.resolve("exporter", name)
+        except Exception:  # noqa: BLE001 - unknown types are reported when built
+            return False
+        return getattr(cls, "scope", "all") == "outbound"
 
     def block_reason(self, lead: Lead, company_state: Dict[str, Dict[str, Any]]) -> Optional[str]:
         """Why this lead must NOT be handed over (None = it may be).
@@ -432,13 +548,15 @@ class Pipeline:
             out.append(lead)
         return out
 
-    def _write_run_files(self, out_dir: Path, leads: List[Lead], counts: Dict[str, int]) -> None:
+    def _write_run_files(self, out_dir: Path, leads: List[Lead], counts: Dict[str, int],
+                         usage: Optional[List[Dict[str, Any]]] = None) -> None:
         with open(out_dir / "rejected.csv", "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=["company", "domain", "stage", "reason"])
             w.writeheader()
             w.writerows(self.rejected)
         (out_dir / "summary.json").write_text(json.dumps({
-            "playbook": self.pb.name, "counts": counts, "errors": self.errors,
+            "playbook": self.pb.name, "mode": self.pb.mode, "counts": counts, "errors": self.errors,
+            "warnings": self.warnings, "usage": usage or [],
             "top": [{"company": ld.company.name, "score": ld.score, "tier": ld.tier,
                      "contact": ld.contact.full_name if ld.contact else ""} for ld in leads[:20]],
         }, indent=2), encoding="utf-8")

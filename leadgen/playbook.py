@@ -40,9 +40,16 @@ class PlaybookError(ValueError):
     """Raised when a playbook is missing or invalid."""
 
 
+MODES = ("delivery", "outbound")
+
 DEFAULTS: Dict[str, Any] = {
     "name": "",
     "description": "",
+    # delivery (default): find -> filter -> enrich -> verify -> score -> export lead files.
+    #   No email copy is written, nothing is handed to a sending tool, no replies.
+    # outbound: the full outreach engine (write sequences, hand over to Instantly /
+    #   Smartlead, reply handling, follow-ups, webhook server).
+    "mode": "delivery",
     "offer": {
         "sender_name": "",
         "sender_title": "",
@@ -80,6 +87,8 @@ DEFAULTS: Dict[str, Any] = {
         "urgency_keywords": ["urgent", "immediate", "immediately", "asap", "start now", "quick start"],
         "stale_after_days": 21,   # a signal still open this long = hard-to-fill / persistent need
         "match_description": True,  # match_keywords may also hit the signal description
+        "drop_reposts": False,    # drop primary signals detected as re-posted (stale listings)
+        "allow_undated": True,    # False: drop primary signals without a posting date
     },
     "buyers": {
         "titles": [],             # priority order: first = best
@@ -164,6 +173,23 @@ DEFAULTS: Dict[str, Any] = {
         "on": ["positive", "referral", "question", "run_summary"],
     },
     "storage": {"path": "data/leadgen.db"},
+    # Branding + defaults for client deliveries (leadgen deliver). Clients may override.
+    "delivery": {
+        "brand_name": "Hiring Signal Report",
+        "brand_color": "#1f4e79",
+        "sender_name": "",
+        "sender_email": "",
+        "website": "",
+        "logo_url": "",
+        "footer": "",
+    },
+    # Cost control. A "paid lookup" = one request to a paid provider (Apollo, Hunter,
+    # TheirStack, Apify, the email verifiers, AI APIs).
+    "usage": {
+        "max_paid_lookups": 0,    # per run; 0 = no cap (the --budget flag overrides)
+        "cost_per_call": {},      # {adapter type: USD per paid request}, for cost estimates
+        "llm_price_per_mtok": {}, # {model: {input: USD, output: USD}} per million tokens
+    },
 }
 
 _LIST_OF_DICT_SECTIONS = ("sources",)
@@ -211,6 +237,9 @@ class Playbook:
     replies: Dict[str, Any]
     notify: Dict[str, Any]
     storage: Dict[str, Any]
+    mode: str = "delivery"
+    delivery: Dict[str, Any] = field(default_factory=dict)
+    usage: Dict[str, Any] = field(default_factory=dict)
     path: Optional[Path] = None
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -262,8 +291,10 @@ def validate(data: Dict[str, Any]) -> List[str]:
         errs.append("'name' is required")
     elif not re.match(r"^[A-Za-z0-9_.-]+$", str(data["name"])):
         errs.append("'name' may only contain letters, digits, '-', '_' and '.'")
+    if data.get("mode") not in MODES:
+        errs.append(f"'mode' must be one of {', '.join(MODES)} (got {data.get('mode')!r})")
     for key in ("offer", "icp", "signals", "buyers", "enrichment", "scoring", "writer",
-                "outbound", "replies", "notify", "storage"):
+                "outbound", "replies", "notify", "storage", "delivery", "usage"):
         if not isinstance(data.get(key), dict):
             errs.append(f"'{key}' must be a mapping")
     if not isinstance(data.get("sources"), list):
@@ -334,6 +365,15 @@ def validate(data: Dict[str, Any]) -> List[str]:
     for i, e in enumerate(_as_list(data["notify"].get("channels"))):
         if not isinstance(e, dict) or not e.get("type"):
             errs.append(f"notify.channels[{i}] must be a mapping with a 'type'")
+    mpl = data["usage"].get("max_paid_lookups")
+    if not isinstance(mpl, int) or isinstance(mpl, bool) or mpl < 0:
+        errs.append("usage.max_paid_lookups must be an integer >= 0 (0 = no cap)")
+    for k in ("cost_per_call", "llm_price_per_mtok"):
+        if not isinstance(data["usage"].get(k) or {}, dict):
+            errs.append(f"usage.{k} must be a mapping")
+    color = str(data["delivery"].get("brand_color") or "")
+    if color and not re.match(r"^#[0-9A-Fa-f]{6}$", color):
+        errs.append("delivery.brand_color must be a hex colour like #1f4e79")
     if data["replies"].get("classifier") not in ("auto", "rules", "ai"):
         errs.append("replies.classifier must be auto, rules or ai")
     return errs
@@ -369,6 +409,9 @@ def from_dict(data: Dict[str, Any], path: Optional[Path] = None,
         replies=merged["replies"],
         notify=merged["notify"],
         storage=merged["storage"],
+        mode=str(merged["mode"]),
+        delivery=merged["delivery"],
+        usage=merged["usage"],
         path=path,
         raw=data,
     )

@@ -36,7 +36,7 @@ with embedded whitespace / control characters raises ``MissingCredentialError``.
 
 Config keys
 -----------
-model              Model id (default ``claude-sonnet-5``).
+model              Model id (default ``claude-opus-5``).
 base_url           Endpoint override. Accepts the API root
                    (``https://api.anthropic.com``), the ``/v1`` root, or the full
                    ``.../v1/messages`` URL (e.g. for a gateway / proxy).
@@ -87,7 +87,7 @@ class AnthropicClient(LLMClient):
 
     name = "anthropic"
     env_key = "ANTHROPIC_API_KEY"
-    default_model = "claude-sonnet-5"
+    default_model = "claude-opus-5"
 
     @property
     def endpoint(self) -> str:

@@ -20,7 +20,10 @@ TODAY = date(2026, 9, 24)
 
 
 def build_ctx(env: Optional[Dict[str, str]] = None, dry_run: bool = False, **overrides: Any) -> Context:
-    data: Dict[str, Any] = {"name": "test"}
+    # The module tests exercise the outbound features (writer, replies, hand-over),
+    # so the fixture defaults to mode: outbound. Delivery tests pass mode="delivery";
+    # tests/test_modes.py pins the engine's real default (delivery).
+    data: Dict[str, Any] = {"name": "test", "mode": "outbound"}
     data.update(overrides)
     pb = from_dict(data, env=env or {})
     return Context(playbook=pb, http=FakeHttp(), store=Store(":memory:"), env=dict(env or {}),

@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import registry
 from .context import MissingCredentialError
+from .usage import BudgetExceeded
 from .filters import excluded_domain
 from .http import HttpError, redact
 from .models import Company, Contact, EmailStatus
@@ -555,6 +556,10 @@ class ContactWaterfall:
                                   company.name, added)
                 if not self.satisfied(company):
                     self._complete(slot, company)
+            except BudgetExceeded as e:
+                # the run's paid-lookup budget is spent: switch this paid finder off quietly
+                # (free finders such as pattern keep running; the pipeline reports the budget)
+                slot.disabled = str(e)
             except MissingCredentialError as e:
                 self._error(slot.label, e)
                 slot.disabled = redact(str(e))

@@ -17,6 +17,9 @@
 # =============================================================================
 
 name: local-business
+# Outreach template: writes email sequences and hands them to a sending tool.
+# (For lead delivery to clients use playbooks/recruitment-delivery.yaml.)
+mode: outbound
 description: Local businesses from Google Maps (review signals) -> owners and managers.
 
 offer:

@@ -838,7 +838,7 @@ def test_ai_writer_end_to_end_anthropic(make_ctx):
                "usage": {"input_tokens": 900, "output_tokens": 700}}
     ctx.http.add("POST", "https://api.anthropic.com/v1/messages", json=payload)
     out = build_writer(ctx).write(make_lead())
-    assert out.writer == "ai:claude-sonnet-5" and out.warnings == []
+    assert out.writer == "ai:claude-opus-5" and out.warnings == []
     body = ctx.http.calls[0]["json"]
     assert body["max_tokens"] == 4000 and len(body["messages"]) == 1
     assert "single JSON object and nothing else" in body["system"]

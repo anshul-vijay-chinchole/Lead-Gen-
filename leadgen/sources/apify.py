@@ -316,6 +316,10 @@ class ApifySource(Source):
             self.log.info("dry-run: source %s (Apify) skipped", self.label)
             return []
         self.validate()
+        from ..registry import risk_note
+        risk = risk_note("source", self.type_name or self.name, self.config)
+        if risk.startswith("use at own risk"):
+            self.log.warning("source %s: %s", self.label, risk)
         items = self.fetch_items()
         if not items:
             self.log.warning("source %s: Apify returned no items", self.label)
@@ -335,3 +339,18 @@ class ApifySource(Source):
 
 
 __all__ = ["ApifySource", "PRESETS", "guess_preset", "guess_preset_from_items"]
+
+
+class LinkedInJobsSource(ApifySource):
+    """LinkedIn job posts via an Apify actor - USE AT OWN RISK (scraping is against LinkedIn's terms).
+
+    Same config as ``apify`` with ``preset: linkedin_jobs`` forced. Never used by
+    the shipped default playbooks; prefer greenhouse / lever / ashby, adzuna,
+    theirstack or your own imports.
+    """
+
+    name = "linkedin_jobs"
+
+    @property
+    def preset(self) -> str:
+        return "linkedin_jobs"

@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from .http import HttpClient
 from .playbook import Playbook
+from .usage import UsageMeter
 
 
 class MissingCredentialError(RuntimeError):
@@ -26,12 +27,15 @@ class Context:
     today: date = field(default_factory=date.today)
     log: logging.Logger = field(default_factory=lambda: logging.getLogger("leadgen"))
     dry_run: bool = False            # no paid API calls / no sending; stages that need them are skipped
+    usage: Any = None                # UsageMeter: API calls per adapter + the paid-lookup budget
     _llm: Any = None
     _llm_loaded: bool = False
 
     def __post_init__(self) -> None:
         if self.http is None:
             self.http = HttpClient()
+        if self.usage is None:
+            self.usage = UsageMeter.from_playbook(self.playbook)
 
     @property
     def llm(self) -> Any:
@@ -69,9 +73,21 @@ class Adapter:
         self.config = config or {}
         self.ctx = ctx
 
+    # Set by registry.create: the adapter's kind + type, and whether its requests
+    # are paid lookups (registry.PAID). Adapters built by hand default to free.
+    adapter_kind: str = ""
+    type_name: str = ""
+    paid: bool = False
+
     @property
     def http(self) -> Any:
-        return self.ctx.http
+        """``ctx.http`` wrapped in the usage meter (counts calls, enforces the budget)."""
+        meter = getattr(self.ctx, "usage", None)
+        if meter is None:
+            return self.ctx.http
+        from .usage import MeteredHttp
+        return MeteredHttp(self.ctx.http, meter, self.adapter_kind or "adapter",
+                           self.type_name or self.name, bool(self.paid))
 
     @property
     def log(self) -> logging.Logger:

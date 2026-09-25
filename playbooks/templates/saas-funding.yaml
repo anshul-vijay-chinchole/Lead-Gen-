@@ -15,6 +15,9 @@
 # =============================================================================
 
 name: saas-funding
+# Outreach template: writes email sequences and hands them to a sending tool.
+# (For lead delivery to clients use playbooks/recruitment-delivery.yaml.)
+mode: outbound
 description: Recently funded B2B SaaS companies -> founders and heads of growth.
 
 offer:
@@ -92,7 +95,7 @@ scoring:
 writer:
   type: ai
   provider: anthropic
-  model: claude-sonnet-5        # or claude-opus-5-5 (best quality, costs more) / claude-haiku-4-5 (cheapest)
+  model: claude-opus-5          # or claude-sonnet-5 / claude-haiku-4-5 (cheaper), claude-opus-5-5
   max_words: 80
   extra_instructions: >-
     Congratulate them on the round in a few words, then connect it to the growth plan the round

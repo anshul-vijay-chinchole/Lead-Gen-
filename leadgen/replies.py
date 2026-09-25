@@ -1930,7 +1930,10 @@ def handle_reply(reply: Reply, ctx: Any) -> Reply:
     See the module docstring for the action taken per category. Returns the
     (mutated) reply with ``lead_id``, classification, ``suggested_reply`` and a
     readable ``action`` string filled in. Requires ``ctx.store``.
+    Outbound mode only: raises ``modes.OutboundOnlyError`` for a delivery-mode playbook.
     """
+    from .modes import require_outbound
+    require_outbound(ctx, "Reply handling")
     store, pb = ctx.store, ctx.playbook
     if store is None:
         raise RuntimeError("handle_reply needs ctx.store (a leadgen.store.Store)")

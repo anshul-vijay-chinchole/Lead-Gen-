@@ -19,6 +19,9 @@
 # =============================================================================
 
 name: demo-offline
+# Outbound demo: writes email sequences + upload files, handles replies.
+# (The engine's default is 'delivery' - lead files only. See playbooks/demo-delivery.yaml.)
+mode: outbound
 description: Offline demo - a recruitment agency finding companies hiring finance + engineering roles.
 
 # --- Who we are and what we offer (used in every email) ----------------------
