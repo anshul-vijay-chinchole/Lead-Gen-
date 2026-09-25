@@ -1,0 +1,143 @@
+# =============================================================================
+#  demo-delivery - try the Hiring Signal Report with ZERO API keys and zero cost
+# =============================================================================
+#  The same shape as playbooks/recruitment-delivery.yaml, but 100% offline:
+#    - job postings come from a sample CSV (examples/data/demo_jobs.csv),
+#    - decision-makers from a second CSV (examples/data/demo_delivery_contacts.csv),
+#      plus free email-pattern guessing for people without an email,
+#    - emails are only checked offline (the free "basic" checker).
+#  Every company, person and domain in the sample data is made up, and the
+#  dates are written like "2 days ago", so the demo never goes stale.
+#
+#  Run it from the repository root:
+#
+#      leadgen deliver --client demo-client --dry-run   # preview the demo client's report
+#      leadgen deliver --client demo-client             # deliver it (recorded in the ledger)
+#      leadgen run -p playbooks/demo-delivery.yaml      # one run without a client
+#
+#  clients/demo-client.yaml ("Northstar Finance Recruiting") uses this file as
+#  its base playbook and narrows it to finance roles in a few US states + the UK.
+#  Without a client, this playbook finds finance AND engineering roles anywhere.
+#
+#  What the sample data shows (for the demo client):
+#    - fresh finance jobs in Texas, Illinois, New York, Georgia and the UK;
+#    - jobs too old for the 7-day window, a job without a date, and a re-posted
+#      ad (Lakeshore's "Cost Accountant": the new ad counts, the 24-day-old one not);
+#    - companies left out: another staffing agency, one too small, ones in other
+#      states / countries, an intern-only posting, the client's own clients;
+#    - every email label: verified, risky (catch-all or never checked),
+#      guessed-unverified (built from a name pattern) and not found;
+#    - a few funding rounds (bonus points), and one start-up whose only news is
+#      a funding round (never delivered: no matching job);
+#    - a company without a website (its decision-maker has a LinkedIn profile
+#      but no email).
+#
+#  Start over: delete data/demo-delivery.db and the deliveries/demo-client/ folder.
+#  Lines starting with "#" are comments - the engine ignores them.
+# =============================================================================
+
+name: demo-delivery
+mode: delivery          # lead files only: nothing is written or sent
+description: Offline demo of the weekly Hiring Signal Report - made-up companies hiring finance and engineering roles.
+
+# --- The report's look (clients may change it under "branding:") ---------------
+delivery:
+  brand_name: Hiring Signal Report
+  brand_color: "#1f4e79"
+  sender_name: Alex Morgan                 # the (made-up) seller of the report
+  sender_email: alex@signalworks-demo.com
+  website: https://signalworks-demo.com
+  logo_url: ""
+  footer: "Demo report built from made-up sample data. Emails marked guessed-unverified were built from a name pattern."
+
+# --- Which companies count ----------------------------------------------------
+icp:
+  locations: []                            # anywhere (the demo client picks its own places)
+  exclude_locations: []
+  employees: {min: 20, max: 5000}
+  industries: []
+  # Other agencies are competitors of the agencies we sell to.
+  exclude_industries: [staffing, recruiting, recruitment]
+  exclude_keywords: [staffing agency, recruitment agency]
+  exclude_domains: []
+  require_domain: false                    # a company without a website is still a lead
+  unknown_passes: true
+
+# --- Signals: a fresh job posting for a role the client fills -------------------
+signals:
+  types: [job_posting, funding]            # funding rounds only add bonus points
+  primary: [job_posting]
+  require: true
+  match_keywords: [accountant, accounting, controller, financial analyst, finance manager,
+                   finance director, head of finance, fp&a, accounts payable, accounts receivable,
+                   payroll, bookkeeper,
+                   software engineer, backend engineer, frontend engineer, full stack engineer,
+                   data engineer, devops engineer, platform engineer]
+  match_description: false                 # the job TITLE must name the role
+  exclude_keywords: [intern, internship, apprentice]
+  max_age_days: 7                          # only jobs posted in the last 7 days
+  allow_undated: false                     # no posting date = not provably fresh = left out
+  drop_reposts: true                       # old ads put up again are left out
+  stale_after_days: 21
+
+# --- Decision-makers, best first (the demo client uses its own buyer_titles) ------
+buyers:
+  titles: [CFO, VP Finance, Finance Director, Head of Finance, Financial Controller, Controller,
+           CTO, VP Engineering, Head of Engineering, Engineering Manager,
+           Head of Talent Acquisition, HR Director, Head of People, CEO, Founder]
+  exclude_titles: [intern, assistant, student, trainee]
+  max_contacts_per_company: 1
+  allow_generic_emails: false              # jobs@ / info@ are never named as the decision-maker
+
+# --- Where the jobs come from ------------------------------------------------------
+sources:
+  - type: csv
+    label: demo-jobs
+    path: examples/data/demo_jobs.csv
+    # Columns (recognised automatically): Company, Domain, Location, Industry,
+    # Employees, Job Title, Job URL, Date Posted, Job ID, Job Description,
+    # Latest Funding, Funding Amount, Funding Date.
+
+# --- Find the person, then check the email ------------------------------------------
+enrichment:
+  finders:
+    - type: csv                            # people "we already know" (a sample list)
+      path: examples/data/demo_delivery_contacts.csv
+    - type: pattern                        # free: guesses first.last@domain for people without an email
+  verifier:
+    type: basic                            # free + offline: can never confirm a mailbox
+  # Delivery mode: these only pick WHICH person goes in the file (the best-ranked
+  # one with any address that is not invalid). The file labels every email
+  # honestly: verified / risky / guessed-unverified / not found.
+  accept_statuses: [valid, risky, unknown]
+  accept_guessed_statuses: [valid, risky, unknown]
+  max_companies: 50
+
+# --- Scoring: the same hiring-signal scoring as recruitment-delivery ------------------
+scoring:
+  weights: {intent: 45, fit: 15, reachability: 30, extra: 10}
+  tiers: {hot: 65, normal: 15}             # hot = call first; skip (< 15) = nothing fresh, not delivered
+  intent: {fresh: 20, volume: 10, persistence: 5, urgency: 5}
+  freshness_days: [2, 4, 7, 14]            # 2 days = full points, 4 = 3/4, 7 = 1/2, 14 = 1/4
+  volume_full_at: 3
+  extra_per_signal: 5
+  unknown_credit: 0.5
+
+# --- Review file for `leadgen run` (deliveries write their own files) -----------------
+outbound:
+  exporters:
+    - type: csv                            # opportunities.csv - every lead with score + reasons
+
+# --- Cost control (nothing here costs money) ---------------------------------------------
+usage:
+  max_paid_lookups: 0
+
+# --- Alerts ---------------------------------------------------------------------------------
+notify:
+  channels:
+    - type: console
+  "on": [run_summary]                      # keep "on" quoted (YAML)
+
+# --- Memory: what each client already received (SQLite file, created automatically) --------
+storage:
+  path: data/demo-delivery.db

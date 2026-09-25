@@ -1,0 +1,69 @@
+# =============================================================================
+#  demo-client - a made-up client, to try `leadgen deliver` offline
+# =============================================================================
+#  "Northstar Finance Recruiting" is a fictional agency that places accountants,
+#  controllers, financial analysts and payroll people in Texas, Illinois,
+#  New York, Georgia and the UK. It buys the weekly Hiring Signal Report.
+#
+#  It runs on the offline sample data (playbooks/demo-delivery.yaml): no API
+#  keys, no cost. From the repository root:
+#
+#      leadgen deliver --client demo-client --dry-run   # free preview, nothing recorded
+#      leadgen deliver --client demo-client             # deliver: files in deliveries/demo-client/<date>/
+#      leadgen deliver --client demo-client             # next week: only what was NOT delivered before
+#
+#  The first delivery holds 10 leads (leads_per_week). Two more companies
+#  qualify but are held back; they arrive in the next delivery, and after that
+#  there is nothing new until new jobs are posted.
+#  Start over: delete data/demo-delivery.db and deliveries/demo-client/.
+#
+#  Every setting is explained in clients/_template.yaml.
+# =============================================================================
+
+display_name: Northstar Finance Recruiting
+playbook: playbooks/demo-delivery.yaml
+contact: {name: Jamie Rivera, email: jamie@northstar-demo.com}   # your records only
+
+# --- What the client wants ---------------------------------------------------------
+roles: [accountant, accounting, controller, financial analyst, finance manager, fp&a,
+        accounts payable, accounts receivable, payroll, bookkeeper]
+exclude_roles: [intern, trainee]
+buyer_titles: [CFO, VP Finance, Finance Director, Head of Finance, Financial Controller, Controller,
+               Head of Talent Acquisition, HR Director]
+locations: [Texas, Illinois, New York, Georgia, United Kingdom]
+exclude_locations: []
+company_size: {min: 20, max: 5000}
+industries: []
+
+# Northstar's own do-not-list.
+exclusions:
+  companies: [Riverwalk Hospitality Group]     # already their client
+  domains: [gulfcoastpaper-demo.com]           # another existing client
+  keywords: [staffing, recruiting, recruitment]   # competitors
+
+# --- How much, how fresh ---------------------------------------------------------------
+leads_per_week: 10
+freshness_days: 7
+allow_undated: false
+drop_reposts: true
+redelivery_days: null           # never deliver the same company / job / person twice
+dedupe: [company, job, contact]
+tiers: [hot, normal]
+
+emails:
+  include_unverified: true      # risky + guessed emails are delivered, clearly labelled
+
+opening_line:
+  enabled: true                 # adds the "Suggested opening line" column
+  ai: false                     # free template line (no AI, no cost)
+  max_cost_usd: 0.50
+
+budget:
+  max_paid_lookups: 0
+
+delivery:
+  formats: [csv, xlsx, html]
+  folder: deliveries/{client}/{date}
+
+branding: {}                    # e.g. {brand_color: "#0b6e4f"}
+overrides: {}

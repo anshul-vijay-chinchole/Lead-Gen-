@@ -1,0 +1,356 @@
+# =============================================================================
+#  RECRUITMENT-DELIVERY - the weekly "Hiring Signal Report" you sell to agencies
+# =============================================================================
+#  What it does: finds companies that posted a job in the last few days for a
+#  role a recruitment / staffing agency fills, names the person who owns the
+#  hire, checks what it can about their email, scores every lead and hands
+#  you lead FILES (CSV / Excel / a one-page HTML summary).
+#
+#  Delivery mode: nothing is ever written or emailed to anyone. You sell the
+#  file; your client (the agency) does their own outreach.
+#
+#  How it is used: every client has a file in clients/ (copy
+#  clients/_template.yaml, or run `leadgen clients new <name>`). The client
+#  file names this playbook as its base and adds the client's own targeting
+#  on top (roles, locations, company size, exclusions, how many leads). So:
+#    - THIS file  = where leads come from + how people / emails are found + scoring
+#    - CLIENT file = what one client wants
+#
+#      leadgen doctor  --client <name>             # are the keys working? (free checks)
+#      leadgen deliver --client <name> --dry-run   # free preview, nothing recorded
+#      leadgen deliver --client <name>             # the real delivery
+#      leadgen run -p playbooks/recruitment-delivery.yaml   # one run without a client
+#
+#  ZERO BUDGET: as shipped, everything switched on is free. Adzuna has a free
+#  API key; the Greenhouse / Lever / Ashby job boards and your own CSV files
+#  need no key; email addresses are guessed from name patterns (free) and
+#  checked with the free "basic" checker. Paid tools (TheirStack, Apollo,
+#  Hunter) are listed but switched off ("enabled: false") until you want them.
+#
+#  NOT included on purpose: LinkedIn and Indeed scraping (the linkedin_jobs
+#  source and the Apify indeed_jobs / linkedin_jobs presets). Those sites'
+#  terms forbid scraping, so they are "use at your own risk" and this
+#  playbook never uses them. Every source below is an official API, a
+#  company's own public job board, or a file you supply.
+#
+#  Values like ${SENDER_NAME:-Your Name} come from your .env file (copy
+#  .env.example to .env); the text after ":-" is used until you set them.
+#  Lines starting with "#" are comments - the engine ignores them.
+# =============================================================================
+
+name: recruitment-delivery
+# delivery = lead files only (the engine's default). Client deliveries always
+# run in delivery mode, whatever this line says.
+mode: delivery
+description: Weekly Hiring Signal Report - companies hiring the roles a recruitment agency fills (free sources by default).
+
+# -----------------------------------------------------------------------------
+# DELIVERY - the look of the report your clients receive (HTML summary, Excel
+# "About" sheet). A client file can change any of these under "branding:".
+# -----------------------------------------------------------------------------
+delivery:
+  brand_name: Hiring Signal Report      # the report's title
+  brand_color: "#1f4e79"                # header colour, like "#1f4e79" (keep the quotes)
+  sender_name: ${SENDER_NAME:-Your Name}
+  sender_email: ${SENDER_EMAIL:-}       # shown in the footer so clients can reply to you
+  website: ${SENDER_WEBSITE:-}
+  logo_url: ""                          # optional: a link to your logo image (https://...)
+  # One line at the bottom of every report.
+  footer: "Leads come from public job postings. Emails marked guessed-unverified were built from a name pattern - check them before use."
+
+# -----------------------------------------------------------------------------
+# ICP - which companies count. For a client delivery, locations,
+# exclude_locations, employees and industries always come from the client file
+# (locations, exclude_locations, company_size, industries - left out there means
+# anywhere / any size / any industry), so the four values below only apply to
+# `leadgen run` without a client. The rest applies to every client; a client's
+# exclusions (domains, keywords) are ADDED to the lists here.
+# -----------------------------------------------------------------------------
+icp:
+  locations: []                 # e.g. [United States] or [Texas, Oklahoma]; [] = anywhere
+  exclude_locations: []
+  # Companies with fewer than 10 staff rarely pay agency fees. null = no limit.
+  employees: {min: 10, max: null}
+  industries: []                # [] = any industry
+  # Other agencies are your clients' competitors, never their customers.
+  exclude_industries: [staffing, recruiting, recruitment, executive search]
+  exclude_keywords: [staffing agency, recruitment agency, recruiting firm, executive search]
+  exclude_domains: []
+  # false: Adzuna results have a company NAME but no website, and they are
+  # still good leads (the client can look the company up). true would drop them.
+  require_domain: false
+  # Missing size / industry / location data is not a reason to drop a company
+  # (it just scores a little lower).
+  unknown_passes: true
+
+# -----------------------------------------------------------------------------
+# SIGNALS - the "why now": a job posted in the last few days for a role the
+# client fills. Client files set roles, freshness and the repost / undated rules.
+# -----------------------------------------------------------------------------
+signals:
+  # Job postings are the product. Funding, expansion, leadership changes and
+  # head-count growth only add bonus points; a company with ONLY one of those
+  # (no matching job) is never put in a client's file.
+  types: [job_posting, funding, expansion, leadership_change, headcount_growth]
+  primary: [job_posting]
+  require: true
+  # The roles that count. EXAMPLE niche: finance and accounting. A client's
+  # "roles:" list replaces this one.
+  match_keywords: [accountant, accounting, controller, financial analyst, finance manager,
+                   finance director, head of finance, fp&a, accounts payable, accounts receivable,
+                   payroll, bookkeeper, tax manager, treasury, credit controller]
+  # false = the JOB TITLE itself must name one of the roles (a "Sales Manager"
+  # post that mentions "accounting" in its text is not a role the client fills).
+  match_description: false
+  exclude_keywords: [intern, internship, apprentice, apprenticeship, volunteer, graduate scheme]
+  # Only jobs posted in the last 7 days (a client's freshness_days replaces this).
+  max_age_days: 7
+  # Jobs without a posting date are left out: we cannot promise they are fresh.
+  allow_undated: false
+  # Leave out old ads that were simply put up again (spotted by comparing with
+  # what earlier runs saw).
+  drop_reposts: true
+  urgency_keywords: [urgent, urgently, immediate, immediately, asap, start now, quick start]
+  # A role still open this long is hard to fill (bonus points). Only matters
+  # when a client allows older jobs (freshness_days above 21).
+  stale_after_days: 21
+
+# -----------------------------------------------------------------------------
+# BUYERS - the decision-maker named in each lead, BEST FIRST. Generic buyers of
+# agency services: talent acquisition / HR, then department heads, then the
+# top of small companies. Clients usually set their own "buyer_titles:"
+# (e.g. [CFO, VP Finance, Controller, Head of Talent]) and that list wins.
+# Abbreviations are understood: VP = Vice President, TA = Talent Acquisition,
+# HR = Human Resources, CFO = Chief Financial Officer, ...
+# -----------------------------------------------------------------------------
+buyers:
+  titles:
+    # talent acquisition / HR - they hire agencies
+    - Head of Talent Acquisition
+    - Director of Talent Acquisition
+    - Talent Acquisition Manager
+    - Head of People
+    - HR Director
+    - HR Manager
+    - Hiring Manager
+    # department heads, whatever the department ("VP Finance",
+    # "Director of Engineering", "Head of Operations")
+    - VP
+    - Director
+    - Head
+    # small companies: the people at the top
+    - CFO
+    - COO
+    - CTO
+    - CEO
+    - Founder
+  exclude_titles: [intern, assistant, student, trainee]
+  # Hints for Apollo when it is switched on (its seniority names).
+  seniorities: [c_suite, vp, head, director, manager]
+  departments: []
+  # One decision-maker per company (client deliveries always use 1).
+  max_contacts_per_company: 1
+  # Shared mailboxes (info@, jobs@, hr@) are never named as the decision-maker.
+  allow_generic_emails: false
+
+# -----------------------------------------------------------------------------
+# SOURCES - where companies and their job postings come from. The same
+# company found by two sources is merged. "enabled: false" keeps the settings
+# but skips the source.
+#
+# IMPORTANT: the search words below (Adzuna "queries", TheirStack
+# "job_titles") decide WHAT is fetched; the client's "roles:" decide what
+# COUNTS. Keep them in the same niche. For a client in another niche (nurses,
+# drivers, engineers ...), copy this file (e.g. playbooks/delivery-nursing.yaml),
+# change the search words, and point that client's "playbook:" line at the copy.
+# -----------------------------------------------------------------------------
+sources:
+  # Adzuna job-search API. FREE key: sign up at developer.adzuna.com, then put
+  # ADZUNA_APP_ID and ADZUNA_APP_KEY in .env. Each country x query x page is
+  # one request (here: 1 country x 3 queries x 2 pages = at most 6 per run).
+  - type: adzuna
+    label: adzuna
+    # REQUIRED. Adzuna searches one country at a time: list the markets your
+    # clients recruit in, e.g. [us], [gb], [us, ca], [gb, au]. (gb = United Kingdom)
+    countries: [us]
+    queries: [accountant, financial controller, finance manager]
+    what_exclude: [intern, internship]
+    max_days_old: 7               # match signals.max_age_days
+    max_pages: 2                  # 50 jobs per page
+
+  # Company job boards (Greenhouse / Lever / Ashby) - FREE, no key. A
+  # watchlist: add companies you know post jobs you can fill. "board" is the
+  # company's name in its job-board address, e.g. the "examplecorp" in
+  # boards.greenhouse.io/examplecorp, jobs.lever.co/examplecorp or
+  # jobs.ashbyhq.com/examplecorp. Replace the example, then set enabled: true.
+  - type: greenhouse
+    label: greenhouse-watchlist
+    enabled: false
+    companies:
+      - {name: Example Corp, board: examplecorp, domain: examplecorp.example, location: "Austin, TX"}
+      # - {name: Another Co, board: anotherco, domain: anotherco.example}
+    max_jobs_per_company: 10
+  - type: lever
+    label: lever-watchlist
+    enabled: false
+    companies:
+      - {name: Example Labs, board: examplelabs, domain: examplelabs.example}
+      # EU-hosted Lever boards need region: eu, e.g.
+      # - {name: Example GmbH, board: examplegmbh, domain: example-gmbh.example, region: eu}
+  - type: ashby
+    label: ashby-watchlist
+    enabled: false
+    companies:
+      - {name: Example Tech, board: exampletech, domain: exampletech.example}
+
+  # Your own job list (a spreadsheet you keep, a download from a job board
+  # that allows it, a Clay / Zapier export ...) - FREE. Save it as CSV at the
+  # path below, then set enabled: true. Column names are recognised
+  # automatically, in any order:
+  #   Company (required)   Domain or Website   Location   Industry   Employees
+  #   Job Title (required) Job URL   Date Posted (2026-09-20, or "3 days ago")   Job ID
+  # A row without a Date Posted is left out (allow_undated: false above).
+  # If your headers differ, map them, e.g.
+  #   mapping: {name: "Employer", signal_title: "Role", signal_date: "Posted"}
+  - type: csv
+    label: my-job-list
+    enabled: false
+    path: data/imports/jobs.csv
+
+  # TheirStack - job postings WITH company data (website, size, industry) and
+  # often the hiring team. Free trial credits, then PAID per job returned.
+  # Key: THEIRSTACK_API_KEY. Switch on when you have a budget.
+  - type: theirstack
+    label: theirstack
+    enabled: false
+    job_titles: [accountant, financial controller, financial analyst, finance manager, payroll manager]
+    exclude_job_titles: [intern, internship]
+    countries: [US]               # ISO codes, e.g. [US, CA] or [GB]
+    max_age_days: 7
+    limit: 25                     # jobs per page - each job costs credits
+    max_pages: 1
+
+# -----------------------------------------------------------------------------
+# ENRICHMENT - find the decision-maker, then check the email.
+# Finders run top to bottom and stop as soon as a decision-maker with an email
+# (or email guesses) is found, so a paid finder is only asked when needed.
+# -----------------------------------------------------------------------------
+enrichment:
+  finders:
+    # Apollo - people search + email reveal. PAID credits (small free plan).
+    # Key: APOLLO_API_KEY.
+    - type: apollo
+      enabled: false
+      per_page: 10
+      reveal_limit: 1             # email reveals per company (1 credit each)
+    # Hunter - people + emails at a company domain. Free plan: a few searches
+    # a month, then PAID. Key: HUNTER_API_KEY.
+    - type: hunter
+      enabled: false
+    # FREE: guesses first.last@company.com etc. for a named person without an
+    # email. Guesses are ALWAYS labelled "guessed-unverified" in the client's
+    # file. (It cannot discover people: names come from the sources above or
+    # from Apollo / Hunter.) Put it first if you would rather save paid credits.
+    - type: pattern
+  # Email checker. basic = FREE, offline: catches typos and throw-away inboxes
+  # but can never confirm a mailbox. Paid checkers (millionverifier,
+  # zerobounce, neverbounce, hunter) can mark emails "verified".
+  verifier:
+    type: basic
+  # In delivery mode nothing is emailed by you, so these two lists only decide
+  # WHICH person goes in the file: the best-ranked decision-maker with any
+  # address that is not invalid. Every email is labelled honestly in the file
+  # (verified / risky / guessed-unverified / not found), and a client with
+  # emails.include_unverified: false only receives "verified" ones.
+  accept_statuses: [valid, risky, unknown]
+  accept_guessed_statuses: [valid, risky, unknown]
+  # Credit guard: enrich at most this many companies per run. Client
+  # deliveries use (leads_per_week x 2, at least 10) when that is lower.
+  max_companies: 100
+  min_prescore: 0
+  # Don't look people up again when a source already named a decision-maker with an email.
+  skip_if_contact_present: true
+
+# -----------------------------------------------------------------------------
+# SCORING - every lead gets 0-100, tuned for hiring signals: fresh jobs, several
+# open roles and "urgent" wording count most, then the decision-maker + email.
+# The score also sets the order of the rows in the client's file (hot first).
+#   hot    (>= 65): call first - e.g. a job posted in the last 2 days AND the
+#                   client's top buyer (first buyer title) with a verified email,
+#                   or 3+ fresh roles with one of the top 3 buyer titles named.
+#   normal (>= 15): any matching job inside the client's freshness window at a
+#                   company that fits, even with no data on its size and nobody
+#                   named yet. (A weekly report must not lose last week's jobs.)
+#   skip   (< 15):  nothing fresh, e.g. only a job older than two weeks (possible
+#                   when a client allows older jobs). Not delivered by default.
+# Client files choose which tiers they receive (default: hot + normal).
+# -----------------------------------------------------------------------------
+scoring:
+  weights:
+    intent: 45          # how fresh, how many and how urgent the matching jobs are
+    fit: 15             # location / size / industry (mostly already filtered)
+    reachability: 30    # the right person (buyer title) + how sure the email is
+    extra: 10           # bonus signals: funding, expansion, leadership change ...
+  tiers: {hot: 65, normal: 15}
+  # How the intent points are split.
+  intent: {fresh: 20, volume: 10, persistence: 5, urgency: 5}
+  # Freshness bands in days for a 7-day window: posted within 2 days = full
+  # points, 4 days = 3/4, 7 days = 1/2, 14 days = 1/4.
+  freshness_days: [2, 4, 7, 14]
+  volume_full_at: 3     # 3 matching open roles = full "volume" points
+  extra_per_signal: 5
+  unknown_credit: 0.5   # half the fit points when size / industry / location is unknown
+
+# -----------------------------------------------------------------------------
+# WRITER - not used for delivery (no emails are written). Only needed when a
+# client turns on AI opening lines (opening_line: {enabled: true, ai: true}):
+# the lines are then written by this provider / model. Leave it out to keep
+# the free template lines. Example:
+# writer:
+#   provider: anthropic           # key: ANTHROPIC_API_KEY
+#   model: claude-haiku-4-5       # the cheapest Claude model
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# OUTBOUND - `leadgen deliver` writes the client's files itself. The csv
+# exporter below writes a review file (opportunities.csv: every lead with its
+# score and reasons) for plain `leadgen run`, and into the delivery's
+# _internal/ folder. Sending tools (Instantly, Smartlead, webhooks) are never
+# used in delivery mode.
+# -----------------------------------------------------------------------------
+outbound:
+  exporters:
+    - type: csv
+
+# -----------------------------------------------------------------------------
+# USAGE - cost control. A "paid lookup" = one request to a paid provider
+# (TheirStack, Apollo, Hunter, the paid email checkers, AI). Adzuna, the job
+# boards, CSV files, the pattern finder and the basic checker are free.
+# -----------------------------------------------------------------------------
+usage:
+  # Most paid requests per run. 0 = no cap. A client's budget.max_paid_lookups
+  # or `leadgen deliver --budget N` overrides it.
+  max_paid_lookups: 0
+  # Your plan's price per request (USD), for the cost estimate printed after
+  # every run. Providers price per plan, so these are EXAMPLES - use your own:
+  # (TheirStack charges per job returned, so its price is one page of "limit" jobs.)
+  # cost_per_call: {apollo: 0.05, hunter: 0.03, millionverifier: 0.004, theirstack: 0.50}
+  cost_per_call: {}
+  # AI prices per million tokens, only for models the engine does not know:
+  # llm_price_per_mtok: {my-model: {input: 1.0, output: 5.0}}
+  llm_price_per_mtok: {}
+
+# -----------------------------------------------------------------------------
+# NOTIFY - print a short summary after each run.
+# -----------------------------------------------------------------------------
+notify:
+  channels:
+    - type: console
+  "on": [run_summary]     # keep "on" quoted (plain YAML reads on as true)
+
+# -----------------------------------------------------------------------------
+# STORAGE - the engine's memory: what each client already received (so nothing
+# is delivered twice), email check results, job history. Keep this file safe.
+# -----------------------------------------------------------------------------
+storage:
+  path: data/leadgen.db
