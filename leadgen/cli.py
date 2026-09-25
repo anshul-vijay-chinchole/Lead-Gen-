@@ -1,34 +1,78 @@
 """Command-line interface: ``leadgen <command> [options]`` (also ``python -m leadgen``).
 
+Modes
+-----
+Every playbook runs in one of two modes (``mode:`` in the playbook, see
+``leadgen/modes.py``):
+
+* ``delivery`` (the default): the business sells lead files. A run stops after
+  scoring and writes lead files; ``leadgen deliver`` makes a client's weekly
+  "Hiring Signal Report". Nothing is ever written to or sent to anyone.
+* ``outbound``: the outreach features - email copy, hand-over to sending
+  tools, replies, follow-ups and the reply webhook server.
+
 Commands
 --------
 init NAME       Create ``playbooks/NAME.yaml`` from a template (never overwrites).
 validate        Load a playbook, build every adapter it uses and report unknown
-                types, config mistakes and missing API keys as a checklist.
-run             One full pipeline run: find -> filter -> enrich -> verify ->
-                score -> write -> export. ``--dry-run`` skips everything that
-                uses the network (no paid calls, nothing sent).
+                types, config mistakes and missing API keys as a checklist. Shows
+                the mode; in delivery mode outbound-only settings (AI writer,
+                hand-over exporters) are warnings, not failures.
+run             One full pipeline run. Delivery mode: find -> filter -> enrich ->
+                verify -> score -> lead files. Outbound mode adds write + hand-over.
+                ``--dry-run`` skips everything that uses the network (no paid
+                calls, nothing sent); ``--budget N`` caps paid lookups. The API
+                usage (+ estimated cost) is printed after every run.
+deliver         One client's weekly Hiring Signal Report (``--client NAME`` =
+                ``clients/NAME.yaml``): client-ready CSV / Excel / HTML files, the
+                internal QA files, then the QA summary. ``--dry-run`` = preview
+                (``...-PREVIEW`` files, nothing recorded as delivered).
+clients         ``clients [list]``: every client with its weekly volume and delivery
+                history. ``clients new NAME``: a new client file from the template.
+doctor          Test every API key a playbook (``-p``) or client (``--client``) uses:
+                one free account / credits call per key - never a paid lookup.
 demo            Write the "live opportunities" one-pager (Markdown + HTML) for a run.
 leads           Show the leads of a run as a table.
-replies         Classify a replies CSV and act on every reply (stages, suppression,
-                follow-ups, alerts); writes ``replies_classified.csv``.
-serve           Run the webhook receiver for Instantly / Smartlead reply events.
+replies         (outbound mode) Classify a replies CSV and act on every reply
+                (stages, suppression, follow-ups, alerts); writes ``replies_classified.csv``.
+serve           (outbound mode) Run the webhook receiver for Instantly / Smartlead
+                reply events.
 stats           Funnel numbers + recent runs.
 mark            Move a lead to a stage by hand (booked, won, lost, ...).
-suppress        Manage the do-not-contact list (add / remove / list).
-followups       Show follow-ups that are due; ``--done ID`` ticks one off.
-adapters        List every adapter type the engine knows, per kind.
+suppress        Manage the do-not-list (add / remove / list): emails, domains,
+                company names and LinkedIn profiles. Global by default; with
+                ``--client NAME`` that client's own list (never delivered to them).
+followups       (outbound mode) Show follow-ups that are due; ``--done ID`` ticks one off.
+adapters        List every adapter type the engine knows, per kind: offline /
+                network / network (paid), its credential, and notes (use-at-own-risk
+                scrapers, outbound-only adapters).
+
+``replies``, ``serve`` and ``followups`` refuse to run (exit 2, nothing opened)
+unless ``-p`` names an outbound-mode playbook - without ``-p`` the default mode,
+delivery, applies.
 
 Global options (accepted before or after the command)
 -----------------------------------------------------
 -p / --playbook PATH   The playbook YAML (required by run, validate, demo, replies,
-                       serve; optional elsewhere, where it scopes the output).
+                       serve; optional elsewhere, where it scopes the output;
+                       ignored by deliver, which uses the client file's playbook).
 --db PATH              SQLite file; overrides the playbook's ``storage.path``
-                       (default without a playbook: ``data/leadgen.db``).
+                       (default without a playbook: ``data/leadgen.db``; with
+                       ``--client``: the storage path of the client's playbook).
 -v / --verbose         More logging (-v info, -vv debug) and full tracebacks.
 --env-file PATH        ``KEY=VALUE`` file loaded before anything else (default
                        ``.env`` in the current directory, skipped when missing).
                        Variables already set in the environment always win.
+
+Command options read by the delivery commands: ``--client NAME`` and
+``--clients-dir DIR`` (default ``clients``), ``--budget N`` (paid-lookup cap for
+the run; 0 = no cap; overrides ``usage.max_paid_lookups`` and the client file's
+``budget.max_paid_lookups``), ``--out DIR`` (deliver: the output folder,
+``{client}`` / ``{date}`` placeholders allowed). The playbook keys the CLI itself
+reads: ``mode``, ``name``, ``storage.path``, ``sources``, ``notify`` (to avoid
+printing the run summary twice), ``writer``, ``outbound.exporters``,
+``enrichment``, ``buyers.titles``, ``offer.sender_name`` / ``delivery.sender_name``
+and ``replies.classifier`` (validate).
 
 Plugins: ``LEADGEN_PLUGINS=my_pkg.adapters,other_module`` (environment or .env)
 imports those modules before any command runs, so they can add their own
@@ -36,18 +80,23 @@ adapter types with ``leadgen.registry.register(kind, type, "module:Class")``.
 The working directory is importable for this.
 
 Exit codes: 0 success, 1 the command ran but found a problem (validation
-failed, every source failed, nothing to show), 2 usage / configuration error
-(bad playbook, missing file or credential) - reported as one friendly line on
-stderr, with the traceback only under ``-v``.
+failed, every source failed, no leads delivered, a key failed the doctor,
+nothing to show), 2 usage / configuration error (bad playbook or client file,
+missing file or credential, an outbound-only command in delivery mode) -
+reported as one friendly line on stderr, with the traceback only under ``-v``.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import dataclasses
+import difflib
 import importlib
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import traceback
@@ -61,10 +110,14 @@ import yaml
 
 from . import __version__, registry
 from .context import Context, MissingCredentialError
+from .delivery.client import (DEFAULT_CLIENTS_DIR, Client, ClientError, is_handover_exporter,
+                              list_clients)
 from .http import HttpClient
 from .models import Lead, ReplyCategory, Stage, Tier
+from .modes import DELIVERY, OUTBOUND, is_outbound, mode_of, outbound_only_message
 from .playbook import DEFAULTS, Playbook, PlaybookError, from_dict, load_playbook
-from .store import Store
+from .store import SUPPRESSION_KINDS, Store, normalize_suppression
+from .usage import UsageMeter
 from .utils import is_valid_email, normalize_domain, parse_date
 
 EXIT_OK = 0
@@ -76,9 +129,15 @@ DEFAULT_ENV_FILE = ".env"
 DEFAULT_DB = str(DEFAULTS["storage"]["path"])
 WEBHOOK_TOKEN_ENV = "LEADGEN_WEBHOOK_TOKEN"
 PLUGINS_ENV = "LEADGEN_PLUGINS"
+OUTBOUND_EXAMPLE = "playbooks/demo-offline.yaml"   # an outbound-mode playbook shipped with the repo
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+MODE_TEXT = {
+    DELIVERY: "delivery - lead files only: no email copy is written, nothing is sent to anyone",
+    OUTBOUND: "outbound - writes email sequences and hands leads to sending tools (replies, follow-ups)",
+}
 
 log = logging.getLogger("leadgen")
 
@@ -305,8 +364,48 @@ def load_plugins(env: Dict[str, str]) -> List[str]:
     return names
 
 
-def open_session(args: argparse.Namespace, *, need_playbook: bool, dry_run: bool = False) -> Session:
-    """Load the playbook (if any), open the store and build the ``Context``."""
+def make_http() -> Any:
+    """The HTTP client a command uses (one per command).
+
+    Every command gets its client from here, so tests can replace this function
+    (``monkeypatch.setattr(cli, "make_http", lambda: FakeHttp())``) and no test
+    ever reaches the real network."""
+    return HttpClient()
+
+
+def close_http(http: Any) -> None:
+    """Close the HTTP client's connection pool (best effort)."""
+    closer = getattr(getattr(http, "session", None), "close", None)
+    try:
+        if callable(closer):
+            closer()
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+
+
+def open_store(db: str) -> Store:
+    """Open the SQLite database ``db``; a problem becomes one friendly line (exit 2)."""
+    try:
+        return Store(os.path.expanduser(str(db)))
+    except (sqlite3.Error, OSError) as e:
+        raise CliError(f"cannot open the database {db}: {e}") from e
+
+
+def check_budget(value: Optional[int]) -> Optional[int]:
+    """``--budget N``: None (not given) or a whole number >= 0 (0 = no cap)."""
+    if value is None:
+        return None
+    if value < 0:
+        raise CliError(f"--budget must be 0 or more (got {value}): it is the most paid lookups this run may make "
+                       f"(0 = no cap). For no paid calls at all, use --dry-run.")
+    return value
+
+
+def open_session(args: argparse.Namespace, *, need_playbook: bool, dry_run: bool = False,
+                 budget: Optional[int] = None) -> Session:
+    """Load the playbook (if any), open the store and build the ``Context``.
+
+    ``budget`` (``--budget N``) overrides the playbook's ``usage.max_paid_lookups``."""
     env = build_env(args)
     pb_path = getattr(args, "playbook", None)
     playbook: Optional[Playbook] = None
@@ -316,13 +415,31 @@ def open_session(args: argparse.Namespace, *, need_playbook: bool, dry_run: bool
         raise CliError(f"'{args.command}' needs a playbook: add -p playbooks/<name>.yaml "
                        f"(try: leadgen {args.command} -p playbooks/demo-offline.yaml)")
     db = getattr(args, "db", None) or (str(playbook.db_path) if playbook else DEFAULT_DB)
-    try:
-        store = Store(os.path.expanduser(db))
-    except (sqlite3.Error, OSError) as e:
-        raise CliError(f"cannot open the database {db}: {e}") from e
-    ctx = Context(playbook=playbook or from_dict({"name": "leadgen"}, env=env), http=HttpClient(),
-                  store=store, env=env, today=date.today(), log=log, dry_run=dry_run)
+    store = open_store(db)
+    pb = playbook or from_dict({"name": "leadgen"}, env=env)
+    ctx = Context(playbook=pb, http=make_http(), store=store, env=env, today=date.today(), log=log,
+                  dry_run=dry_run, usage=UsageMeter.from_playbook(pb, budget))
     return Session(ctx=ctx, store=store, playbook=playbook, playbook_path=pb_path)
+
+
+def outbound_gate(args: argparse.Namespace, feature: str) -> Optional[int]:
+    """Refuse an outbound-only command unless ``-p`` names an outbound-mode playbook.
+
+    Returns None when the command may run, else prints the reason to stderr and
+    returns exit code 2 - before the database, the network or any file is touched.
+    Without ``-p`` the default mode (delivery) applies."""
+    pb_path = getattr(args, "playbook", None)
+    name = ""
+    if pb_path:
+        playbook = load_playbook(pb_path, env=build_env(args))
+        if is_outbound(playbook):
+            return None
+        name = playbook.name
+    sys.stderr.write(f"error: {outbound_only_message(feature, name)}\n")
+    if not pb_path:
+        sys.stderr.write(f"No playbook was given (-p), so the default mode (delivery) applies. Name an "
+                         f"outbound-mode playbook, e.g. leadgen {args.command} -p {OUTBOUND_EXAMPLE}\n")
+    return EXIT_USAGE
 
 
 def _resolve_run(session: Session, run: Optional[str]) -> str:
@@ -519,52 +636,125 @@ def check_adapter(kind: str, cfg: Any, ctx: Context) -> Check:
     return Check("ok", label, note)
 
 
+def _enabled(cfg: Any) -> bool:
+    return isinstance(cfg, dict) and cfg.get("enabled") is not False
+
+
+def risk_checks(kind: str, cfg: Any) -> List[Check]:
+    """A warning for an enabled adapter that scrapes a site whose terms forbid it
+    (``registry.risk_note`` starting with 'use at own risk')."""
+    if not _enabled(cfg):
+        return []
+    note = registry.risk_note(kind, str(cfg.get("type") or ""), cfg)
+    if note.startswith("use at own risk"):
+        return [Check("warn", _describe(kind, cfg), note)]
+    return []
+
+
+def _llm_config(w: Dict[str, Any]) -> Dict[str, Any]:
+    """The writer's LLM entry, built the same way as ``llm.build_llm``."""
+    llm_cfg = dict(w.get("llm") or {})
+    llm_cfg.update({"type": w.get("provider"), "model": w.get("model"), "base_url": w.get("base_url"),
+                    "temperature": w.get("temperature")})
+    if w.get("api_key_env"):
+        llm_cfg["api_key_env"] = w["api_key_env"]
+    return llm_cfg
+
+
+def _llm_label(w: Dict[str, Any]) -> str:
+    return f"{w.get('provider')}{', ' + str(w.get('model')) if w.get('model') else ''}"
+
+
+def _writer_checks_delivery(ctx: Context) -> List[Check]:
+    """Delivery mode: the writer never runs; its AI model is only used for AI opening lines."""
+    w = ctx.playbook.writer
+    provider = str(w.get("provider") or "")
+    checks: List[Check] = []
+    if w.get("type") == "ai":
+        detail = "ignored in delivery mode - no email copy is written"
+        if provider:
+            detail += ("; writer.provider / writer.model are still used for AI opening lines "
+                       "(clients with opening_line.ai: true)")
+        checks.append(Check("warn", f"writer ai ({_llm_label(w) if provider else 'no provider'})", detail))
+    else:
+        checks.append(Check("skip", "writer", "not used in delivery mode - no email copy is written"))
+    if provider:
+        c = check_adapter("llm", _llm_config(w), ctx)
+        c.label = f"AI opening lines ({_llm_label(w)})"
+        if c.status == "fail":
+            c.status = "warn"
+            c.detail += (" - only matters for clients with opening_line.ai: true (until it is fixed they "
+                         "get the free template line)")
+        elif c.status == "ok":
+            c.detail += " - used only for clients with opening_line.ai: true"
+        checks.append(c)
+    return checks
+
+
+def _writer_checks_outbound(ctx: Context) -> List[Check]:
+    w = ctx.playbook.writer
+    if w.get("type") == "ai":
+        c = check_adapter("llm", _llm_config(w), ctx)
+        c.label = f"writer ai ({_llm_label(w)})"
+        if c.status == "fail" and w.get("fallback_to_template", True):
+            c.detail += " - the template writer would be used instead"
+        return [c]
+    return [check_adapter("writer", dict(w, type="template"), ctx)]
+
+
 def validate_playbook(ctx: Context) -> List[Check]:
-    """Checklist for every adapter the playbook uses, plus a few sanity checks."""
+    """Checklist for every adapter the playbook uses, plus a few sanity checks.
+
+    In delivery mode the outbound-only settings - the email writer and hand-over
+    exporters (Instantly, Smartlead, upload CSVs, webhooks) - are never used, so
+    they are reported as warnings ("ignored in delivery mode"), never failures.
+    Adapters that scrape sites against their terms get a 'use at own risk' warning."""
     pb = ctx.playbook
+    outbound = is_outbound(pb)
     checks: List[Check] = []
     active_sources = [s for s in pb.sources if not (isinstance(s, dict) and s.get("enabled") is False)]
     if not active_sources:
         checks.append(Check("fail", "sources", "no sources configured - nothing to find (add one under 'sources:')"))
     for cfg in pb.sources:
         checks.append(check_adapter("source", cfg, ctx))
+        checks += risk_checks("source", cfg)
     finders = pb.enrichment.get("finders") or []
     if not finders:
         checks.append(Check("warn", "finders", "no contact finders - only contacts supplied by sources are used"))
     for cfg in finders:
         checks.append(check_adapter("finder", cfg, ctx))
+        checks += risk_checks("finder", cfg)
     ver = pb.enrichment.get("verifier")
     if ver:
         checks.append(check_adapter("verifier", ver, ctx))
-    else:
+    elif outbound:
         checks.append(Check("warn", "verifier", "none configured - emails are not checked before sending"))
-    w = pb.writer
-    if w.get("type") == "ai":
-        llm_cfg = dict(w.get("llm") or {})  # same construction as llm.build_llm
-        llm_cfg.update({"type": w.get("provider"), "model": w.get("model"), "base_url": w.get("base_url"),
-                        "temperature": w.get("temperature")})
-        if w.get("api_key_env"):
-            llm_cfg["api_key_env"] = w["api_key_env"]
-        c = check_adapter("llm", llm_cfg, ctx)
-        c.label = f"writer ai ({w.get('provider')}{', ' + str(w.get('model')) if w.get('model') else ''})"
-        if c.status == "fail" and w.get("fallback_to_template", True):
-            c.detail += " - the template writer would be used instead"
-        checks.append(c)
     else:
-        checks.append(check_adapter("writer", dict(w, type="template"), ctx))
+        checks.append(Check("warn", "verifier", "none configured - every email is delivered as not verified"))
+    checks += _writer_checks_outbound(ctx) if outbound else _writer_checks_delivery(ctx)
     exporters = pb.outbound.get("exporters") or []
     if not exporters:
-        checks.append(Check("warn", "exporters", "none configured - results only land in the database"))
+        checks.append(Check("warn", "exporters", "none configured - results only land in the database"
+                            + ("" if outbound else " (the client files of `leadgen deliver` are not affected)")))
     for cfg in exporters:
+        if not outbound and _enabled(cfg) and is_handover_exporter(str(cfg.get("type") or "")):
+            checks.append(Check("warn", _describe("exporter", cfg),
+                                "hands leads to a sending tool - ignored in delivery mode (lead files only); "
+                                "remove it, or set 'mode: outbound' to use it"))
+            continue
         checks.append(check_adapter("exporter", cfg, ctx))
     for cfg in pb.notify.get("channels") or []:
         checks.append(check_adapter("notifier", cfg, ctx))
-    if pb.replies.get("classifier") == "ai" and w.get("type") != "ai" and not w.get("provider"):
+    w = pb.writer
+    if outbound and pb.replies.get("classifier") == "ai" and w.get("type") != "ai" and not w.get("provider"):
         checks.append(Check("warn", "replies", "classifier 'ai' needs writer.provider - the rules are used instead"))
     if not (pb.buyers.get("titles") or []):
         checks.append(Check("warn", "buyers", "buyers.titles is empty - any contact counts as a decision-maker"))
-    if not pb.offer.get("sender_name"):
+    if outbound and not pb.offer.get("sender_name"):
         checks.append(Check("warn", "offer", "offer.sender_name is empty - emails would go out unsigned"))
+    if not outbound and not str((pb.delivery or {}).get("sender_name") or "").strip():
+        checks.append(Check("warn", "delivery", "delivery.sender_name is empty - the report's footer won't "
+                                                "say who it is from"))
     return checks
 
 
@@ -576,6 +766,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     try:
         pb = session.ctx.playbook
         _out(f"Playbook: {pb.name}  ({session.playbook_path})")
+        _out(f"Mode: {MODE_TEXT.get(mode_of(pb), mode_of(pb))}")
         if pb.description:
             _out(f"  {pb.description}")
         if args.dry_run:
@@ -594,6 +785,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
         uses_network = any(c.status == "ok" and c.detail.startswith("network") for c in checks)
         _out(f"OK - ready to run ({len(warns)} warning(s)). Next: leadgen run -p {session.playbook_path}"
              + (" --dry-run" if uses_network or args.dry_run else ""))
+        if not is_outbound(pb):
+            _out("For a client's weekly report: leadgen deliver --client <name> --dry-run   "
+                 "(clients/<name>.yaml names this playbook in its 'playbook:' line)")
         return EXIT_OK
     finally:
         session.close()
@@ -603,19 +797,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # run / demo / leads
 # =============================================================================
 
+def _console_prints(channel: Any, event: str) -> bool:
+    """True for an enabled console channel that prints ``event`` to stdout."""
+    if not isinstance(channel, dict) or channel.get("type") != "console" or channel.get("enabled") is False:
+        return False
+    if str(channel.get("stream") or "stdout").lower() != "stdout":
+        return False
+    events = channel.get("events")
+    return not events or event in events
+
+
 def _console_shows(pb: Playbook, event: str) -> bool:
     """True when a console notifier will already print ``event`` to stdout."""
     if event not in (pb.notify.get("on") or []):
         return False
-    for ch in pb.notify.get("channels") or []:
-        if not isinstance(ch, dict) or ch.get("type") != "console" or ch.get("enabled") is False:
-            continue
-        if str(ch.get("stream") or "stdout").lower() != "stdout":
-            continue
-        events = ch.get("events")
-        if not events or event in events:
-            return True
-    return False
+    return any(_console_prints(ch, event) for ch in pb.notify.get("channels") or [])
 
 
 def _failed_sources(pb: Playbook, errors: Sequence[str], dry_run: bool) -> Tuple[int, int]:
@@ -647,14 +843,18 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.limit is not None and args.limit < 1:
         raise CliError("--limit must be a positive number")
-    session = open_session(args, need_playbook=True, dry_run=args.dry_run)
+    budget = check_budget(args.budget)
+    session = open_session(args, need_playbook=True, dry_run=args.dry_run, budget=budget)
     try:
         ctx = session.ctx
         pb = ctx.playbook
         mode = " (dry run: nothing that uses the network runs, nothing is sent)" if args.dry_run else ""
-        _out(f"Running playbook '{pb.name}'{mode} ...")
+        cap = f", at most {budget} paid lookup(s)" if budget else ""
+        _out(f"Running playbook '{pb.name}' ({mode_of(pb)} mode{cap}){mode} ...")
         result = Pipeline(ctx, out_dir=Path(args.out) if args.out else None, limit=args.limit).run()
         if not _console_shows(pb, "run_summary"):
+            # RunResult.summary() ends with the API usage lines (paid lookups, estimated cost);
+            # when a console notifier is configured it has just printed this same summary
             _out(result.summary())
         _out("")
         _out(f"Files in {result.out_dir}:")
@@ -676,6 +876,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         _out("Next:")
         _out(f"  leadgen leads{_pb_hint(session)}      # the leads of this run")
         _out(f"  leadgen demo{_pb_hint(session)}       # one-page 'live opportunities' report")
+        if not is_outbound(pb):
+            _out("  leadgen deliver --client <name>   # a client's weekly report (clients/<name>.yaml)")
         if args.dry_run and not result.counts.get("sourced"):
             _out("")
             _out("Note: nothing was found because every source uses the network and --dry-run skips "
@@ -762,6 +964,328 @@ def cmd_leads(args: argparse.Namespace) -> int:
 
 
 # =============================================================================
+# deliver / clients / doctor  (the lead-delivery business)
+# =============================================================================
+
+DELIVERY_FILE_WHAT = {
+    "csv": "spreadsheet - opens in Excel / Google Sheets, imports into any CRM",
+    "xlsx": "Excel workbook - 'Leads' sheet + 'About' sheet (counts, email-status legend)",
+    "html": "one-page summary - open in a browser, or print to PDF",
+}
+
+
+def load_client_and_playbook(args: argparse.Namespace, env: Dict[str, str]) -> Tuple[Client, Playbook]:
+    """``--client NAME`` (in ``--clients-dir``) and the playbook built for it. Problems
+    in the client file or its base playbook become one friendly error (exit 2)."""
+    from .delivery.client import client_playbook, load_client
+
+    try:
+        client = load_client(args.client, args.clients_dir)
+        return client, client_playbook(client, env=env)
+    except ClientError as e:
+        raise CliError(str(e)) from e
+
+
+def without_console_summary(client: Client, pb: Playbook) -> Client:
+    """A copy of ``client`` whose run leaves out the console channels that would print
+    the pipeline's run summary: ``leadgen deliver`` prints the delivery's QA summary
+    instead (the same counts, plus what was actually delivered - the pipeline's own
+    "email verified" count would contradict the honest labels in the files).
+    Slack / webhook channels are kept; the client file on disk is not changed."""
+    if not _console_shows(pb, "run_summary"):
+        return client
+    channels = [ch for ch in pb.notify.get("channels") or [] if not _console_prints(ch, "run_summary")]
+    overrides = copy.deepcopy(dict(client.overrides or {}))
+    notify = dict(overrides.get("notify") or {})
+    notify["channels"] = channels
+    overrides["notify"] = notify
+    return dataclasses.replace(client, overrides=overrides)
+
+
+def _recipient(client: Client) -> str:
+    """Who gets the files: 'Sam Lee <sam@acme.example> at Acme Staffing', or the client's name."""
+    contact = client.contact if isinstance(client.contact, dict) else {}
+    name = str(contact.get("name") or "").strip()
+    email = str(contact.get("email") or "").strip()
+    who = f"{name} <{email}>" if name and email else (name or email)
+    return f"{who} at {client.display_name}" if who else client.display_name
+
+
+def _client_options(args: argparse.Namespace) -> str:
+    """The options to repeat in a suggested follow-up command (clients dir, db, out)."""
+    parts = []
+    if args.clients_dir != DEFAULT_CLIENTS_DIR:
+        parts.append(f"--clients-dir {shlex.quote(str(args.clients_dir))}")
+    if getattr(args, "db", None):
+        parts.append(f"--db {shlex.quote(str(args.db))}")
+    if getattr(args, "out", None):
+        parts.append(f"--out {shlex.quote(str(args.out))}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _print_delivery(result: Any, client: Client, args: argparse.Namespace) -> None:
+    """Where the files are (client-ready first, internal second), the QA summary, what next."""
+    folder = result.folder
+    _out("")
+    if result.dry_run:
+        _out(f"PREVIEW files - not for the client (nothing was recorded as delivered) - in {folder}:")
+    else:
+        _out(f"Files for the client in {folder}:")
+    width = max([len(Path(p).name) for p in result.files.values()] + [24])
+    for fmt, path in result.files.items():
+        _out(f"  {Path(path).name:<{width}}  {DELIVERY_FILE_WHAT.get(fmt, '')}".rstrip())
+    if result.sheet_url:
+        _out(f"  Google Sheet: {result.sheet_url}")
+    internal = result.internal_dir
+    _out("")
+    _out(f"Internal files - for you, not the client - in {internal}:")
+    for name, what in (("qa.txt", "this QA summary (qa.json: the same as data)"),
+                       ("not_delivered.csv", "every company / lead left out, and why")):
+        if internal is not None and (Path(internal) / name).exists():
+            _out(f"  {name:<24} {what}")
+    run_dir = Path(result.run.out_dir)
+    if run_dir.exists():
+        _out(f"  {run_dir.name + '/':<24} the pipeline run: rejected.csv, summary.json, opportunities.csv")
+    _out("")
+    qa = result.qa
+    try:  # the files were listed above: don't list them twice
+        qa = dataclasses.replace(qa, files={}, folder="", sheet_url="")
+    except TypeError:
+        pass
+    for line in qa.lines():
+        _out(line)
+    _out("")
+    if not result.delivered:
+        _out(f"Nothing to send this time: no new leads for {client.display_name}. The reasons are above; every "
+             f"company left out is listed in {Path(internal or folder) / 'not_delivered.csv'}.")
+    elif result.dry_run:
+        _out(f"Next: this was a preview - check the files, then make the real delivery: "
+             f"leadgen deliver --client {client.name}{_client_options(args)}")
+    else:
+        _out(f"Next: send the files in {folder} to {_recipient(client)} "
+             f"(not the {Path(internal).name if internal else '_internal'} folder - that one is yours).")
+        if not (client.contact or {}).get("email"):
+            where = client.path or f"clients/{client.name}.yaml"
+            _out(f"  (tip: add 'contact: {{name: ..., email: ...}}' to {where} to see who gets them)")
+
+
+def cmd_deliver(args: argparse.Namespace) -> int:
+    from .delivery.run import deliver
+
+    budget = check_budget(args.budget)
+    env = build_env(args)
+    if getattr(args, "playbook", None):
+        log.warning("-p is ignored by 'deliver': the client file's 'playbook:' line names the base playbook")
+    client, pb = load_client_and_playbook(args, env)
+    db = getattr(args, "db", None) or str(pb.db_path)
+    store = open_store(db)
+    http = make_http()
+    try:
+        preview = " - DRY RUN (preview: offline sources only, nothing recorded as delivered)" if args.dry_run else ""
+        cap = f" - at most {budget} paid lookup(s)" if budget else ""
+        _out(f"Delivering the Hiring Signal Report for {client.display_name} ({client.name}){cap}{preview} ...")
+        try:
+            result = deliver(without_console_summary(client, pb), store=store, env=env, http=http,
+                             today=date.today(), dry_run=bool(args.dry_run), budget=budget, out_dir=args.out,
+                             log=log)
+        except ClientError as e:
+            raise CliError(str(e)) from e
+    finally:
+        store.close()
+        close_http(http)
+    _print_delivery(result, client, args)
+    sourced = result.run.counts.get("sourced", 0)
+    offline_sources, _ = _failed_sources(pb, [], True)
+    if args.dry_run and not sourced and not offline_sources:
+        _out("")
+        _out("Note: nothing was found because every source uses the network and --dry-run skips them. "
+             "Add a csv/json source to rehearse offline, or run without --dry-run.")
+    active, failed = _failed_sources(pb, result.run.errors, bool(args.dry_run))
+    if active and failed >= active and not sourced:
+        sys.stderr.write(f"error: every source failed ({failed} of {active}) - see the warnings above\n")
+        return EXIT_PROBLEM
+    if not result.delivered:
+        sys.stderr.write("error: no leads were delivered - see the QA summary above for why\n")
+        return EXIT_PROBLEM
+    return EXIT_OK
+
+
+def cmd_clients(args: argparse.Namespace) -> int:
+    if args.action == "new":
+        return _clients_new(args)
+    if args.name:
+        raise CliError(f"'leadgen clients list' takes no name (got {args.name!r}). To create a client: "
+                       f"leadgen clients new {args.name}")
+    return _clients_list(args)
+
+
+def _clients_new(args: argparse.Namespace) -> int:
+    from .delivery.client import new_client_file
+
+    name = str(args.name or "").strip()
+    if not name:
+        raise CliError("give the new client's short name, e.g. leadgen clients new acme-staffing "
+                       "(lower-case letters, digits, '-' and '_')")
+    if name.endswith((".yaml", ".yml")):
+        name = name.rsplit(".", 1)[0]
+    folder = Path(args.clients_dir)
+    for existing in (folder / f"{name}.yaml", folder / f"{name}.yml"):
+        if existing.exists():
+            raise CliError(f"{existing} already exists - edit that file, or choose another name", EXIT_PROBLEM)
+    try:
+        path = new_client_file(name, args.clients_dir)
+    except ClientError as e:
+        raise CliError(str(e)) from e
+    opt = "" if args.clients_dir == DEFAULT_CLIENTS_DIR else f" --clients-dir {shlex.quote(str(args.clients_dir))}"
+    _out(f"Created {path} from the client template.")
+    _out("")
+    _out("Next steps:")
+    _out(f"  1. Edit {path}: display_name, contact, roles, locations, leads_per_week, exclusions")
+    _out("     (every setting is explained in the file).")
+    _out(f"  2. leadgen doctor --client {name}{opt}             # checks the API keys it uses (free calls)")
+    _out(f"  3. leadgen deliver --client {name}{opt} --dry-run   # preview files: nothing recorded, no charges")
+    _out(f"  4. leadgen deliver --client {name}{opt}             # the real weekly delivery")
+    return EXIT_OK
+
+
+def _clients_list(args: argparse.Namespace) -> int:
+    from .delivery.client import client_playbook, load_client
+    from .delivery.ledger import Ledger
+
+    env = build_env(args)
+    folder = args.clients_dir
+    names = list_clients(folder)
+    stores: Dict[str, Optional[Store]] = {}
+
+    def ledger_for(db: str) -> Optional[Any]:
+        """The ledger in ``db``; None when that database does not exist yet (never created here)."""
+        path = os.path.expanduser(str(db))
+        key = path if path == ":memory:" else os.path.abspath(path)
+        if key not in stores:
+            stores[key] = open_store(path) if path != ":memory:" and Path(path).is_file() else None
+        store = stores[key]
+        return Ledger(store) if store is not None else None
+
+    rows: List[List[Any]] = []
+    problems: List[str] = []
+    try:
+        if getattr(args, "db", None):
+            ledger_for(args.db)  # also lists clients delivered to before whose file is gone
+        for name in names:
+            try:
+                client = load_client(name, folder)
+                pb = client_playbook(client, env=env)   # also checks the base playbook is usable
+                db = getattr(args, "db", None) or str(pb.db_path)
+            except ClientError as e:
+                problems.append(str(e))
+                rows.append([name, "(invalid client file - see the error below)", "-", "-", "-", "-"])
+                continue
+            ledger = ledger_for(db)
+            s = ledger.summary(client.name) if ledger is not None else {}
+            rows.append([client.name, client.display_name, client.leads_per_week, s.get("deliveries", 0),
+                         s.get("last_delivery") or "never", s.get("company", 0)])
+        listed = set(names)
+        for store in stores.values():  # clients delivered to before whose file is gone
+            if store is None:
+                continue
+            ledger = Ledger(store)
+            for other in ledger.list_clients_with_history():
+                if other in listed:
+                    continue
+                listed.add(other)
+                s = ledger.summary(other)
+                rows.append([other, "(no client file)", "-", s.get("deliveries", 0),
+                             s.get("last_delivery") or "never", s.get("company", 0)])
+    finally:
+        for store in stores.values():
+            if store is not None:
+                store.close()
+    if not rows:
+        where = f"{folder}/" if Path(folder).is_dir() else f"{folder}/ (the folder does not exist yet)"
+        _out(f"No client files in {where}. Create one with: leadgen clients new <name>")
+        return EXIT_OK
+    _out(f"Clients in {folder}/: {len(names)}")
+    _out("")
+    _out(format_table(["client", "display name", "leads/week", "deliveries", "last delivery", "total delivered"],
+                      rows, widths={"client": 30, "display name": 44},
+                      right=("leads/week", "deliveries", "total delivered")))
+    _out("")
+    _out("total delivered = leads (companies) sent so far - none of them is ever delivered to that client again.")
+    _out("Next: leadgen deliver --client <name> --dry-run   |   new client: leadgen clients new <name>")
+    if problems:
+        for p in problems:
+            sys.stderr.write(f"error: {p}\n")
+        return EXIT_PROBLEM
+    return EXIT_OK
+
+
+_DOCTOR_STATUS = {"ok": "ok", "failed": "FAILED", "missing_key": "MISSING KEY", "skipped": "skipped"}
+
+
+def _doctor_adapter(r: Any) -> str:
+    name = f"{r.kind} {r.type}"
+    return name + (f" '{r.label}'" if r.label and r.label != r.type else "")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from .doctor import run_doctor
+
+    env = build_env(args)
+    pb_path = getattr(args, "playbook", None)
+    if pb_path and args.client:
+        raise CliError("doctor checks one thing at a time: give -p PLAYBOOK or --client NAME, not both")
+    sheet: Optional[Dict[str, Any]] = None
+    if args.client:
+        client, pb = load_client_and_playbook(args, env)
+        what = f"client '{client.name}' ({client.display_name}; base playbook {client.playbook})"
+        sheet = dict(client.delivery.google_sheet or {})
+        next_step = f"leadgen deliver --client {client.name} --dry-run"
+    elif pb_path:
+        pb = load_playbook(pb_path, env=env)
+        what = f"playbook '{pb.name}' ({pb_path})"
+        next_step = f"leadgen run -p {pb_path}"
+    else:
+        raise CliError("doctor needs -p PLAYBOOK or --client NAME (e.g. leadgen doctor --client acme, or "
+                       "leadgen doctor -p playbooks/recruitment-delivery.yaml)")
+    http = make_http()
+    store = Store(":memory:")  # the doctor never reads or writes your database
+    try:
+        ctx = Context(playbook=pb, http=http, store=store, env=env, today=date.today(), log=log,
+                      dry_run=bool(args.dry_run))
+        _out(f"Checking the API keys of {what}, {mode_of(pb)} mode ...")
+        if args.dry_run:
+            _out("  (--dry-run: keys are only checked for presence - nobody is contacted)")
+        else:
+            _out("  (one free account / credits call per key - never a paid lookup)")
+        results = run_doctor(ctx, google_sheet=sheet)
+    finally:
+        store.close()
+        close_http(http)
+    _out("")
+    if not results:
+        _out("Nothing to check: no enabled adapters.")
+        return EXIT_OK
+    rows = [[_DOCTOR_STATUS.get(r.status, r.status), _doctor_adapter(r), r.detail, r.quota or "-"]
+            for r in results]
+    _out(format_table(["status", "adapter", "detail", "quota"], rows,
+                      widths={"adapter": 48, "detail": 240, "quota": 80}))
+    counts = {s: sum(1 for r in results if r.status == s) for s in _DOCTOR_STATUS}
+    problems = [r for r in results if r.status in ("failed", "missing_key")]
+    _out("")
+    _out(f"{counts['ok']} ok, {counts['failed']} failed, {counts['missing_key']} missing key, "
+         f"{counts['skipped']} skipped")
+    if problems:
+        _out("Fix the FAILED / MISSING KEY rows: API keys go in .env (see .env.example), then run the doctor again.")
+        sys.stderr.write(f"error: {len(problems)} adapter(s) need attention - see the table above\n")
+        return EXIT_PROBLEM
+    if counts["ok"]:
+        _out(f"Every key that was checked works. Next: {next_step}")
+    else:
+        _out(f"Nothing here needs a key{' check' if args.dry_run else ''}. Next: {next_step}")
+    return EXIT_OK
+
+
+# =============================================================================
 # replies / serve
 # =============================================================================
 
@@ -771,6 +1295,9 @@ REPLY_COLUMNS = ["received_at", "from_email", "subject", "category", "confidence
 
 
 def cmd_replies(args: argparse.Namespace) -> int:
+    gate = outbound_gate(args, "leadgen replies (reply handling)")
+    if gate is not None:
+        return gate
     from .outbound.csv_export import write_csv
     from .replies import handle_reply, load_replies_csv
 
@@ -832,6 +1359,9 @@ def cmd_replies(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    gate = outbound_gate(args, "leadgen serve (the reply webhook server)")
+    if gate is not None:
+        return gate
     from .server import WEBHOOK_PATHS, make_server
 
     session = open_session(args, need_playbook=True)
@@ -934,26 +1464,51 @@ def cmd_mark(args: argparse.Namespace) -> int:
 
 # host names: dot-separated labels (letters incl. IDN, digits, inner hyphens), TLD: 2+ chars, starts with a letter
 _DOMAIN_RE = re.compile(r"^(?=.{3,253}$)(?:[^\W_](?:[\w-]{0,61}[^\W_])?\.)+[^\W\d_][\w-]{1,62}$")
+# a LinkedIn profile / company page once normalised (no scheme, no www.): linkedin.com/in/jane-doe
+_LINKEDIN_RE = re.compile(r"^(?:[a-z0-9-]+\.)*linkedin\.com/\S+$")
 _CSV_DELIMITERS = (",", ";", "\t", "|")
-# header words that mark a do-not-contact column (compared without case / punctuation)
-_EMAIL_HEADER_WORDS = ("mail",)                      # email, e-mail, Email Address, E-Mail-Adresse ...
+# header words that mark a do-not-list column (compared without case / punctuation), per kind,
+# tried group by group: email, e-mail, Email Address ...; domain / website; company name ...
+_EMAIL_HEADER_WORDS = ("mail",)
 _DOMAIN_HEADER_WORDS = ("domain", "website", "url", "site", "value")
+_HEADER_WORDS: Dict[Optional[str], Tuple[Tuple[str, ...], ...]] = {
+    None: (_EMAIL_HEADER_WORDS, _DOMAIN_HEADER_WORDS),
+    "email": (_EMAIL_HEADER_WORDS, _DOMAIN_HEADER_WORDS),
+    "domain": (_EMAIL_HEADER_WORDS, _DOMAIN_HEADER_WORDS),
+    "company": (("company", "organisation", "organization", "employer", "business", "account"), ("name",)),
+    "linkedin": (("linkedin",), ("profile", "url")),
+}
+_KIND_HINT = {
+    None: "email address, domain or LinkedIn URL (for a company name add --kind company)",
+    "email": "email address",
+    "domain": "domain (e.g. acme.com)",
+    "company": "company name",
+    "linkedin": "LinkedIn profile URL (e.g. https://www.linkedin.com/in/jane-doe)",
+}
 
 
 def suppression_value(raw: Any, kind: Optional[str] = None) -> Optional[Tuple[str, str]]:
-    """One do-not-contact entry -> ``(value, kind)`` as the store matches it, or None.
+    """One do-not-list entry -> ``(value, kind)``, or None when it could never match.
+
+    ``kind`` None = auto-detect: a LinkedIn URL (``linkedin.com/...``) is a
+    ``linkedin`` entry, a value with an ``@`` an ``email``, anything else a
+    ``domain``. Company names are never guessed: they need ``kind="company"``.
 
     Understands the usual blocklist notations: ``Jane Doe <jane@x.com>`` and
     ``mailto:jane@x.com`` (-> the address), ``@acme.com`` / ``*@acme.com`` /
-    ``*.acme.com`` (-> the whole domain) and URLs (-> their domain). ``kind``
-    forces email / domain; without it a value with an ``@`` is an email.
-    Returns None for anything that is neither a valid email nor a plausible
-    domain (a name, a header cell, ``n/a`` ...), so it is never stored as an
-    entry that can't match.
+    ``*.acme.com`` (-> the whole domain) and URLs (-> their domain). Emails and
+    domains come back normalised; company names and LinkedIn URLs come back as
+    typed (trimmed) - the store / ledger normalises them when saving and matching.
+    Returns None for anything that is not a valid value of its kind (a person's
+    name without ``--kind company``, a header cell, ``n/a`` ...).
     """
     v = str(raw or "").strip().strip("'\"").strip()
     if not v:
         return None
+    if kind == "company":
+        return (v, "company") if normalize_suppression(v, "company") else None
+    if kind == "linkedin" or (kind is None and "linkedin.com/" in v.lower()):
+        return (v, "linkedin") if _LINKEDIN_RE.match(normalize_suppression(v, "linkedin")) else None
     if ("<" in v and ">" in v) or v.lower().startswith("mailto:"):
         v = parseaddr(v)[1].strip() or v
     whole_domain = False
@@ -975,32 +1530,34 @@ def _norm_header(h: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(h or "").lower())
 
 
-def _pick_column(rows: List[List[str]]) -> Tuple[int, bool]:
-    """``(column, has_header)`` holding the emails / domains of a do-not-contact CSV.
+def _pick_column(rows: List[List[str]], kind: Optional[str] = None) -> Tuple[int, bool]:
+    """``(column, has_header)`` holding the values of a do-not-list CSV.
 
-    A header naming an email column wins (``email``, ``E-mail``, ``Email Address``
-    ...), then one naming a domain / website column; among several candidates
-    the one with the most valid entries is used. Without a matching header the
-    column with the most valid entries is used, and the first row counts as a
-    header when its cell there is not a valid entry.
+    A header naming a column of the wanted kind wins (``email``, ``E-mail``,
+    ``Email Address`` ..., then a domain / website column; for ``--kind company``
+    a company column, for ``--kind linkedin`` a LinkedIn column); among several
+    candidates the one with the most valid entries is used. Without a matching
+    header the column with the most valid entries is used, and the first row
+    counts as a header when its cell there is not a valid entry.
     """
     header = [_norm_header(h) for h in rows[0]]
     body = rows[1:]
     width = max(len(r) for r in rows)
+    check_kind = kind if kind in ("company", "linkedin") else None
 
     def valid(col: int, rs: List[List[str]]) -> int:
-        return sum(1 for r in rs if len(r) > col and suppression_value(r[col]))
+        return sum(1 for r in rs if len(r) > col and suppression_value(r[col], check_kind))
 
-    for words in (_EMAIL_HEADER_WORDS, _DOMAIN_HEADER_WORDS):
+    for words in _HEADER_WORDS.get(kind, _HEADER_WORDS[None]):
         cands = [i for i, h in enumerate(header) if h and any(w in h for w in words)]
         if cands:
             return max(cands, key=lambda i: (valid(i, body), -i)), True
     col = max(range(width), key=lambda i: (valid(i, rows), -i))
     first = rows[0][col] if len(rows[0]) > col else ""
-    return col, suppression_value(first) is None
+    return col, suppression_value(first, check_kind) is None
 
 
-def _read_values_file(path: Path) -> List[str]:
+def _read_values_file(path: Path, kind: Optional[str] = None) -> List[str]:
     """Values from a TXT (one per line, # comments) or a CSV / TSV export.
 
     CSV: the delimiter (``, ; tab |``) is taken from the header line and the
@@ -1018,7 +1575,7 @@ def _read_values_file(path: Path) -> List[str]:
         rows = [r for r in csv.reader(lines, delimiter=delim) if any(c.strip() for c in r)]
         if not rows:
             return []
-        col, has_header = _pick_column(rows)
+        col, has_header = _pick_column(rows, kind)
         body = rows[1:] if has_header else rows
         return [r[col].strip() for r in body if len(r) > col and r[col].strip()]
     out = []
@@ -1030,13 +1587,16 @@ def _read_values_file(path: Path) -> List[str]:
 
 
 def _unsuppress(store: Store, raw: str, kind: Optional[str] = None) -> int:
-    """Remove exactly one entry: an email removes only that address, a domain only the
-    domain entry (``jane@acme.com`` never lifts a whole-domain block on ``acme.com``).
-    The value as typed is removed too, so malformed legacy entries can be cleaned up."""
+    """Remove exactly one entry from the global list: an email removes only that address,
+    a domain only the domain entry (``jane@acme.com`` never lifts a whole-domain block on
+    ``acme.com``). The value as typed is removed too, so malformed legacy entries can be
+    cleaned up. A value that is no email / domain / LinkedIn URL is tried as a company name."""
     targets = set()
     parsed = suppression_value(raw, kind)
     if parsed:
-        targets.add(parsed)
+        targets.add((normalize_suppression(parsed[0], parsed[1]), parsed[1]))
+    elif kind is None and normalize_suppression(str(raw or ""), "company"):
+        targets.add((normalize_suppression(str(raw), "company"), "company"))
     exact = str(raw or "").strip().lower()
     if exact:
         targets.update((exact, k) for k in ([kind] if kind else ["email", "domain"]))
@@ -1048,7 +1608,131 @@ def _unsuppress(store: Store, raw: str, kind: Optional[str] = None) -> int:
     return removed
 
 
+def _suppress_values(args: argparse.Namespace) -> List[str]:
+    """The VALUE argument plus the values of ``--file``."""
+    values: List[str] = [args.value] if args.value else []
+    if args.file:
+        fp = Path(args.file)
+        if not fp.is_file():
+            raise FileNotFoundError(2, "file not found", str(fp))
+        values += _read_values_file(fp, args.kind)
+    if not values:
+        raise CliError(f"suppress {args.action}: give a VALUE or --file")
+    return values
+
+
+def _report_invalid(invalid: List[str], kind: Optional[str]) -> None:
+    for v in invalid[:10]:
+        sys.stderr.write(f"warning: skipped {v!r} - not a valid {_KIND_HINT.get(kind, kind)}\n")
+    if len(invalid) > 10:
+        sys.stderr.write(f"warning: ... and {len(invalid) - 10} more invalid value(s)\n")
+
+
+def _suppression_table(rows: List[Dict[str, Any]]) -> str:
+    return format_table(["value", "kind", "reason", "added"],
+                        [[r["value"], r["kind"], r.get("reason") or "", r.get("added_at") or ""] for r in rows],
+                        widths={"value": 60, "reason": 40})
+
+
+def _client_target(args: argparse.Namespace, env: Dict[str, str]) -> Tuple[str, str, Optional[Client]]:
+    """``(client name, database, Client or None)`` for ``suppress --client NAME``.
+
+    The database is ``--db``, else the storage path of the client's playbook (the one
+    ``leadgen deliver`` records in). ``add`` needs an existing client file (a typo must
+    not start a list nobody reads); ``remove`` / ``list`` also work for a client whose
+    file is gone (then ``--db`` or the default database is used)."""
+    from .delivery.client import client_playbook, load_client
+
+    raw = str(args.client or "").strip()
+    p = Path(raw)
+    name = p.stem if p.suffix.lower() in (".yaml", ".yml") else p.name
+    known = list_clients(args.clients_dir)
+    exists = name in known or (p.suffix.lower() in (".yaml", ".yml") and p.is_file())
+    db = getattr(args, "db", None)
+    if not exists:
+        if args.action == "add":
+            msg = f"client '{raw}' not found in {args.clients_dir}/"
+            guess = difflib.get_close_matches(name, known, n=1, cutoff=0.6)
+            if guess:
+                msg += f" - did you mean '{guess[0]}'?"
+            elif known:
+                msg += f" (clients: {', '.join(known)})"
+            raise CliError(msg + f". Create it with: leadgen clients new {name}")
+        return name, db or DEFAULT_DB, None
+    try:
+        client = load_client(raw, args.clients_dir)
+        if not db:
+            db = str(client_playbook(client, env=env).db_path)
+    except ClientError as e:
+        raise CliError(str(e)) from e
+    return client.name, db, client
+
+
+def _suppress_client(args: argparse.Namespace) -> int:
+    """``suppress ... --client NAME``: that client's own do-not-list (the delivery ledger)."""
+    from .delivery.ledger import Ledger
+
+    name, db, client = _client_target(args, build_env(args))
+    store = open_store(db)
+    try:
+        ledger = Ledger(store)
+        whose = f"client '{name}'"
+        if args.action == "list":
+            rows = ledger.list_suppressed(name)
+            if rows:
+                _out(f"{len(rows)} value(s) on the do-not-list of {whose} in {store.path}:")
+                _out("")
+                _out(_suppression_table(rows))
+            else:
+                _out(f"The do-not-list of {whose} in {store.path} is empty.")
+            if client is not None:
+                ex = client.exclusions
+                extra = [f"{label}: {', '.join(map(str, items))}" for label, items in
+                         (("companies", ex.companies), ("domains", ex.domains), ("keywords", ex.keywords)) if items]
+                if extra:
+                    _out("")
+                    _out(f"Also left out by the client file ({client.path or name}) 'exclusions': " + "; ".join(extra))
+            return EXIT_OK
+        values = _suppress_values(args)
+        done = 0
+        invalid: List[str] = []
+        for v in values:
+            parsed = suppression_value(v, args.kind)
+            if args.action == "add":
+                if parsed is None:
+                    invalid.append(v)
+                    continue
+                try:
+                    ledger.suppress(name, parsed[0], parsed[1], args.reason or "manual")
+                except ValueError as e:
+                    log.debug("not added: %s", e)
+                    invalid.append(v)
+                    continue
+                done += 1
+            elif parsed is not None:
+                done += ledger.unsuppress(name, parsed[0], parsed[1])
+            elif args.kind is None and normalize_suppression(v, "company"):
+                done += ledger.unsuppress(name, v, "company")   # a company name typed without --kind
+        _report_invalid(invalid, args.kind)
+        verb, prep = ("Added", "to") if args.action == "add" else ("Removed", "from")
+        _out(f"{verb} {done} value(s)" + (f" (of {len(values)} given)" if done != len(values) else "")
+             + f" {prep} the do-not-list of {whose} in {store.path}.")
+        if args.action == "add" and done:
+            _out(f"They are never delivered to {name} (checked before any paid lookup).")
+        if invalid:
+            sys.stderr.write(f"error: {len(invalid)} value(s) were not added - fix them and add them again "
+                             f"(e.g. jane@acme.com, acme.com, a LinkedIn URL, or --kind company \"Acme Corp\")\n")
+            return EXIT_PROBLEM
+        return EXIT_OK
+    finally:
+        store.close()
+
+
 def cmd_suppress(args: argparse.Namespace) -> int:
+    if args.client:
+        if getattr(args, "playbook", None):
+            log.warning("-p is ignored with --client: the client's list lives in its playbook's database")
+        return _suppress_client(args)
     session = open_session(args, need_playbook=False)
     try:
         store = session.store
@@ -1059,18 +1743,9 @@ def cmd_suppress(args: argparse.Namespace) -> int:
                 return EXIT_OK
             _out(f"{len(rows)} suppressed value(s) in {store.path}:")
             _out("")
-            _out(format_table(["value", "kind", "reason", "added"],
-                              [[r["value"], r["kind"], r.get("reason") or "", r.get("added_at") or ""]
-                               for r in rows], widths={"value": 50, "reason": 40}))
+            _out(_suppression_table(rows))
             return EXIT_OK
-        values: List[str] = [args.value] if args.value else []
-        if args.file:
-            fp = Path(args.file)
-            if not fp.is_file():
-                raise FileNotFoundError(2, "file not found", str(fp))
-            values += _read_values_file(fp)
-        if not values:
-            raise CliError(f"suppress {args.action}: give a VALUE or --file")
+        values = _suppress_values(args)
         done = 0
         invalid: List[str] = []
         for v in values:
@@ -1083,17 +1758,13 @@ def cmd_suppress(args: argparse.Namespace) -> int:
                 done += 1
             else:
                 done += _unsuppress(store, v, args.kind)
-        for v in invalid[:10]:
-            sys.stderr.write(f"warning: skipped {v!r} - not a valid "
-                             f"{args.kind or 'email address or domain'}\n")
-        if len(invalid) > 10:
-            sys.stderr.write(f"warning: ... and {len(invalid) - 10} more invalid value(s)\n")
+        _report_invalid(invalid, args.kind)
         verb = "Added" if args.action == "add" else "Removed"
         _out(f"{verb} {done} value(s)" + (f" (of {len(values)} given)" if done != len(values) else "")
              + f" {'to' if args.action == 'add' else 'from'} the suppression list in {store.path}.")
         if invalid:
             sys.stderr.write(f"error: {len(invalid)} value(s) were not added - fix them and add them "
-                             f"again (e.g. jane@acme.com or acme.com)\n")
+                             f"again (e.g. jane@acme.com or acme.com, or --kind company \"Acme Corp\")\n")
             return EXIT_PROBLEM
         return EXIT_OK
     finally:
@@ -1101,6 +1772,9 @@ def cmd_suppress(args: argparse.Namespace) -> int:
 
 
 def cmd_followups(args: argparse.Namespace) -> int:
+    gate = outbound_gate(args, "leadgen followups")
+    if gate is not None:
+        return gate
     session = open_session(args, need_playbook=False)
     try:
         store = session.store
@@ -1133,17 +1807,36 @@ def cmd_followups(args: argparse.Namespace) -> int:
         session.close()
 
 
+def adapter_notes(kind: str, name: str, cls: Any = None) -> List[str]:
+    """Notes shown by ``leadgen adapters``: the 'use at own risk' note of scrapers
+    (``registry.risk_note``) and whether the adapter only works in outbound mode."""
+    notes: List[str] = []
+    risk = registry.risk_note(kind, name)
+    if risk:
+        notes.append(risk)
+    if kind == "exporter" and cls is not None and getattr(cls, "scope", "all") == "outbound":
+        notes.append("outbound mode only: hands leads to a sending tool")
+    if kind == "writer":
+        notes.append("outbound mode only: writes email copy")
+    return notes
+
+
 def cmd_adapters(args: argparse.Namespace) -> int:
-    _out("Adapter types by kind (use them as 'type:' in a playbook):")
+    _out("Adapter types by kind (use them as 'type:' in a playbook).")
+    _out("runs: offline = never uses the network; network (paid) = every request costs money or credits "
+         "and counts towards --budget / usage.max_paid_lookups.")
     for kind in registry.KINDS:
         _out("")
         _out(f"{kind}:")
         rows = []
         for name in registry.available(kind):
+            cls = None
             try:
                 cls = registry.resolve(kind, name)
                 env = getattr(cls, "env_key", "") or ""
                 where = "offline" if getattr(cls, "offline", False) else "network"
+                if where == "network" and (kind, name) in registry.PAID:
+                    where = "network (paid)"
                 doc = (cls.__doc__ or "").strip().splitlines()[0] if cls.__doc__ else ""
             except Exception as e:  # noqa: BLE001 - a broken optional adapter must not hide the rest
                 env, where, doc = "", "unavailable", f"cannot import: {e}"
@@ -1152,9 +1845,10 @@ def cmd_adapters(args: argparse.Namespace) -> int:
                 env = ", ".join(e for _, e in creds)
             if (kind, name) == ("llm", "openai_compatible"):
                 env = "writer.api_key_env"  # never OPENAI_API_KEY: that key only goes to api.openai.com
-            rows.append(["  " + name, where, env or "-", doc])
-        _out(format_table(["type", "runs", "credential", "description"], rows,
-                          widths={"description": 70}))
+            notes = "; ".join(adapter_notes(kind, name, cls))
+            rows.append(["  " + name, where, env or "-", doc, notes or "-"])
+        _out(format_table(["type", "runs", "credential", "description", "notes"], rows,
+                          widths={"description": 60, "notes": 90}))
     return EXIT_OK
 
 
@@ -1185,12 +1879,20 @@ def _add_global_options(p: argparse.ArgumentParser, suppress: bool) -> None:
                    help="KEY=VALUE file with API keys (default: .env; existing env vars win)")
 
 
+def _add_budget(sp: argparse.ArgumentParser, what: str) -> None:
+    sp.add_argument("--budget", type=int, metavar="N",
+                    help=f"at most N paid lookups (requests to paid providers) this run; 0 = no cap. "
+                         f"Overrides {what}. For no paid calls at all use --dry-run")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="leadgen",
-        description="Signal-led lead generation: find companies with a reason to buy now, "
-                    "find the decision-maker, verify the email, score, write and export.",
-        epilog="Start here: leadgen run -p playbooks/demo-offline.yaml   (no API keys needed)")
+        description="Signal-led lead generation: find companies with a reason to buy now (e.g. they are "
+                    "hiring), find the decision-maker, verify the email, score, and deliver lead files "
+                    "(delivery mode) or run outreach (outbound mode).",
+        epilog="Start here: leadgen deliver --client demo-client --dry-run   or   "
+               "leadgen run -p playbooks/demo-delivery.yaml   (no API keys needed)")
     parser.add_argument("--version", action="version", version=f"leadgen {__version__}")
     _add_global_options(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -1202,21 +1904,52 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(func=func)
         return sp
 
+    def clients_dir(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--clients-dir", default=DEFAULT_CLIENTS_DIR, metavar="DIR",
+                        help=f"folder with the client files (default: {DEFAULT_CLIENTS_DIR})")
+
     sp = add("init", cmd_init, "create a new playbook from a template")
     sp.add_argument("name", help="playbook name (letters, digits, - _ .)")
     sp.add_argument("--template", choices=TEMPLATES, default="generic", help="template to copy (default: generic)")
     sp.add_argument("--dir", default="playbooks", help="where to write it (default: playbooks)")
 
-    sp = add("validate", cmd_validate, "check a playbook: adapters, config and API keys")
+    sp = add("validate", cmd_validate, "check a playbook: mode, adapters, config and API keys")
     sp.add_argument("--dry-run", action="store_true",
                     help="check for a --dry-run (keys of network adapters become optional)")
 
-    sp = add("run", cmd_run, "run the pipeline once: find, filter, enrich, verify, score, write, export")
+    sp = add("run", cmd_run, "run the pipeline once (delivery mode: up to scored lead files; "
+                             "outbound mode: also write + hand over)")
     sp.add_argument("--out", metavar="DIR", help="output folder (default: output/<playbook>/); "
                                                  "each run gets its own sub-folder")
     sp.add_argument("--limit", type=int, metavar="N", help="only enrich/score the top N companies (cheap test)")
     sp.add_argument("--dry-run", action="store_true",
                     help="skip everything that uses the network (no paid API calls, nothing sent)")
+    _add_budget(sp, "the playbook's usage.max_paid_lookups")
+
+    sp = add("deliver", cmd_deliver, "make one client's weekly Hiring Signal Report (CSV / Excel / HTML)")
+    sp.add_argument("--client", required=True, metavar="NAME",
+                    help="the client file: NAME = clients/NAME.yaml (see: leadgen clients)")
+    clients_dir(sp)
+    sp.add_argument("--dry-run", action="store_true",
+                    help="preview: offline sources only, files named ...-PREVIEW, nothing recorded as "
+                         "delivered, no Google Sheets push, no paid calls")
+    _add_budget(sp, "the client file's budget.max_paid_lookups and the playbook's usage.max_paid_lookups")
+    sp.add_argument("--out", metavar="DIR",
+                    help="output folder (default: the client file's delivery.folder, "
+                         "deliveries/{client}/{date}); {client} and {date} are filled in")
+
+    sp = add("clients", cmd_clients, "list your clients (volume + delivery history), or create a client file")
+    sp.add_argument("action", nargs="?", choices=("list", "new"), default="list",
+                    help="list (default) or new")
+    sp.add_argument("name", nargs="?", help="new: the client's short name (lower-case letters, digits, - and _)")
+    clients_dir(sp)
+
+    sp = add("doctor", cmd_doctor, "test every API key a playbook (-p) or client (--client) uses - "
+                                   "one free call per key, never a paid lookup")
+    sp.add_argument("--client", metavar="NAME", help="check the keys this client's delivery uses "
+                                                     "(instead of -p PLAYBOOK)")
+    clients_dir(sp)
+    sp.add_argument("--dry-run", action="store_true", help="only check that keys are set; contact nobody")
 
     sp = add("demo", cmd_demo, "write the 'live opportunities' report (Markdown + HTML) for a run")
     sp.add_argument("--run", default="latest", metavar="RUN_ID", help="run id or 'latest' (default)")
@@ -1230,11 +1963,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tier", choices=(Tier.HOT, Tier.NORMAL, Tier.SKIP), help="only this tier")
     sp.add_argument("--limit", type=int, default=20, help="rows to show (default 20; 0 = all)")
 
-    sp = add("replies", cmd_replies, "classify a replies CSV and act on each reply")
+    sp = add("replies", cmd_replies, "(outbound mode) classify a replies CSV and act on each reply")
     sp.add_argument("--file", required=True, metavar="CSV", help="replies export (from_email, subject, body, ...)")
     sp.add_argument("--out", metavar="DIR", help="where replies_classified.csv goes (default: output/<playbook>/)")
 
-    sp = add("serve", cmd_serve, "run the reply webhook server (Instantly / Smartlead / generic)")
+    sp = add("serve", cmd_serve, "(outbound mode) run the reply webhook server (Instantly / Smartlead / generic)")
     sp.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8787, help="port (default 8787)")
     sp.add_argument("--token", help=f"shared secret required on every webhook (default: ${WEBHOOK_TOKEN_ENV})")
@@ -1251,20 +1984,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--note", help="free-text note stored with the change")
     sp.add_argument("--force", action="store_true", help="allow moving a lead backwards")
 
-    sp = add("suppress", cmd_suppress, "manage the do-not-contact list")
+    sp = add("suppress", cmd_suppress, "manage the do-not-list: global, or one client's with --client")
     sp.add_argument("action", choices=("add", "remove", "list"))
-    sp.add_argument("value", nargs="?", help="an email address or a domain (also 'Name <email>', "
-                                             "'@domain' / '*@domain' for a whole domain)")
-    sp.add_argument("--kind", choices=("email", "domain"), help="default: email if it contains @, else domain")
+    sp.add_argument("value", nargs="?", help="an email address, a domain, a LinkedIn profile URL, or (with "
+                                             "--kind company) a company name. Also 'Name <email>', "
+                                             "'@domain' / '*@domain' for a whole domain")
+    sp.add_argument("--kind", choices=SUPPRESSION_KINDS,
+                    help="default: linkedin for a linkedin.com URL, email if it contains @, else domain "
+                         "(company names always need --kind company)")
+    sp.add_argument("--client", metavar="NAME", help="this client's own do-not-list (never delivered to "
+                                                     "them) instead of the global list")
+    clients_dir(sp)
     sp.add_argument("--reason", help="why (shown in the list)")
     sp.add_argument("--file", metavar="CSV/TXT", help="many values: one per line, or a CSV / TSV export "
-                                                      "(its email - else domain / website - column is used)")
+                                                      "(its email - else domain / website - column is used; "
+                                                      "with --kind company its company column)")
 
-    sp = add("followups", cmd_followups, "list follow-ups that are due (from timing / out-of-office replies)")
+    sp = add("followups", cmd_followups, "(outbound mode) list follow-ups that are due "
+                                         "(from timing / out-of-office replies)")
     sp.add_argument("--done", type=int, metavar="ID", help="mark this follow-up as done")
     sp.add_argument("--days", type=int, default=0, help="also show those due in the next N days")
 
-    add("adapters", cmd_adapters, "list every adapter type per kind")
+    add("adapters", cmd_adapters, "list every adapter type per kind (offline / network / paid, key, notes)")
     return parser
 
 
@@ -1313,7 +2054,7 @@ def _dispatch(args: argparse.Namespace, verbose: int) -> int:
         except (OSError, ValueError, AttributeError):
             pass
         return EXIT_OK
-    except (CliError, PlaybookError, MissingCredentialError, FileNotFoundError,
+    except (CliError, PlaybookError, ClientError, MissingCredentialError, FileNotFoundError,
             registry.UnknownAdapterError) as e:
         if verbose:
             traceback.print_exc()

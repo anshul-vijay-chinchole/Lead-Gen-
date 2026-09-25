@@ -126,7 +126,8 @@ def test_load_env_file_never_overrides_existing(tmp_path):
 
 
 def test_env_file_feeds_playbook_placeholders(tmp_path, g, capsys, monkeypatch):
-    pb = write_playbook(tmp_path, {"name": "envtest", "offer": {"sender_name": "${SENDER_NAME}"},
+    # outbound: offer.sender_name signs emails (delivery mode never writes any, so never warns about it)
+    pb = write_playbook(tmp_path, {"name": "envtest", "mode": "outbound", "offer": {"sender_name": "${SENDER_NAME}"},
                                    "sources": [{"type": "csv", "path": "examples/data/demo_signals.csv"}],
                                    "buyers": {"titles": ["CEO"]}})
     assert main(["validate", "-p", pb, *g]) == 0
@@ -256,6 +257,7 @@ def test_validate_demo_offline_passes(g, capsys):
 def test_validate_broken_playbook_fails(tmp_path, g, capsys):
     pb = write_playbook(tmp_path, {
         "name": "broken",
+        "mode": "outbound",   # the writer + hand-over exporters are only checked strictly in outbound mode
         "sources": [{"type": "nosuchsource"},
                     {"type": "csv", "path": "does/not/exist.csv"},
                     {"type": "theirstack"},
@@ -297,7 +299,7 @@ def test_validate_with_keys_present_passes(tmp_path, capsys, monkeypatch):
 def test_validate_openai_compatible_needs_explicit_key(tmp_path, g, capsys, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     pb = write_playbook(tmp_path, {
-        "name": "compat", "sources": [{"type": "csv", "path": "examples/data/demo_signals.csv"}],
+        "name": "compat", "mode": "outbound", "sources": [{"type": "csv", "path": "examples/data/demo_signals.csv"}],
         "writer": {"type": "ai", "provider": "openai_compatible", "model": "llama",
                    "base_url": "https://openrouter.ai/api/v1"}})
     assert main(["validate", "-p", pb, *g]) == 1
@@ -670,7 +672,8 @@ def test_suppress_add_file_website_column(tmp_path, g, capsys):
 
 
 def test_followups(tmp_path, g, capsys):
-    assert main(["followups", *g]) == 0
+    # followups is an outbound-mode command: without -p the default mode (delivery) refuses it
+    assert main(["followups", "-p", DEMO, *g]) == 0
     assert "No follow-ups due" in capsys.readouterr().out
     run_demo(g, tmp_path)
     replies = tmp_path / "r.csv"
@@ -685,11 +688,11 @@ def test_followups(tmp_path, g, capsys):
     assert "graham.holt@redfern-demo.com" in out and "Redfern Manufacturing" in out and "timing" in out
     store = Store(g[1])
     fid = store.conn.execute("SELECT id FROM followups").fetchone()["id"]
-    assert main(["followups", "--done", str(fid), *g]) == 0
+    assert main(["followups", "-p", DEMO, "--done", str(fid), *g]) == 0
     assert "marked done" in capsys.readouterr().out
     assert main(["followups", "-p", DEMO, "--days", "120", *g]) == 0
     assert "No follow-ups due" in capsys.readouterr().out
-    assert main(["followups", "--done", "9999", *g]) == 1
+    assert main(["followups", "-p", DEMO, "--done", "9999", *g]) == 1
     store.close()
 
 
