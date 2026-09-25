@@ -80,13 +80,20 @@ Tables in the same SQLite file as the `Store` (created on first use, via `store.
 `client_suppression(client, kind, value, reason, added_at, PRIMARY KEY(client, kind, value))`.
 * `company_item_key(company) -> str` (= `company.key`)
 * `job_item_key(company, signal) -> str` - `"<company.key>|<external_id>"`, else the
-  URL without query/fragment, else the signal fingerprint
-* `contact_item_key(contact) -> str` - email, else normalised LinkedIn URL, else `name|company`
+  URL without tracking parameters (utm_*, gh_src, lever-source, ...; parameters that
+  identify the job such as Indeed `jk` / Greenhouse `gh_jid` are kept), else
+  `<company.key>|<signal fingerprint>`
+* `contact_item_key(contact) -> str` - email, else `linkedin_key(url)` (any country host,
+  nothing after `/in/<name>`), else `name|company`
+* `lead_items(lead)` - the (kind, key) pairs recorded for a delivered lead. For a company
+  with a domain the same items are also recorded under "by name" bookkeeping kinds, so
+  the company is recognised when a later source lists it without a website.
 * `class Ledger(store)`:
   `delivered(client, kind, key, window_days: Optional[int], today) -> bool`
   (window None = ever; N = within the last N days);
   `record(client, items: Iterable[Tuple[kind, key]], run_id, today) -> int`;
-  `summary(client) -> dict` (`deliveries`, `last_delivery`, counts per kind);
+  `summary(client) -> dict` (`deliveries` - from the append-only `delivery_runs` table -,
+  `first_delivery`, `last_delivery`, counts per kind);
   `list_clients_with_history() -> List[str]`;
   `suppress(client, value, kind, reason="")`, `unsuppress(client, value, kind=None) -> int`,
   `is_suppressed(client, email="", domain="", company="", linkedin="") -> bool`,
@@ -98,8 +105,13 @@ Tables in the same SQLite file as the `Store` (created on first use, via `store.
   signals whose `job_item_key` was delivered (when `job` in dedupe); a company
   left with no signal -> reason "all its jobs were already delivered".
   `filter_contact` rejects contacts delivered before (when `contact` in dedupe) or
-  suppressed for the client (email / linkedin). Counts what it removed in
-  `.removed = {"company": n, "job": n, "contact": n, "suppressed": n}`.
+  suppressed for the client (email / linkedin). `filter_enriched` (after enrichment,
+  before verification) drops a company without a website whose people turn out to be
+  at a domain on the client's do-not-list (`company_do_not_list` also checks the
+  company LinkedIn page and the provider's `email_domain` hint). Counts what it removed
+  in `.removed = {"company": n, "job": n, "contact": n, "suppressed": n}`. (The pipeline
+  applies the same after-enrichment check to the global suppression list and
+  `icp.exclude_domains`.)
 
 ### `delivery/opening.py`
 * `template_line(row: dict) -> str` - free, factual, no AI: e.g.
@@ -128,8 +140,11 @@ Tables in the same SQLite file as the `Store` (created on first use, via `store.
   print-friendly, every value `html.escape`d, works with 0 rows.
 * `push_google_sheet(pkg, cfg: dict, ctx) -> str` - gspread (lazy import; clear
   `RuntimeError` if missing), service account from `cfg.service_account_file` or
-  `GOOGLE_APPLICATION_CREDENTIALS`; worksheet name `cfg.worksheet` with `{date}`;
-  replaces its contents; returns the sheet URL. Not called in dry runs.
+  `GOOGLE_APPLICATION_CREDENTIALS`; worksheet name `cfg.worksheet` with `{date}` /
+  `{client}`; a `{date}` tab that already holds data is never overwritten (rows go to
+  `<tab>-2`, `-3`, ...), a fixed name is replaced; written without clearing first, so a
+  failed push leaves the tab unchanged; returns the sheet URL. Not called in dry runs
+  or for an empty delivery.
 * `write_all(pkg, folder, formats) -> Dict[str, Path]` - file names
   `<client>-hiring-signals-<YYYY-MM-DD>.<ext>`.
 

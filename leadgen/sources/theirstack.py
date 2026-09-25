@@ -37,6 +37,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from ..http import HttpError
+from ..usage import BudgetExceeded
 from ..models import Company, SignalType
 from ..utils import get_path, to_int
 from .base import Source
@@ -181,6 +182,12 @@ class TheirStackSource(Source):
                     raise
                 self.log.warning("source %s: page %d failed (%s); keeping %d companies",
                                  self.label, page, e, len(collector))
+                break
+            except BudgetExceeded as e:
+                if page == 0:
+                    raise  # nothing was paid for yet
+                self.budget_stop = str(e)
+                self.log.warning("source %s: %s; keeping %d companies", self.label, e, len(collector))
                 break
             pages += 1
             if not isinstance(data, dict):

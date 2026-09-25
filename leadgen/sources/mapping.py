@@ -1070,6 +1070,10 @@ class RecordMapper:
         linkedin = clean_url(val("person_linkedin_url"))
         if not (first or last or full or email or linkedin):
             return None
+        raw_status = as_text(val("email_status"))
+        if email and raw_status:
+            data = dict(data or {})
+            data.setdefault("email_status_raw", raw_status)  # e.g. Apollo export 'Guessed' / 'Extrapolated'
         return Contact(
             first_name=first, last_name=last, full_name=full,
             title=clean_title(val("title")),

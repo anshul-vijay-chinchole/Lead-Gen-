@@ -390,6 +390,10 @@ def from_dict(data: Dict[str, Any], path: Optional[Path] = None,
     for key, default in DEFAULTS.items():
         if merged.get(key) is None:
             merged[key] = copy.deepcopy(default)
+    # a single mapping (``exporters: {type: csv}``) is a one-item list everywhere else
+    for section, key in (("enrichment", "finders"), ("outbound", "exporters"), ("notify", "channels")):
+        if isinstance(merged.get(section), dict) and key in merged[section]:
+            merged[section][key] = _as_list(merged[section][key])
     problems = validate(merged)
     if problems:
         where = f" ({path})" if path else ""

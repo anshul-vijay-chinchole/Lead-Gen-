@@ -823,6 +823,18 @@ def client_playbook(client: Client, env: Optional[Dict[str, str]] = None) -> Pla
     sig["max_age_days"] = int(client.freshness_days)
     sig["allow_undated"] = bool(client.allow_undated)
     sig["drop_reposts"] = bool(client.drop_reposts)
+    # sources with their own date window must look back at least freshness_days
+    # (widen only, never narrow: the signals stage applies the exact window)
+    windows = {"adzuna": "max_days_old", "theirstack": "max_age_days"}
+    for src in data.get("sources") or []:
+        key = windows.get(str(src.get("type"))) if isinstance(src, dict) else None
+        if key:
+            try:
+                current = int(src.get(key) or 0)
+            except (TypeError, ValueError):
+                current = 0
+            if current and current < int(client.freshness_days):
+                src[key] = int(client.freshness_days)
 
     buyers = _section(data, "buyers")
     if client.buyer_titles:

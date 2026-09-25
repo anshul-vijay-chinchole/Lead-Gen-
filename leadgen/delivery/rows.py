@@ -12,8 +12,9 @@ Email honesty - ``email_status`` is always exactly one of:
                       AND the address was not built from a name pattern
   risky               a real address from a provider / import that is not
                       confirmed (catch-all domain, or never checked)
-  guessed-unverified  built from a name pattern (first.last@...). ALWAYS this
-                      label, whatever a checker said: a guess is never "verified"
+  guessed-unverified  built from a name pattern (first.last@...) - by us or, per its
+                      own status ('guessed', 'extrapolated'), by the data provider.
+                      ALWAYS this label, whatever a checker said: a guess is never "verified"
   not found           no usable email in this file (none found, it failed
                       verification, or it was withheld by the client's email policy)
 """
@@ -71,6 +72,10 @@ SIGNAL_LABELS: Dict[str, str] = {
 
 MAX_JOB_TITLES = 5
 
+# Raw provider statuses meaning "the provider guessed this address from a pattern".
+GUESS_STATUS_WORDS = ("guess", "extrapolat", "pattern")
+_RAW_STATUS_KEYS = ("email_status_raw", "apollo_email_status", "csv_email_status")
+
 
 def columns(include_opening: bool = False) -> List[Tuple[str, str]]:
     return BASE_COLUMNS + ([OPENING_COLUMN] if include_opening else [])
@@ -88,6 +93,10 @@ def is_guessed(contact: Optional[Contact]) -> bool:
         return True
     if contact.source == "pattern":
         return True
+    for key in _RAW_STATUS_KEYS:  # the data provider itself says it guessed the address
+        raw = str(contact.data.get(key) or "").strip().lower()
+        if raw and any(w in raw for w in GUESS_STATUS_WORDS):
+            return True
     return contact.email in (contact.email_candidates or [])
 
 
@@ -178,6 +187,7 @@ def build_row(lead: Lead, today: date, include_unverified: bool = True,
         # internal (never written to client files)
         "_lead_id": lead.id,
         "_company_key": c.key,
+        "_job_location": (top.location or "") if top else "",
         "_signal_types": sorted({s.type for s in c.signals or []}),
     }
     if include_opening:

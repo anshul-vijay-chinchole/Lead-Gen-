@@ -192,7 +192,8 @@ overwritten: the next one goes to `<folder>-2`, `-3`, ...
   into `usage`. `0` = no cap.
 * `Adapter.http` wraps `ctx.http` in `MeteredHttp(inner, meter, adapter_kind, type_name, paid)`.
   `registry.create` sets `adapter.adapter_kind`, `type_name` and `paid =
-  (kind, type) in registry.PAID`. Every request is counted per adapter. A request
+  registry.is_paid(kind, type)` (the built-in `registry.PAID` types plus plugins
+  registered with `paid=True`). Every request is counted per adapter. A request
   by a paid adapter is a **paid lookup**. Once the cap is reached,
   `before_request` raises `BudgetExceeded` **before** the network is touched.
   Free adapters keep working.
@@ -329,8 +330,9 @@ Every category is also a `notify` event. Input comes from `leadgen replies
   grouped delivery-first. `tests/test_e2e_delivery.py` checks that it stays complete.
 * `LEADGEN_PLUGINS=module_a,module_b` imports those modules before any
   command, so they can `registry.register(kind, type, "module:Class")` their
-  own adapters. Plugin types are metered but are not paid lookups (`registry.PAID`
-  lists the built-in paid types only).
+  own adapters. Plugin types are metered; one registered with
+  `register(kind, type, target, paid=True)` is a paid lookup capped by `--budget`
+  (`registry.is_paid` = `registry.PAID` plus those plugins).
 * CLI exit codes: 0 ok, 1 the command ran but found a problem (e.g. `deliver`
   delivered nothing, `doctor` found a bad key), 2 usage / configuration error
   (one friendly line on stderr; traceback with `-v`).

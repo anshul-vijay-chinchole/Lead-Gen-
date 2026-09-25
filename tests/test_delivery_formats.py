@@ -793,3 +793,16 @@ def test_worksheet_title_limits():
     assert formats.worksheet_title("", pkg) == "2026-09-24"
     assert formats.worksheet_title("  Week   {date} ", pkg) == "Week 2026-09-24"
     assert len(formats.worksheet_title("x" * 300, pkg)) == 100
+
+
+def test_provider_guessed_email_is_never_labelled_verified():
+    """Apollo / CSV exports mark some addresses 'Guessed' / 'Extrapolated': even if a
+    verifier later says valid, the client file says guessed-unverified."""
+    from leadgen.delivery.rows import GUESSED, VERIFIED, email_label
+    from leadgen.models import Contact
+    for key, raw in (("email_status_raw", "Guessed"), ("apollo_email_status", "extrapolated"),
+                     ("csv_email_status", "pattern guess")):
+        ct = Contact(full_name="Jane Doe", email="jane@acme.com", email_status="valid", data={key: raw})
+        assert email_label(ct) == GUESSED
+    assert email_label(Contact(full_name="Jane Doe", email="jane@acme.com", email_status="valid",
+                               data={"email_status_raw": "Verified"})) == VERIFIED

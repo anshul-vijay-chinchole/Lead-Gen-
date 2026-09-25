@@ -225,7 +225,7 @@ def test_record_mapper_full_record():
     assert c.location == "Leeds, UK" and c.country == "UK" and c.data == {"rating": 4.2, "city": "Leeds"}
     [ct] = c.contacts
     assert (ct.full_name, ct.title, ct.email, ct.email_status) == ("Jane Doe", "CFO", "jane@acme.com", "valid")
-    assert ct.phone == "+44 1" and ct.location == "York" and ct.data == {"source_id": "p1"} and ct.source == "lbl"
+    assert ct.phone == "+44 1" and ct.location == "York" and ct.data == {"source_id": "p1", "email_status_raw": "valid"} and ct.source == "lbl"
     job, fund = c.signals
     assert job.type == "job_posting" and job.title == "AP Clerk" and job.posted_at == date(2026, 9, 19)
     assert job.external_id == "77" and job.location == "Leeds" and len(job.description) <= 1500

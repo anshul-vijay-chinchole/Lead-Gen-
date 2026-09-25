@@ -114,7 +114,7 @@ Delivery QA - Northstar Finance Recruiting (demo-client) - 2026-09-25
       1  excluded keyword 'staffing' in name
       1  no live job posting
   duplicates removed ......... 0
-  on a do-not-list ........... 1
+  on a do-not-list ........... 3
   held back (over the limit) . 2 - not recorded, so they can go in a later delivery
   verified email rate ........ 50% (5 of 10)
   email status ............... verified 5, risky 3, guessed-unverified 1, not found 1
@@ -381,8 +381,12 @@ client file, install the extra package with `pip install -e ".[sheets]"`, and gi
 a Google service account. Use either `service_account_file:` in the client file,
 `GOOGLE_APPLICATION_CREDENTIALS` (path to the JSON key file), or
 `GOOGLE_SERVICE_ACCOUNT_JSON` (the JSON itself) in `.env`. Share the sheet with the
-service account's email address. Each delivery replaces the worksheet named by
-`worksheet` (default: the date). `leadgen doctor --client <name>` checks the credentials
+service account's email address. With `{date}` in `worksheet` (the default) each delivery
+gets its own tab that is never overwritten: if that tab already holds data (a second
+delivery the same day, or another client sharing the spreadsheet) the rows go to
+`<date>-2`, `-3`, ... A fixed name without `{date}` is a rolling tab that each delivery
+replaces. A delivery with no leads does not touch the sheet, and a failed push leaves the
+tab as it was. `leadgen doctor --client <name>` checks the credentials
 without contacting Google. A failed push is a QA warning; the files are still complete.
 Dry runs never push.
 
@@ -504,7 +508,7 @@ Printed after every delivery and saved as `_internal/qa.txt` (and `qa.json`):
 | delivered (target N), M hot | Rows in the file vs `leads_per_week`. |
 | filtered out + top reasons | Everything left out, grouped (details are in `_internal/not_delivered.csv`). |
 | duplicates removed | Already delivered to this client, plus the same company or person twice in this run. |
-| on a do-not-list | Removed by the global or the client's do-not-list. |
+| on a do-not-list | Removed by the global or the client's do-not-list (including the client file's `exclusions`). |
 | held back (over the limit) | Good leads over `leads_per_week`; not recorded, so they can go out next time. |
 | verified email rate | `verified` emails / rows delivered. |
 | email status | Count per label. |

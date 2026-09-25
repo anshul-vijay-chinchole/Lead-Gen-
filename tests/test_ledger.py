@@ -754,8 +754,7 @@ registry.register("finder", "ledger_people", "tests.test_ledger:PeopleFinder")
     # the client file's exclusions.domains are icp.exclude_domains: select_contacts drops Bo before
     # filter_contact sees him, so the hooks never learn the domain. deliver() must also drop leads for
     # which LedgerHooks.company_do_not_list(lead.company) gives a reason (leadgen/delivery/run.py).
-    pytest.param(False, marks=pytest.mark.xfail(reason="needs deliver()/select_leads to call "
-                                                       "LedgerHooks.company_do_not_list after enrichment")),
+    False,
 ])
 def test_do_not_list_company_found_only_by_enrichment_is_not_delivered(delivery_ws, store, tmp_path, stored):
     """A name-only company whose decision-maker turns out to be at a do-not-list domain is

@@ -295,3 +295,53 @@ def test_ai_reply_classifier_retries_truncated_output(make_ctx):
     r = classify_ai(Reply(from_email="a@b.com", body="Sounds great, send details"), ctx)
     assert r.category == "positive" and r.classifier == "ai"
     assert ctx.llm.calls[1]["max_tokens"] == 2 * ctx.llm.calls[0]["max_tokens"]
+
+
+def test_post_is_not_resent_after_a_read_timeout(monkeypatch):
+    """A paid POST (AI call, Apollo reveal) that timed out waiting for the answer may already
+    be billed: it must not be sent again. GETs and never-sent requests are retried."""
+    import requests
+    from leadgen.http import HttpClient, HttpError
+    calls = []
+
+    def fake(method, url, **kw):
+        calls.append(method)
+        raise requests.exceptions.ReadTimeout("read timed out")
+    c = HttpClient(retries=3, sleep=lambda s: None)
+    monkeypatch.setattr(c.session, "request", fake)
+    with pytest.raises(HttpError):
+        c.post("https://api.example.com/v1/messages", json={})
+    assert calls == ["POST"]
+    calls.clear()
+    with pytest.raises(HttpError):
+        c.get("https://api.example.com/v1/x")
+    assert calls == ["GET"] * 4
+
+
+def test_global_suppression_blocks_domainless_company_found_via_its_people(make_ctx, tmp_path):
+    """A company without a website whose decision-maker is at a suppressed domain is dropped."""
+    import csv as _csv
+    from leadgen.pipeline import Pipeline
+    src = tmp_path / "jobs.csv"
+    with open(src, "w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["Company", "Employees", "Job Title", "Date Posted", "First Name", "Last Name", "Title",
+                    "Email", "Email Status"])
+        w.writerow(["Big Client Inc", 100, "Accountant", "1 day ago", "Bo", "Lee", "CFO",
+                    "bo@bigclient.example", "verified"])
+    ctx = make_ctx(mode="delivery", sources=[{"type": "csv", "path": str(src)}],
+                   buyers={"titles": ["CFO"]}, notify={"channels": []})
+    ctx.store.suppress("bigclient.example", "domain", "asked not to be listed")
+    res = Pipeline(ctx, out_dir=tmp_path / "out").run()
+    assert res.leads == []
+    assert any("suppression list" in r["reason"] for r in res.rejected)
+
+
+def test_ledger_counts_every_delivery_run(tmp_path):
+    from leadgen.delivery.ledger import Ledger
+    s = Store(":memory:")
+    lg = Ledger(s)
+    lg.record("acme", [("company", "acme.com")], run_id="r1", today=date(2026, 6, 1))
+    lg.record("acme", [("company", "acme.com")], run_id="r2", today=date(2026, 9, 25))  # re-delivered
+    summ = lg.summary("acme")
+    assert summ["deliveries"] == 2 and summ["first_delivery"] == "2026-06-01"

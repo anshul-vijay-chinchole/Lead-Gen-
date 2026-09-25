@@ -2,7 +2,8 @@
 
 Every adapter reaches the network through ``Adapter.http``, which wraps
 ``ctx.http`` in a ``MeteredHttp``. Each request is counted per adapter; a
-request made by a *paid* adapter (see ``registry.PAID``) is a "paid lookup".
+request made by a *paid* adapter (``registry.is_paid``: the built-in
+``registry.PAID`` types plus plugins registered with ``paid=True``) is a "paid lookup".
 When ``UsageMeter.max_paid_lookups`` (the ``--budget`` flag, or
 ``usage.max_paid_lookups``) is reached, further paid requests raise
 ``BudgetExceeded`` *before* touching the network - free adapters keep working.

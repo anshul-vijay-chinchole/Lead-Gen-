@@ -74,7 +74,7 @@ class Adapter:
         self.ctx = ctx
 
     # Set by registry.create: the adapter's kind + type, and whether its requests
-    # are paid lookups (registry.PAID). Adapters built by hand default to free.
+    # are paid lookups (registry.is_paid). Adapters built by hand default to free.
     adapter_kind: str = ""
     type_name: str = ""
     paid: bool = False

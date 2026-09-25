@@ -34,7 +34,7 @@ from .outbound.base import ExportResult
 from .scoring import score, tier_for
 from .signals import process_signals
 from .usage import BudgetExceeded
-from .utils import normalize_company_name
+from .utils import is_personal_email, normalize_company_name, normalize_domain
 from .writer import build_writer
 
 MAX_CANDIDATES_TO_VERIFY = 3
@@ -86,6 +86,7 @@ class RunResult:
             f"  match the ICP ........... {c.get('qualified', 0)}",
             f"  decision-maker found .... {c.get('enriched', 0)}",
             f"  email verified .......... {c.get('verified', 0)}",
+            f"  email accepted .......... {c.get('usable_email', 0)}",
             f"  hot / normal / skip ..... {c.get('hot', 0)} / {c.get('normal', 0)} / {c.get('skip', 0)}",
             f"  sequences written ....... {c.get('written', 0)}",
             f"  handed to outbound ...... {c.get('exported', 0)}",
@@ -116,6 +117,23 @@ class PipelineHooks:
 
     def filter_contact(self, company: Company, contact: Contact) -> Optional[str]:
         return None
+
+    def filter_enriched(self, company: Company) -> Optional[str]:
+        """Runs after enrichment, before any email is verified: more is known now (e.g.
+        the email domain of a company that arrived without a website). Return a
+        reason to drop the company."""
+        return None
+
+
+def _enriched_domains(company: Company) -> List[str]:
+    """Domains learnt about a company without a website: provider hint + people's emails."""
+    if company.domain:
+        return []
+    data = company.data if isinstance(company.data, dict) else {}
+    found = [str(data.get("email_domain") or "")]
+    found += [normalize_domain(ct.email) for ct in company.contacts or []
+              if isinstance(ct, Contact) and ct.email and not is_personal_email(ct.email)]
+    return [d for d in dict.fromkeys(found) if d]
 
 
 def merge_companies(companies: List[Company]) -> List[Company]:
@@ -189,6 +207,10 @@ class Pipeline:
                 got = src.fetch()
                 self.ctx.log.info("source %s: %d companies", label, len(got))
                 companies.extend(got)
+                stop = str(getattr(src, "budget_stop", "") or "")
+                if stop:  # the source hit the budget part-way: what it had already paid for is kept
+                    self._warn(f"source {label} stopped early: {stop} (kept the {len(got)} companies "
+                               f"already found)")
             except BudgetExceeded as e:
                 self._warn(f"source {label} stopped: {e}")
             except (MissingCredentialError, HttpError, registry.UnknownAdapterError, OSError, ValueError) as e:
@@ -199,6 +221,8 @@ class Pipeline:
         cfg = self.pb.enrichment.get("verifier")
         if not cfg:
             return None
+        if isinstance(cfg, dict) and cfg.get("enabled") is False:  # switched off: never the paid one
+            cfg = {"type": "basic"}
         try:
             v = self._make("verifier", cfg)
         except (MissingCredentialError, registry.UnknownAdapterError) as e:
@@ -220,6 +244,15 @@ class Pipeline:
         if contact.data.get("email_guessed"):
             return contact.email_status in set(enr.get("accept_guessed_statuses") or [EmailStatus.VALID])
         return True
+
+    @staticmethod
+    def email_confirmed(contact: Optional[Contact]) -> bool:
+        """A checker (or the data provider) said "valid" AND the address was not built from
+        a name pattern - the rule behind the "verified" label in client files
+        (``delivery.rows.email_label``). ``email_ok`` only says the address is acceptable."""
+        from .delivery.rows import is_guessed
+        return bool(contact and contact.email and contact.email_status == EmailStatus.VALID
+                    and not is_guessed(contact))
 
     def verify_contact(self, contact: Contact, verifier: Any) -> None:
         """Set contact.email/email_status, trying guessed candidates if needed."""
@@ -323,6 +356,25 @@ class Pipeline:
                     self._warn(f"enrichment stopped: {e}")
                 except Exception as e:  # noqa: BLE001 - never lose the run to one company
                     self._err(f"enrich {company.name}", e)
+            # a company that arrived without a website may turn out to be at a
+            # suppressed / excluded domain once its people are known
+            late = None
+            for d in _enriched_domains(company):
+                if store.is_suppressed(domain=d):
+                    late = f"domain {d} is on the suppression list (found via its people)"
+                elif excluded_domain(d, ctx):
+                    late = f"excluded domain {d} (found via its people)"
+                if late:
+                    break
+            if late:
+                self._reject(company, "icp", late)
+                continue
+            if self.hooks is not None:
+                late = self.hooks.filter_enriched(company)
+                if late:
+                    self._reject(company, "delivery", late)
+                    counts["hook_rejected"] = counts.get("hook_rejected", 0) + 1
+                    continue
             chosen = select_contacts(company, ctx, limit=per_company * 3)
             accepted: List[Contact] = []
             good = 0
@@ -330,12 +382,14 @@ class Pipeline:
                 if good >= per_company:
                     break  # enough deliverable people: don't spend verification credits on the rest
                 if store.is_suppressed(email=contact.email, linkedin=contact.linkedin_url):
+                    counts["suppressed_contacts"] = counts.get("suppressed_contacts", 0) + 1
                     continue
                 if self.hooks is not None and self.hooks.filter_contact(company, contact):
                     continue
                 if not contact.email or contact.email_status == EmailStatus.UNKNOWN:
                     self.verify_contact(contact, verifier)
                     if contact.email and store.is_suppressed(email=contact.email):
+                        counts["suppressed_contacts"] = counts.get("suppressed_contacts", 0) + 1
                         continue
                     if (contact.email and self.hooks is not None
                             and self.hooks.filter_contact(company, contact)):
@@ -362,8 +416,8 @@ class Pipeline:
             ct = lead.contact
             if ct:
                 lead.stage = Stage.ENRICHED
-                if self.email_ok(ct):
-                    lead.stage = Stage.VERIFIED
+                if self.email_ok(ct) and (self.outbound or self.email_confirmed(ct)):
+                    lead.stage = Stage.VERIFIED  # delivery mode: only a confirmed, non-guessed email
                 elif ct.email and ct.data.get("email_guessed") and ct.email_status in accept:
                     lead.notes.append(f"guessed email only {ct.email_status} (needs valid)")
                 elif ct.email:
@@ -377,7 +431,8 @@ class Pipeline:
             else:
                 lead.notes.append("no decision-maker found")
         leads.sort(key=lambda ld: ld.score, reverse=True)
-        counts["verified"] = sum(1 for ld in leads if ld.stage == Stage.VERIFIED)
+        counts["verified"] = sum(1 for ld in leads if self.email_confirmed(ld.contact))
+        counts["usable_email"] = sum(1 for ld in leads if self.email_ok(ld.contact))
         for t in (Tier.HOT, Tier.NORMAL, Tier.SKIP):
             counts[t] = sum(1 for ld in leads if ld.tier == t)
 
@@ -430,7 +485,7 @@ class Pipeline:
         handed: set = set()
         built = []
         for cfg in pb.outbound.get("exporters") or []:
-            if cfg.get("enabled") is False:
+            if not isinstance(cfg, dict) or cfg.get("enabled") is False:
                 continue
             if not self.outbound and self._is_handover_type(str(cfg.get("type"))):
                 self._warn(f"exporter '{cfg.get('type')}' hands leads to a sending tool - skipped "
@@ -551,9 +606,11 @@ class Pipeline:
     def _write_run_files(self, out_dir: Path, leads: List[Lead], counts: Dict[str, int],
                          usage: Optional[List[Dict[str, Any]]] = None) -> None:
         with open(out_dir / "rejected.csv", "w", newline="", encoding="utf-8") as f:
+            from .outbound.csv_export import guard_cell  # company names come from scraped sources
             w = csv.DictWriter(f, fieldnames=["company", "domain", "stage", "reason"])
             w.writeheader()
-            w.writerows(self.rejected)
+            w.writerows({k: guard_cell("" if r.get(k) is None else str(r.get(k)))
+                         for k in ("company", "domain", "stage", "reason")} for r in self.rejected)
         (out_dir / "summary.json").write_text(json.dumps({
             "playbook": self.pb.name, "mode": self.pb.mode, "counts": counts, "errors": self.errors,
             "warnings": self.warnings, "usage": usage or [],

@@ -78,6 +78,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..http import HttpError
+from ..usage import BudgetExceeded
 from ..models import Company, Contact, EmailStatus
 from ..utils import contains_any, is_valid_email, normalize_text
 from .base import ContactFinder
@@ -443,6 +444,9 @@ class ApolloFinder(ContactFinder):
             except ValueError as e:  # unreadable response: never lose the people already found
                 self.log.warning("apollo: email reveal failed (%s); keeping %d people found without it",
                                  e, len(contacts))
+                break
+            except BudgetExceeded as e:  # the search was already paid for: keep its people
+                self.log.warning("apollo: %s; keeping %d people found without more reveals", e, len(contacts))
                 break
             if person:
                 self.apply_person(contact, person)

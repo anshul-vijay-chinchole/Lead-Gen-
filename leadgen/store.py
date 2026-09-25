@@ -8,6 +8,7 @@ can share it (rows are tagged with the playbook name).
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta
@@ -36,7 +37,10 @@ def normalize_suppression(value: str, kind: str) -> str:
         for prefix in ("https://", "http://"):
             if v.startswith(prefix):
                 v = v[len(prefix):]
-        return v[4:] if v.startswith("www.") else v
+        v = v[4:] if v.startswith("www.") else v
+        # any country / mobile host (uk., m.) -> linkedin.com; nothing after /in/<name>
+        v = re.sub(r"^(?:[a-z0-9-]+\.)*linkedin\.com(?=/|$)", "linkedin.com", v)
+        return re.sub(r"^(linkedin\.com/(?:in|company|school|showcase)/[^/]+)/.*$", r"\1", v)
     raise ValueError(f"kind must be one of {', '.join(SUPPRESSION_KINDS)}")
 
 SCHEMA = """

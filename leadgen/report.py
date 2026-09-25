@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlparse
 
 from .models import EmailStatus, Lead, ReplyCategory, Stage, Tier
+from .delivery.rows import is_guessed
 from .utils import normalize_text, parse_date
 
 #: How many signals to show per opportunity.
@@ -197,7 +198,8 @@ def _opportunity(lead: Lead, today: date, mask: bool) -> Dict[str, Any]:
             "name": ct.full_name or "",
             "title": ct.title or "",
             "email": (mask_email(email) if mask else email),
-            "status": EMAIL_STATUS_LABELS.get(ct.email_status, ct.email_status or "") if email else "",
+            "status": ("guessed-unverified" if is_guessed(ct)
+                       else EMAIL_STATUS_LABELS.get(ct.email_status, ct.email_status or "")) if email else "",
         }
     email_msg = None
     msgs = sorted(lead.messages or [], key=lambda m: m.step if isinstance(m.step, int) else 0)
@@ -231,7 +233,7 @@ def _demo_data(leads: Sequence[Lead], ctx: Any, top: int, prospect: Optional[str
         st["signal"] = st["signal"] or bool(ld.company.signals)
         if ld.contact and (ld.contact.full_name or ld.contact.email):
             st["contact"] = True
-            if ld.contact.email and ld.contact.email_status == EmailStatus.VALID:
+            if ld.contact.email and ld.contact.email_status == EmailStatus.VALID and not is_guessed(ld.contact):
                 st["valid"] = True
     picked = select_opportunities(leads, top)
     # the "N of them" counts use the same base as the headline number

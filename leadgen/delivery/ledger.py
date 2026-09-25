@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS client_suppression (
     added_at TEXT NOT NULL,
     PRIMARY KEY (client, kind, value)
 );
+-- append-only: one row per delivery run (the items table above is keyed per item and
+-- moves re-delivered items to their latest run, so it cannot count deliveries)
+CREATE TABLE IF NOT EXISTS delivery_runs (
+    client TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    delivered_at TEXT NOT NULL,
+    items INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (client, run_id)
+);
 """
 
 # Query parameters that only track where a click came from (never identify a job).
@@ -346,8 +355,14 @@ class Ledger:
             "ON CONFLICT(client, kind, key) DO UPDATE SET run_id=excluded.run_id, "
             "delivered_at=excluded.delivered_at",
             [(name, kind, key, str(run_id or ""), day) for kind, key in rows])
+        n = sum(1 for kind, _ in rows if kind in DELIVERY_KINDS)
+        if rows:
+            conn.execute(
+                "INSERT INTO delivery_runs (client, run_id, delivered_at, items) VALUES (?,?,?,?) "
+                "ON CONFLICT(client, run_id) DO UPDATE SET items=MAX(items, excluded.items)",
+                (name, str(run_id or f"day:{day}"), day, n))
         conn.commit()
-        return sum(1 for kind, _ in rows if kind in DELIVERY_KINDS)
+        return n
 
     def summary(self, client: Any) -> Dict[str, Any]:
         """What the client has received so far::
@@ -363,10 +378,13 @@ class Ledger:
                               (name,)):
             if r["kind"] in by_kind:   # the "by name" bookkeeping rows are not items
                 by_kind[r["kind"]] = r["n"]
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT CASE WHEN run_id IS NULL OR run_id='' THEN 'day:' || delivered_at "
-            "ELSE run_id END) AS runs, MIN(delivered_at) AS first, MAX(delivered_at) AS last "
-            "FROM deliveries WHERE client=?", (name,)).fetchone()
+        row = conn.execute("SELECT COUNT(*) AS runs, MIN(delivered_at) AS first, MAX(delivered_at) AS last "
+                           "FROM delivery_runs WHERE client=?", (name,)).fetchone()
+        if not row["runs"]:  # databases written before delivery_runs existed
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT CASE WHEN run_id IS NULL OR run_id='' THEN 'day:' || delivered_at "
+                "ELSE run_id END) AS runs, MIN(delivered_at) AS first, MAX(delivered_at) AS last "
+                "FROM deliveries WHERE client=?", (name,)).fetchone()
         suppressed = conn.execute("SELECT COUNT(*) AS n FROM client_suppression WHERE client=?",
                                   (name,)).fetchone()["n"]
         out: Dict[str, Any] = {
@@ -601,6 +619,15 @@ class LedgerHooks(PipelineHooks):
         return None
 
     # --- hooks -------------------------------------------------------------------------
+    def filter_enriched(self, company: Company) -> Optional[str]:
+        """After enrichment: a company without a website whose people turn out to be at a
+        domain on this client's do-not-list (stored or ``exclusions.domains``)."""
+        already = self._mark(company)
+        reason = self.company_do_not_list(company)
+        if reason and not already:
+            self.removed["suppressed"] += 1
+        return reason
+
     def filter_company(self, company: Company) -> Optional[str]:
         reason = self.company_do_not_list(company)
         if reason:

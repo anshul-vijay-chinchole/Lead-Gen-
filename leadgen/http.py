@@ -122,7 +122,11 @@ class HttpClient:
                     detail = type(e).__name__  # its message quotes the header value (the key)
                 else:
                     detail = f"{type(e).__name__}: {_scrub(str(e), url)}"
-                if attempt > self.retries or isinstance(e, _NO_RETRY):
+                # a POST that timed out while waiting for the answer may already have been
+                # processed (and billed): only re-send when it never left (connect errors)
+                resent_risk = method.upper() != "GET" and not isinstance(
+                    e, (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout))
+                if attempt > self.retries or isinstance(e, _NO_RETRY) or resent_risk:
                     raise HttpError(0, url, detail) from None
                 wait = self.backoff ** attempt
                 log.warning("network error on %s %s (%s); retry %d in %.1fs",

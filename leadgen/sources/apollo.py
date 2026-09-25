@@ -51,6 +51,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..http import HttpError
+from ..usage import BudgetExceeded
 from ..models import Company, Signal, SignalType
 from ..utils import get_path, parse_date, to_int
 from .base import Source
@@ -360,6 +361,12 @@ class ApolloSource(Source):
                 self.log.warning("source %s: page %d failed (%s); keeping %d companies",
                                  self.label, page, e, len(collector))
                 break
+            except BudgetExceeded as e:
+                if page == 1:
+                    raise  # nothing was paid for yet
+                self.budget_stop = str(e)
+                self.log.warning("source %s: %s; keeping %d companies", self.label, e, len(collector))
+                break
             if data is None:
                 data = {}
             if not isinstance(data, dict):
@@ -393,6 +400,10 @@ class ApolloSource(Source):
                 except (HttpError, ValueError) as e:
                     self.log.warning("source %s: job postings for %s failed: %s", self.label, company.name, e)
                     continue
+                except BudgetExceeded as e:  # keep every company (and its search signals) already paid for
+                    self.budget_stop = str(e)
+                    self.log.warning("source %s: %s; no more job-posting lookups", self.label, e)
+                    break
                 seen = {(s.fingerprint, s.external_id) for s in company.signals}
                 for s in signals:
                     if (s.fingerprint, s.external_id) not in seen:
