@@ -60,7 +60,9 @@ anthropic_version  ``anthropic-version`` header (default ``2023-06-01``).
 effort             Optional ``output_config.effort`` (``low`` / ``medium`` /
                    ``high`` ...) on models that support it - lower effort means
                    less thinking and cheaper copy. Not sent unless set.
-extra_body         Optional dict merged into the request body.
+extra_body         Optional dict merged into the request body. It cannot replace
+                   ``model``, ``max_tokens`` or ``messages`` (the cost estimate and
+                   the AI cost caps rely on them): such keys are ignored (warning).
 extra_headers      Optional dict of extra headers (e.g. ``anthropic-beta``).
 timeout            HTTP timeout in seconds (default 120).
 api_key / api_key_env  Credential override.
@@ -73,7 +75,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..utils import get_path
 from .base import LLMClient, LLMError
 from .openai import (LLMConfigError, LLMTruncatedError, clean_api_key, clean_headers, effective_temperature,
-                     post_json, record_usage, timeout_from, token_count)
+                     merge_extra_body, post_json, record_usage, timeout_from, token_count)
 
 DEFAULT_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -153,9 +155,7 @@ class AnthropicClient(LLMClient):
             body["temperature"] = temp
         if self.config.get("effort"):
             body["output_config"] = {"effort": str(self.config["effort"])}
-        extra_body = self.config.get("extra_body")
-        if isinstance(extra_body, dict):
-            body.update(extra_body)
+        merge_extra_body(self, body, ("model", "max_tokens", "messages"))
         return url, headers, body
 
     def complete(self, system: str, user: str, *, json_mode: bool = False,

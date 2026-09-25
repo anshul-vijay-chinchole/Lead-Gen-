@@ -76,7 +76,9 @@ and ``replies.classifier`` (validate).
 
 Plugins: ``LEADGEN_PLUGINS=my_pkg.adapters,other_module`` (environment or .env)
 imports those modules before any command runs, so they can add their own
-adapter types with ``leadgen.registry.register(kind, type, "module:Class")``.
+adapter types with ``leadgen.registry.register(kind, type, "module:Class")`` -
+with ``paid=True`` for an adapter that calls a paid API, so its requests are
+paid lookups capped by ``--budget`` (without it they are counted, never capped).
 The working directory is importable for this.
 
 Exit codes: 0 success, 1 the command ran but found a problem (validation
@@ -894,6 +896,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         session.close()
 
 
+def honest_demo_leads(leads: Sequence[Lead]) -> List[Lead]:
+    """The run's leads as the demo one-pager shows them: an address built from a name
+    pattern (``rows.is_guessed``) carries the label the client files give it,
+    ``guessed-unverified``, as its status - never a checker's ``valid``. So the sample
+    report shown to prospects never calls a guess "verified" nor counts it as "with a
+    verified email". Shallow copies: the stored leads are not changed."""
+    from .delivery.rows import GUESSED, is_guessed
+
+    out: List[Lead] = []
+    for ld in leads:
+        ct = ld.contact
+        if ct is not None and is_guessed(ct) and ct.email_status != GUESSED:
+            shown = copy.copy(ct)
+            shown.email_status = GUESSED
+            ld = copy.copy(ld)
+            ld.contact = shown
+        out.append(ld)
+    return out
+
+
 def cmd_demo(args: argparse.Namespace) -> int:
     from .report import write_demo
 
@@ -902,7 +924,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
     session = open_session(args, need_playbook=True)
     try:
         run_id = _resolve_run(session, args.run)
-        leads = session.store.leads_for_run(run_id)
+        leads = honest_demo_leads(session.store.leads_for_run(run_id))
         if args.out:
             out = Path(args.out)
         else:  # the folder the run itself wrote to (recorded in the run's meta)
@@ -974,13 +996,32 @@ DELIVERY_FILE_WHAT = {
 }
 
 
+def client_arg(raw: Any, clients_dir: str) -> str:
+    """``--client`` as typed, with a bare name spelled as its file is stored: on a
+    case-insensitive disk (macOS, Windows) ``--client ACME`` opens ``clients/acme.yaml``,
+    and the client is ``acme`` - its ledger and do-not-list are kept under the file's own
+    name, so another spelling must never start an empty history (and re-deliver everything)."""
+    value = str(raw or "").strip()
+    p = Path(value)
+    if not value or p.suffix.lower() in (".yaml", ".yml") or len(p.parts) != 1:
+        return value
+    known = list_clients(clients_dir)
+    if value in known:
+        return value
+    same = [k for k in known if k.casefold() == value.casefold()]
+    folder = Path(clients_dir)
+    if len(same) == 1 and any((folder / f"{value}{ext}").is_file() for ext in (".yaml", ".yml")):
+        return same[0]
+    return value
+
+
 def load_client_and_playbook(args: argparse.Namespace, env: Dict[str, str]) -> Tuple[Client, Playbook]:
     """``--client NAME`` (in ``--clients-dir``) and the playbook built for it. Problems
     in the client file or its base playbook become one friendly error (exit 2)."""
     from .delivery.client import client_playbook, load_client
 
     try:
-        client = load_client(args.client, args.clients_dir)
+        client = load_client(client_arg(args.client, args.clients_dir), args.clients_dir)
         return client, client_playbook(client, env=env)
     except ClientError as e:
         raise CliError(str(e)) from e
@@ -1023,8 +1064,32 @@ def _client_options(args: argparse.Namespace) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
-def _print_delivery(result: Any, client: Client, args: argparse.Namespace) -> None:
-    """Where the files are (client-ready first, internal second), the QA summary, what next."""
+def _same_database(a: Any, b: Any) -> bool:
+    """True when two database paths name the same SQLite file."""
+    def norm(p: Any) -> str:
+        s = os.path.expanduser(str(p))
+        return s if s == ":memory:" else os.path.normcase(os.path.abspath(s))
+    return norm(a) == norm(b)
+
+
+def _other_files(folder: Any, files: Dict[str, Any], internal: Any) -> List[str]:
+    """What a delivery folder holds besides this delivery's client files and its
+    ``_internal`` folder (e.g. PREVIEW files or anything put there by hand), sorted.
+    Hidden files (``.DS_Store`` ...) are ignored."""
+    keep = {Path(p).name for p in files.values()}
+    if internal is not None:
+        keep.add(Path(internal).name)
+    try:
+        return sorted(p.name for p in Path(folder).iterdir() if p.name not in keep and not p.name.startswith("."))
+    except OSError:
+        return []
+
+
+def _print_delivery(result: Any, client: Client, args: argparse.Namespace, db_note: str = "") -> None:
+    """Where the files are (client-ready first, internal second), the QA summary, what next.
+
+    ``db_note``: printed after the "Next:" line of a real delivery (``--db`` named another
+    database than the client's playbook uses)."""
     folder = result.folder
     _out("")
     if result.dry_run:
@@ -1062,11 +1127,24 @@ def _print_delivery(result: Any, client: Client, args: argparse.Namespace) -> No
         _out(f"Next: this was a preview - check the files, then make the real delivery: "
              f"leadgen deliver --client {client.name}{_client_options(args)}")
     else:
-        _out(f"Next: send the files in {folder} to {_recipient(client)} "
-             f"(not the {Path(internal).name if internal else '_internal'} folder - that one is yours).")
+        internal_name = Path(internal).name if internal else "_internal"
+        others = _other_files(folder, result.files, internal)
+        if others:
+            # e.g. a PREVIEW that could not be moved away: its rows were never recorded, so a
+            # lead held back this week would reach the client twice - send only this delivery
+            n = len(result.files)
+            _out(f"Next: send ONLY the {n} file{'s' if n != 1 else ''} listed above to {_recipient(client)}. "
+                 f"{folder} also holds {', '.join(others)}: not part of this delivery (never recorded as "
+                 f"delivered) - don't send {'it' if len(others) == 1 else 'them'}, and not the {internal_name} "
+                 f"folder either (that one is yours).")
+        else:
+            _out(f"Next: send the files in {folder} to {_recipient(client)} "
+                 f"(not the {internal_name} folder - that one is yours).")
         if not (client.contact or {}).get("email"):
             where = client.path or f"clients/{client.name}.yaml"
             _out(f"  (tip: add 'contact: {{name: ..., email: ...}}' to {where} to see who gets them)")
+        if db_note:
+            _out(db_note)
 
 
 def cmd_deliver(args: argparse.Namespace) -> int:
@@ -1077,7 +1155,16 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     if getattr(args, "playbook", None):
         log.warning("-p is ignored by 'deliver': the client file's 'playbook:' line names the base playbook")
     client, pb = load_client_and_playbook(args, env)
-    db = getattr(args, "db", None) or str(pb.db_path)
+    usual_db = str(pb.db_path)
+    db = getattr(args, "db", None) or usual_db
+    db_note = ""
+    if not _same_database(db, usual_db):
+        # e.g. a "rehearsal" on a scratch database: the do-not-lists and the delivery history
+        # in the client's real database were not applied, and nothing was recorded there
+        db_note = (f"  Careful: this delivery used --db {db}, not {usual_db} (the database of this client's "
+                   f"playbook, storage.path). Only the do-not-lists and delivery history stored in {db} were "
+                   f"applied, and it was recorded there only. Send these files only if {db} is where you keep "
+                   f"every delivery to {client.name} - never the files of a rehearsal.")
     store = open_store(db)
     http = make_http()
     try:
@@ -1093,7 +1180,7 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     finally:
         store.close()
         close_http(http)
-    _print_delivery(result, client, args)
+    _print_delivery(result, client, args, db_note)
     sourced = result.run.counts.get("sourced", 0)
     offline_sources, _ = _failed_sources(pb, [], True)
     if args.dry_run and not sourced and not offline_sources:
@@ -1168,6 +1255,7 @@ def _clients_list(args: argparse.Namespace) -> int:
 
     rows: List[List[Any]] = []
     problems: List[str] = []
+    redeliver: List[str] = []   # clients whose file allows the same company / job / person again
     try:
         if getattr(args, "db", None):
             ledger_for(args.db)  # also lists clients delivered to before whose file is gone
@@ -1180,6 +1268,8 @@ def _clients_list(args: argparse.Namespace) -> int:
                 problems.append(str(e))
                 rows.append([name, "(invalid client file - see the error below)", "-", "-", "-", "-"])
                 continue
+            if client.redelivery_days is not None or not {"company", "job", "contact"} <= set(client.dedupe or []):
+                redeliver.append(client.name)
             ledger = ledger_for(db)
             s = ledger.summary(client.name) if ledger is not None else {}
             rows.append([client.name, client.display_name, client.leads_per_week, s.get("deliveries", 0),
@@ -1210,7 +1300,13 @@ def _clients_list(args: argparse.Namespace) -> int:
                       rows, widths={"client": 30, "display name": 44},
                       right=("leads/week", "deliveries", "total delivered")))
     _out("")
-    _out("total delivered = leads (companies) sent so far - none of them is ever delivered to that client again.")
+    _out("total delivered = distinct companies sent so far (a company sent again is counted once).")
+    if redeliver:
+        _out(f"May get the same company / job / person again (their client file sets redelivery_days, or a "
+             f"dedupe list without company / job / contact): {', '.join(redeliver)}. Every other client file "
+             f"never allows it.")
+    else:
+        _out("No client file allows the same company, job or person to be delivered twice.")
     _out("Next: leadgen deliver --client <name> --dry-run   |   new client: leadgen clients new <name>")
     if problems:
         for p in problems:
@@ -1643,7 +1739,7 @@ def _client_target(args: argparse.Namespace, env: Dict[str, str]) -> Tuple[str, 
     file is gone (then ``--db`` or the default database is used)."""
     from .delivery.client import client_playbook, load_client
 
-    raw = str(args.client or "").strip()
+    raw = client_arg(args.client, args.clients_dir)
     p = Path(raw)
     name = p.stem if p.suffix.lower() in (".yaml", ".yml") else p.name
     known = list_clients(args.clients_dir)

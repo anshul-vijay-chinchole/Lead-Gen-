@@ -23,6 +23,7 @@ from leadgen.delivery.ledger import (
     guess_kind,
     job_item_key,
     lead_items,
+    linkedin_key,
     normalize_job_url,
 )
 from leadgen.enrich.base import ContactFinder
@@ -77,11 +78,35 @@ def test_job_url_keeps_parameters_that_identify_the_job():
     b = normalize_job_url("http://indeed.com/viewjob?jk=def456&from=serp")
     assert a == "indeed.com/viewjob?jk=abc123" and b == "indeed.com/viewjob?jk=def456"
     assert normalize_job_url("https://boards.greenhouse.io/acme/jobs/55?gh_src=abc&b=2&a=1") == \
-        "boards.greenhouse.io/acme/jobs/55?a=1&b=2&gh_src=abc"
+        "boards.greenhouse.io/acme/jobs/55?a=1&b=2"
+    assert normalize_job_url("https://boards.greenhouse.io/acme?gh_jid=4012345&gh_src=x") == \
+        "boards.greenhouse.io/acme?gh_jid=4012345"                    # gh_jid names the job: kept
     assert normalize_job_url("acme.com/careers/acct/") == "acme.com/careers/acct"
     assert normalize_job_url("https://acme.com:8443/jobs/1") == "acme.com:8443/jobs/1"
     assert normalize_job_url("") == "" and normalize_job_url("   ") == ""
     assert normalize_job_url("http://[broken/jobs/1#x") == "http://[broken/jobs/1"   # never raises
+
+
+@pytest.mark.parametrize("tracked", [
+    "https://boards.greenhouse.io/acme/jobs/4012345?gh_src=linkedin",
+    "https://boards.greenhouse.io/acme/jobs/4012345?gh_src=indeed&utm_source=x",
+    "https://jobs.lever.co/acme/4012345?lever-source=LinkedIn&lever-origin=applied",
+    "https://jobs.lever.co/acme/4012345?lever-source%5B%5D=Indeed&lever-via=abc",
+    "https://careers-acme.icims.com/jobs/4012345/job?iis=Job+Board&iisn=LinkedIn",
+    "https://acme.com/jobs/4012345?_gl=1*abc*_ga*xyz&_ga=2.1.2",
+])
+def test_ats_tracking_parameters_do_not_make_a_new_job(tracked):
+    """The same ad reached through another source-tracking link is the same job."""
+    clean = tracked.split("?", 1)[0]
+    assert normalize_job_url(tracked) == normalize_job_url(clean)
+
+
+def test_same_ad_with_another_tracking_link_is_not_delivered_again(ledger):
+    first = job(url="https://boards.greenhouse.io/acme/jobs/4012345?gh_src=linkedin")
+    ledger.record("acme", lead_items(Lead(company=company("Acme Corp", "acme.com", first))), "r1", LAST_WEEK)
+    hooks = LedgerHooks(ledger, Client("acme", dedupe=["job", "contact"]), TODAY)
+    again = job(url="https://boards.greenhouse.io/acme/jobs/4012345?gh_src=indeed")
+    assert hooks.filter_company(company("Acme Corp", "acme.com", again)) == "all its jobs were already delivered"
 
 
 def test_contact_item_keys():
@@ -106,8 +131,14 @@ def test_lead_items_cover_company_jobs_and_every_contact_identity():
         ("company", "acme.com"), ("job", "acme.com|1"), ("job", "acme.com/j/2"),
         ("job", "acme.com|funding:series b"),
         ("contact", "jane@acme.com"), ("contact", "jane doe|acme.com"),
+        # the same company, jobs and person keyed by the name (for when the domain is missing next time)
+        ("company_by_name", "name:acme"), ("job_by_name", "name:acme|1"),
+        ("job_by_name", "name:acme|funding:series b"), ("contact_by_name", "jane doe|name:acme"),
     ]
-    assert lead_items(Lead(company=company())) == [("company", "acme.com")]
+    assert lead_items(Lead(company=company())) == [("company", "acme.com"), ("company_by_name", "name:acme")]
+    # a company without a domain: its keys already are name keys
+    assert lead_items(Lead(company=company("Acme Corp", "", job(ext="1")))) == [
+        ("company", "name:acme"), ("job", "name:acme|1")]
 
 
 def test_helpers_guess_kind_and_parent_domains():
@@ -392,6 +423,143 @@ def test_hooks_accept_a_plain_client_name(ledger):
     assert hooks.filter_company(company()) is not None
 
 
+# --- a company seen with and without its domain --------------------------------------------------------------
+
+def _deliver(ledger, lead: Lead, day=LAST_WEEK) -> int:
+    return ledger.record("acme", lead_items(lead), "r1", day)
+
+
+def test_company_delivered_with_its_domain_is_recognised_without_it(ledger):
+    """Week 1 the company came with its domain (Greenhouse / CSV / a merge); week 2 it
+    comes name-only (Adzuna has no website): the same company, job and person."""
+    jane = Contact(first_name="Jane", last_name="Doe", email="jane.doe@examplecorp.com")
+    assert _deliver(ledger, Lead(company=company("Example Corp", "examplecorp.com", job(ext="adz-1")),
+                                 contact=jane)) == 4    # company, job, 2 contact identities (not the name rows)
+    assert ledger.summary("acme")["items"] == 4
+    hooks = LedgerHooks(ledger, Client("acme"), TODAY)
+    again = company("Example Corp", "", job("Financial Controller", ext="adz-99"))
+    assert hooks.filter_company(again) == f"already delivered to this client ({LAST_WEEK.isoformat()})"
+    # the person without an email yet: recognised by name at the (name-only) company
+    assert hooks.filter_contact(again, Contact(first_name="Jane", last_name="Doe")) == \
+        "contact already delivered to this client"
+    # only new jobs at known companies: the ad delivered before is stripped, the new one kept
+    jobs_only = LedgerHooks(ledger, Client("acme", dedupe=["job", "contact"]), TODAY)
+    c = company("Example Corp", "", job(ext="adz-1"), job("Financial Controller", ext="adz-99"))
+    assert jobs_only.filter_company(c) is None and [s.external_id for s in c.signals] == ["adz-99"]
+    assert jobs_only.removed["job"] == 1
+    # same name, different domain: a different company (as when sources are merged)
+    assert hooks.filter_company(company("Example Corp", "examplecorp.co.uk", job(ext="x"))) is None
+    assert hooks.filter_contact(company("Example Corp", "examplecorp.co.uk"),
+                                Contact(first_name="Jane", last_name="Doe")) is None
+    # other clients are not affected
+    assert LedgerHooks(ledger, Client("beta"), TODAY).filter_company(again) is None
+
+
+def test_company_delivered_without_its_domain_is_recognised_with_it(ledger):
+    jane = Contact(first_name="Jane", last_name="Doe")
+    _deliver(ledger, Lead(company=company("Example Corp", "", job(ext="adz-1")), contact=jane))
+    hooks = LedgerHooks(ledger, Client("acme", dedupe=["job", "contact"]), TODAY)
+    merged = company("Example Corp", "examplecorp.com", job(ext="adz-1"))
+    assert hooks.filter_company(merged) == "all its jobs were already delivered"
+    assert hooks.filter_contact(merged, Contact(first_name="Jane", last_name="Doe")) == \
+        "contact already delivered to this client"
+    assert LedgerHooks(ledger, Client("acme"), TODAY).filter_company(
+        company("Example Corp", "examplecorp.com", job(ext="new"))) is not None
+
+
+def test_redelivery_window_applies_to_the_name_keys_too(ledger):
+    _deliver(ledger, Lead(company=company("Example Corp", "examplecorp.com", job(ext="1"))), date(2026, 9, 1))
+    again = company("Example Corp", "", job(ext="2"))
+    assert LedgerHooks(ledger, Client("acme", redelivery_days=30), TODAY).filter_company(again) is not None
+    assert LedgerHooks(ledger, Client("acme", redelivery_days=14), TODAY).filter_company(again) is None
+
+
+# --- do-not-list: what is only known later, LinkedIn pages and spellings -----------------------------------
+
+def test_company_without_domain_found_on_the_do_not_list_through_its_people(ledger):
+    """The client suppressed bigclient.com; the company arrives name-only (Adzuna), so only
+    enrichment shows it is Big Client: the whole company is left out, not just the person."""
+    ledger.suppress("acme", "bigclient.com", "domain")
+    hooks = LedgerHooks(ledger, Client("acme"), TODAY)
+    big = company("Big Client Inc", "", job(ext="adz-7"))
+    assert hooks.filter_company(big) is None                       # nothing known yet
+    assert hooks.filter_contact(big, Contact(first_name="Bo", last_name="Big", email="bo@bigclient.com")) == \
+        "on this client's do-not-list (contact)"
+    assert big.signals == []                                        # nothing left to deliver
+    assert big.data["client_do_not_list"] == {"acme": "on this client's do-not-list (domain)"}
+    assert hooks.company_do_not_list(big) == "on this client's do-not-list (domain)"
+    # the other people there are skipped too (no verification credits spent on them)
+    assert hooks.filter_contact(big, Contact(first_name="Al", last_name="Other")) == \
+        "on this client's do-not-list (domain)"
+    assert hooks.removed == {"company": 0, "job": 0, "contact": 0, "suppressed": 2}   # Bo + the company
+    # the mark is per client
+    assert LedgerHooks(ledger, Client("beta"), TODAY).company_do_not_list(big) is None
+    # a company WITH its own domain is not blamed for one person's address elsewhere
+    fine = company("Fine Co", "fine.com", job(ext="1"))
+    assert hooks.filter_contact(fine, Contact(email="moved@bigclient.com")) is not None
+    assert fine.signals and "client_do_not_list" not in fine.data
+
+
+def test_do_not_list_uses_the_email_domain_hint_and_people_found(ledger):
+    ledger.suppress("acme", "bigclient.com", "domain")
+    client = Client("acme", exclusions={"domains": ["excluded.com"]})
+    hooks = LedgerHooks(ledger, client, TODAY)
+    # a source / Hunter left the company's email domain: known before any paid lookup
+    hinted = company("Big Client Inc", "", job())
+    hinted.data["email_domain"] = "bigclient.com"
+    assert hooks.filter_company(hinted) == "on this client's do-not-list (domain)"
+    # after enrichment: the people found show the domain (the client file's exclusions too)
+    late = company("Excluded Holdings", "", job())
+    late.contacts = [Contact(first_name="Ed", last_name="X", email="ed@excluded.com")]
+    assert hooks.company_do_not_list(late) == "on this client's do-not-list (domain)"
+    assert hooks.company_do_not_list(company("Fine Co", "", job())) is None
+
+
+def test_company_linkedin_page_on_the_client_do_not_list(ledger):
+    ledger.suppress("acme", "https://www.linkedin.com/company/example-corp/", "linkedin")
+    hooks = LedgerHooks(ledger, Client("acme"), TODAY)
+    for url in ("https://www.linkedin.com/company/example-corp", "https://uk.linkedin.com/company/Example-Corp/about/"):
+        c = company("Example Corp", "examplecorp.com", job())
+        c.linkedin_url = url
+        assert hooks.filter_company(c) == "on this client's do-not-list (LinkedIn)"
+    other = company("Other Corp", "other.com", job())
+    other.linkedin_url = "https://www.linkedin.com/company/other-corp"
+    assert hooks.filter_company(other) is None
+    assert hooks.removed["suppressed"] == 2
+
+
+def test_linkedin_key_ignores_country_hosts_and_extra_path():
+    same = ["https://uk.linkedin.com/in/jane-doe-123", "https://www.linkedin.com/in/Jane-Doe-123/",
+            "http://linkedin.com/in/jane-doe-123?trk=x", "https://de.linkedin.com/in/jane-doe-123/en",
+            "https://m.linkedin.com/in/jane-doe-123/details/experience/", "www.uk.linkedin.com/in/jane-doe-123"]
+    assert {linkedin_key(u) for u in same} == {"linkedin.com/in/jane-doe-123"}
+    assert linkedin_key("https://ca.linkedin.com/company/acme/jobs/") == "linkedin.com/company/acme"
+    assert linkedin_key("https://notlinkedin.com/in/jane") == "notlinkedin.com/in/jane"
+    assert linkedin_key("") == ""
+
+
+def test_linkedin_do_not_list_and_dedupe_across_country_hosts(ledger, store):
+    ledger.suppress("acme", "https://uk.linkedin.com/in/jane-doe-123", "linkedin")
+    assert [r["value"] for r in ledger.list_suppressed("acme")] == ["linkedin.com/in/jane-doe-123"]
+    # an entry stored in the old spelling still matches
+    store.conn.execute("INSERT INTO client_suppression (client, kind, value, reason, added_at) "
+                       "VALUES ('acme', 'linkedin', 'fr.linkedin.com/in/bob-roe', '', '2026-01-01')")
+    hooks = LedgerHooks(ledger, Client("acme"), TODAY)
+    c = company()
+    assert hooks.filter_contact(c, Contact(full_name="Jane Doe",
+                                           linkedin_url="https://www.linkedin.com/in/jane-doe-123"))
+    assert hooks.filter_contact(c, Contact(full_name="Bob Roe", linkedin_url="https://linkedin.com/in/bob-roe/"))
+    assert ledger.is_suppressed("acme", linkedin="https://www.linkedin.com/in/bob-roe")
+    assert ledger.unsuppress("acme", "https://www.linkedin.com/in/bob-roe") == 1
+    assert ledger.unsuppress("acme", "https://de.linkedin.com/in/jane-doe-123/", "linkedin") == 1
+    assert ledger.list_suppressed("acme") == []
+    # a person delivered with one spelling is recognised with another
+    ledger.record("acme", lead_items(Lead(company=c, contact=Contact(
+        full_name="Kim Lee", linkedin_url="https://uk.linkedin.com/in/kim-lee"))), "r1", LAST_WEEK)
+    assert LedgerHooks(ledger, Client("acme", dedupe=["contact"]), TODAY).filter_contact(
+        company("Beta", "beta.com"), Contact(full_name="Kim Lee", linkedin_url="https://www.linkedin.com/in/kim-lee/"))
+
+
 # --- hooks through a real delivery-mode pipeline run -----------------------------------------------------------
 
 class SpyFinder(ContactFinder):
@@ -550,3 +718,70 @@ def test_client_suppression_through_the_pipeline(delivery_ws, store, tmp_path, d
                        "Gamma Inc": "on this client's do-not-list (company name)"}
     # hooks only read the ledger: nothing was recorded by the run itself
     assert ledger.summary("acme")["items"] == 0
+
+
+def test_company_seen_again_without_its_domain_never_reaches_enrichment(delivery_ws, store, tmp_path):
+    client = _client(delivery_ws)
+    ledger = Ledger(store)
+    res1, _ = _run(client, store, tmp_path / "out")
+    assert _record(ledger, client, res1) > 0
+    # next week Acme comes from a source without websites (Adzuna), with a new job
+    _write_jobs(delivery_ws, [["Acme Corp", "", "Austin, TX", "Software", 120, "job_posting",
+                               "Payroll Accountant", "2026-09-23", "", "adz-9"]])
+    res2, hooks2 = _run(client, store, tmp_path / "out")
+    assert res2.leads == [] and SpyFinder.seen == []
+    assert hooks2.removed["company"] == 1
+    assert [r["reason"] for r in res2.rejected if r["stage"] == "delivery"] == [
+        f"already delivered to this client ({TODAY.isoformat()})"]
+
+
+class PeopleFinder(ContactFinder):
+    """Offline finder: the people listed for a company name (``PEOPLE``)."""
+
+    name = "ledger_people"
+    offline = True
+    PEOPLE: dict = {}
+
+    def find(self, company: Company) -> List[Contact]:
+        return [Contact(**p) for p in PeopleFinder.PEOPLE.get(company.name, [])]
+
+
+registry.register("finder", "ledger_people", "tests.test_ledger:PeopleFinder")
+
+
+@pytest.mark.parametrize("stored", [
+    True,
+    # the client file's exclusions.domains are icp.exclude_domains: select_contacts drops Bo before
+    # filter_contact sees him, so the hooks never learn the domain. deliver() must also drop leads for
+    # which LedgerHooks.company_do_not_list(lead.company) gives a reason (leadgen/delivery/run.py).
+    pytest.param(False, marks=pytest.mark.xfail(reason="needs deliver()/select_leads to call "
+                                                       "LedgerHooks.company_do_not_list after enrichment")),
+])
+def test_do_not_list_company_found_only_by_enrichment_is_not_delivered(delivery_ws, store, tmp_path, stored):
+    """A name-only company whose decision-maker turns out to be at a do-not-list domain is
+    left out of the client file (before: delivered with 'no decision-maker found')."""
+    from leadgen.delivery.run import deliver
+
+    (delivery_ws / "base.yaml").write_text(BASE.replace("ledger_spy", "ledger_people"), encoding="utf-8")
+    _write_jobs(delivery_ws, [
+        ["Big Client Inc", "", "Austin, TX", "Software", 120, "job_posting", "Staff Accountant", "2026-09-23", "",
+         "adz-7"],
+        ["Fine Co", "fine-ledger-demo.com", "Austin, TX", "Software", 120, "job_posting", "Accountant",
+         "2026-09-23", "", "f-1"],
+    ])
+    PeopleFinder.PEOPLE = {
+        "Big Client Inc": [dict(first_name="Bo", last_name="Big", title="CFO", email="bo@bigclient-demo.com",
+                                email_status="valid")],
+        "Fine Co": [dict(first_name="Fay", last_name="Fine", title="CFO", email="fay@fine-ledger-demo.com",
+                         email_status="valid")],
+    }
+    ledger = Ledger(store)
+    if stored:
+        ledger.suppress("acme", "bigclient-demo.com", "domain")
+        client = _client(delivery_ws)
+    else:
+        client = _client(delivery_ws, exclusions={"domains": ["bigclient-demo.com"]})
+    res = deliver(client, store=store, env={}, http=FakeHttp(), today=TODAY, out_dir=tmp_path / "files")
+    assert [r["company"] for r in res.package.rows] == ["Fine Co"]
+    items = ledger.summary("acme")
+    assert items["company"] == 1

@@ -28,8 +28,16 @@ top_reasons          the most common reasons, grouped: details in parentheses,
 duplicates_removed   companies, jobs and contacts the ledger removed because the client
                      already has them + leads that repeated a company / person that is
                      already in this delivery.
-suppressed           companies / people removed by a do-not-list (the client's own
-                     list and exclusions, and the global suppression list).
+suppressed           companies / people removed by a do-not-list: the client's own
+                     (``leadgen suppress --client``, ``exclusions.companies`` - the
+                     ledger hooks' ``suppressed`` count), the client file's
+                     ``exclusions.domains`` / ``keywords`` (ICP rejections "excluded
+                     domain" / "excluded keyword" that one of them caused; the base
+                     playbook's own exclusions are criteria, not the client's
+                     do-not-list), and the global suppression list (companies:
+                     "... is on the suppression list" rejections; people: the
+                     pipeline's ``counts["suppressed_contacts"]`` when it reports it).
+                     These companies are also counted in ``filtered_out``.
 verified_email_rate  rows with a "verified" email / rows delivered (0..1).
 email_status_counts  rows per email status (verified, risky, guessed-unverified, not found).
 warnings             volume below target, no leads at all, paid-lookup budget reached,
@@ -37,7 +45,8 @@ warnings             volume below target, no leads at all, paid-lookup budget re
                      plus anything the caller adds (e.g. a failed Google Sheets push).
 usage_lines          API usage + estimated cost (``UsageMeter.summary_lines``).
 
-Client settings read: ``name``, ``display_name``, ``leads_per_week`` and
+Client settings read: ``name``, ``display_name``, ``leads_per_week``,
+``exclusions.domains`` / ``.keywords`` (for ``suppressed``) and
 ``opening_line.max_cost_usd`` (for the cost-cap warning). Nothing else is read
 from the client or the playbook.
 """
@@ -48,6 +57,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from ..signals import as_str_list, keyword_match
+from ..utils import normalize_domain
 from .rows import EMAIL_LABELS, VERIFIED, DeliveryPackage
 
 TOP_REASONS = 5            # how many grouped reasons the report lists
@@ -311,6 +322,36 @@ def _within_run(within_run_dupes: Any) -> Dict[str, int]:
     return {"in_run": n} if n else {}
 
 
+# check_icp's reasons for the exclusion lists (``filters.check_icp``)
+_EXCLUDED_DOMAIN_RE = re.compile(r"^excluded domain (\S+)")
+_EXCLUDED_KEYWORD_RE = re.compile(r"^excluded keyword (?P<q>['\"])(?P<kw>.+)(?P=q) in \w+$")
+
+
+def _client_exclusions(client: Any) -> Tuple[List[str], List[str]]:
+    """(normalised domains, keywords) of the client file's ``exclusions``."""
+    ex = _get(client, "exclusions", None) if not isinstance(client, str) else None
+    if ex is None:
+        return [], []
+    domains = [d for d in (normalize_domain(x) for x in as_str_list(_get(ex, "domains", None))) if d]
+    return domains, as_str_list(_get(ex, "keywords", None))
+
+
+def _by_client_exclusion(reason: Any, domains: Sequence[str], keywords: Sequence[str]) -> bool:
+    """True when an ICP rejection comes from the client file's ``exclusions.domains`` /
+    ``keywords`` (they are merged with the base playbook's lists, so check which)."""
+    text = str(reason or "").strip()
+    m = _EXCLUDED_DOMAIN_RE.match(text)
+    if m and domains:
+        dom = normalize_domain(m.group(1))
+        return bool(dom) and any(dom == d or dom.endswith("." + d) for d in domains)
+    m = _EXCLUDED_KEYWORD_RE.match(text)
+    if m and keywords:
+        # the base playbook's keyword may have matched first ("staffing agency"): the client's
+        # own ("staffing") counts when it would have matched that same phrase
+        return keyword_match(m.group("kw"), keywords) is not None
+    return False
+
+
 def _is_budget_text(text: str) -> bool:
     t = text.lower()
     return "budget" in t and ("paid" in t or "lookup" in t)
@@ -367,6 +408,9 @@ def build_qa(client: Any, run_result: Any, pkg: DeliveryPackage, ledger_removed:
     duplicates: Dict[str, int] = {k: removed[k] for k in ("company", "job", "contact") if removed[k]}
     duplicates.update(_within_run(within_run_dupes))
     globally_suppressed = sum(1 for r in rejected if "suppression list" in str(r.get("reason", "")))
+    ex_domains, ex_keywords = _client_exclusions(client)
+    client_excluded = sum(1 for r in rejected if _by_client_exclusion(r.get("reason"), ex_domains, ex_keywords))
+    people_suppressed = _int(counts.get("suppressed_contacts"))
 
     rows = list(getattr(pkg, "rows", None) or [])
     delivered = len(rows)
@@ -389,7 +433,7 @@ def build_qa(client: Any, run_result: Any, pkg: DeliveryPackage, ledger_removed:
         top_reasons=top_reasons(reasons),
         duplicates_removed=sum(duplicates.values()),
         duplicates=duplicates,
-        suppressed=removed["suppressed"] + globally_suppressed,
+        suppressed=removed["suppressed"] + client_excluded + globally_suppressed + people_suppressed,
         held_back=held_back,
         verified_email_rate=(verified / delivered) if delivered else 0.0,
         email_status_counts={k: _int(status_counts.get(k)) for k in EMAIL_LABELS},

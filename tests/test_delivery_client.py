@@ -145,6 +145,27 @@ def test_load_by_name_file_name_or_path(ws):
         assert c.path is not None and c.path.resolve() == path.resolve()
 
 
+def test_client_name_comes_from_the_file_on_a_case_insensitive_disk(ws, monkeypatch):
+    """macOS / Windows: 'Acme' opens clients/acme.yaml - the client must still be 'acme'
+    (the ledger's key for its delivery history and do-not-list, and its folder name)."""
+    path = write_client(ws, "acme", "leads_per_week: 12\n")
+    real_is_file = Path.is_file
+
+    def case_insensitive_is_file(self):
+        if real_is_file(self):
+            return True
+        try:
+            return any(p.name.casefold() == self.name.casefold() and real_is_file(p) for p in self.parent.iterdir())
+        except OSError:
+            return False
+
+    monkeypatch.setattr(Path, "is_file", case_insensitive_is_file)
+    for ref in ("Acme", "ACME.yaml", "clients/Acme.YAML", "clients/aCmE"):
+        c = load_client(ref)
+        assert c.name == "acme" and c.path == path.relative_to(ws) and c.leads_per_week == 12, ref
+        assert c.delivery_folder(date(2026, 9, 25)) == Path("deliveries/acme/2026-09-25")
+
+
 def test_load_uses_clients_dir_and_yml_suffix(ws):
     other = ws / "elsewhere"
     other.mkdir()
@@ -270,6 +291,11 @@ def test_unknown_top_level_key_suggests_the_right_one(ws):
     ("emails: {include_unverified: maybe}", "emails.include_unverified must be true or false"),
     ("emails: {verified_only: true}", "unknown setting 'emails.verified_only'"),
     ("opening_line: {max_cost_usd: -1}", "opening_line.max_cost_usd must be an amount in US dollars >= 0"),
+    # NaN / infinity would silently switch the AI cost cap off
+    ("opening_line: {max_cost_usd: .nan}", "opening_line.max_cost_usd must be an amount in US dollars >= 0"),
+    ("opening_line: {max_cost_usd: .inf}", "opening_line.max_cost_usd must be an amount in US dollars >= 0"),
+    ("opening_line: {max_cost_usd: -.inf}", "opening_line.max_cost_usd must be an amount in US dollars >= 0"),
+    ("opening_line: {max_cost_usd: 1%s}" % ("0" * 400), "opening_line.max_cost_usd must be an amount in US dollars"),
     ("opening_line: {enabled: yes please}", "opening_line.enabled must be true or false"),
     ("budget: {max_paid_lookups: -5}", "budget.max_paid_lookups must be a whole number >= 0"),
     ("branding: {brand_colour: '#ffffff'}", "did you mean 'branding.brand_color'?"),

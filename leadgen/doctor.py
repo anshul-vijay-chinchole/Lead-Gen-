@@ -42,7 +42,9 @@ anthropic                  GET {api root}/v1/models/{model} with ``x-api-key`` +
                            ``anthropic-version``: confirms the key AND that
                            ``writer.model`` exists (404 = unknown model).
 openai / openai_compatible GET {base_url}/models (Bearer) - also warns when
-                           ``writer.model`` is not in the returned list.
+                           ``writer.model`` is not in the returned list. As in a
+                           run, ``$OPENAI_API_KEY`` is only sent to api.openai.com
+                           (also via ``doctor_url``) unless named explicitly.
 instantly                  GET {base_url}/api/v2/campaigns?limit=1 (Bearer)
 smartlead                  GET {base_url}/campaigns?api_key= (also checks that
                            ``campaign_id`` is one of the account's campaigns)
@@ -699,13 +701,19 @@ def check_openai(doctor: Doctor, adapter: Any) -> DoctorResult:
     from .llm.openai import clean_headers
 
     adapter.check_config()  # LLMConfigError (missing base_url / model) -> "config problem"
-    key = adapter.api_key()  # '' only for a keyless local server (api_key_required: false)
+    url = doctor_url(adapter, adapter.base_url + "/models")
+    try:
+        target = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        target = ""
+    # the key goes to the doctor_url host: $OPENAI_API_KEY only to api.openai.com unless named
+    # explicitly (as in a run). '' only for a keyless local server (api_key_required: false)
+    key = adapter.api_key(host=target)
     doctor.remember(key)
     headers = {"Accept": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     headers.update(clean_headers(adapter.config.get("extra_headers")))
-    url = doctor_url(adapter, adapter.base_url + "/models")
     hint = doctor.key_hint(adapter)
     data = doctor.get(adapter, url, headers=headers, hint=hint)
     items = data.get("data") if isinstance(data, dict) else data

@@ -174,7 +174,10 @@ overwrites an earlier one on the same day: the files go to `<folder>-2`, `-3`, .
 
 Try a **preview** too: `leadgen deliver --client demo-client --dry-run` writes the same
 files named `...-PREVIEW.csv` / `.xlsx` / `.html` and records nothing, so the real
-delivery afterwards is unaffected. The demo keeps its memory in
+delivery afterwards is unaffected. A preview is never sent: the real delivery of the same
+day moves the PREVIEW files into its `_internal/preview/` folder, so the delivery folder
+holds only what you send (if anything else is in it, the `Next:` line names the exact files
+to send and what to leave out). The demo keeps its memory in
 `data/demo-delivery.db`. Delete that file and `deliveries/demo-client/` to start over.
 
 ---
@@ -261,12 +264,22 @@ preview is empty. It proves the client file and playbook load, then says:
 Note: nothing was found because every source uses the network and --dry-run skips them. Add a csv/json source to rehearse offline, or run without --dry-run.
 ```
 
-To try a real run without recording anything in your real ledger, point it at a scratch
-database and folder:
+To try a real run without recording anything in your real ledger, run it on a **copy** of
+your database, into a scratch folder:
 
 ```bash
-leadgen deliver --client acme --db data/rehearsal.db --out rehearsal/{client}/{date}
+cp data/leadgen.db data/rehearsal.db       # Windows: copy data\leadgen.db data\rehearsal.db
+leadgen deliver --client acme --db data/rehearsal.db --out output/rehearsal/{client}/{date}
 ```
+
+The copy carries your do-not-lists (`leadgen suppress`) and what the client already
+received, so the rehearsal applies them, and it records only in the copy. Skip the `cp`
+line if `data/leadgen.db` doesn't exist yet. A rehearsal's files are **never sent**: the
+real ledger doesn't know about them, so the real delivery would repeat their leads. (Never
+rehearse on an empty scratch database while `data/leadgen.db` exists: that run ignores every
+do-not-list and the client's history.) Whenever `--db` names another database than the
+client's playbook uses, `leadgen deliver` ends with a `Careful: this delivery used --db ...`
+line saying so.
 
 **6. Deliver.**
 
@@ -301,8 +314,9 @@ Next: send the files in deliveries/acme/2026-09-25 to Sam Lee <sam@acme-staffing
 > The free `pattern` finder then guesses emails for people who have a name but no
 > address. Those emails are always labelled `guessed-unverified`.
 
-**7. Send the files.** Send everything in the delivery folder **except `_internal/`**:
-attach it to an email, share a folder, or set `delivery.google_sheet` in the client
+**7. Send the files.** Send the files the `Next:` line names - normally everything in the
+delivery folder **except `_internal/`** - never PREVIEW files or a rehearsal's files:
+attach them to an email, share a folder, or set `delivery.google_sheet` in the client
 file to push the rows to a Google Sheet you share with the client. leadgen never
 sends the report for you.
 
@@ -407,7 +421,11 @@ Dry runs never push.
 The report sells timing, so only fresh jobs count:
 
 - `freshness_days: 7` keeps jobs posted in the last 7 days (as of the delivery date).
-  The "Posted" column says `posted today` / `posted 3 days ago`.
+  The "Posted" column says `posted today` / `posted 3 days ago`. A source only returns
+  jobs inside its own date window, which a client file can't widen: in
+  `playbooks/recruitment-delivery.yaml` Adzuna fetches the last 30 days (newest first)
+  and TheirStack the last 7 (it charges per job). For a client with `freshness_days`
+  above those, raise `max_days_old` / `max_age_days` there too.
 - `allow_undated: false` leaves out jobs without a posting date, because nobody can
   promise they are fresh. With `true`, they show `date unknown (first seen N days ago)`.
 - `drop_reposts: true` leaves out re-posted ads: an old job put up again to look new.
@@ -1034,6 +1052,8 @@ class TradeShowSource(Source):
 
 
 registry.register("source", "tradeshow", "my_plugins:TradeShowSource")
+# a provider that charges per request or per result: add paid=True, e.g.
+# registry.register("finder", "my_people_api", "my_plugins:PeopleFinder", paid=True)
 ```
 
 Put the file in the repo folder, set `LEADGEN_PLUGINS=my_plugins` (in `.env`; several
@@ -1049,8 +1069,12 @@ playbook. Rules:
   only in outbound mode, only gets leads that may be emailed, and what it returns counts
   as handed over.
 - Parse responses defensively (`.get(...)`).
-- The `--budget` cap covers the built-in paid types (`registry.PAID`). Requests from your
-  own adapter are counted, but not as paid lookups.
+- An adapter that calls a **paid** API (money or credits per request or result) must be
+  registered with `paid=True`: `registry.register(kind, type, "module:Class", paid=True)`.
+  Its requests then count as paid lookups, the `--budget` / `usage.max_paid_lookups` cap
+  stops them before they reach the network, and `leadgen adapters` shows it as
+  `network (paid)`. Without `paid=True` its requests are counted in the usage summary but
+  are not paid lookups, so no budget caps them.
 
 Tests use `tests.fakes.FakeHttp` with canned responses, so no test reaches the network.
 Run the suite with `pip install -e ".[dev]" && pytest -q`.

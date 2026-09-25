@@ -175,7 +175,11 @@ sources:
     countries: [us]
     queries: [accountant, financial controller, finance manager]
     what_exclude: [intern, internship]
-    max_days_old: 7               # match signals.max_age_days
+    # Adzuna's own date window. Results come newest first, and each client's
+    # freshness_days then decides which jobs count - so keep this at least the
+    # largest freshness_days of the clients on this playbook (a client file
+    # cannot widen it).
+    max_days_old: 30
     max_pages: 2                  # 50 jobs per page
 
   # Company job boards (Greenhouse / Lever / Ashby) - FREE, no key. A
@@ -226,6 +230,9 @@ sources:
     job_titles: [accountant, financial controller, financial analyst, finance manager, payroll manager]
     exclude_job_titles: [intern, internship]
     countries: [US]               # ISO codes, e.g. [US, CA] or [GB]
+    # TheirStack's own date window: keep it at least the largest freshness_days
+    # of the clients on this playbook (a client file cannot widen it). Every job
+    # returned costs credits, so no wider than that.
     max_age_days: 7
     limit: 25                     # jobs per page - each job costs credits
     max_pages: 1

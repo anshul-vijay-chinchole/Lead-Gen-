@@ -177,6 +177,24 @@ def test_within_run_dupes_may_be_an_int_and_ledger_removed_may_be_missing():
     assert qa3.duplicates == {} and qa3.duplicates_removed == 0
 
 
+def test_the_client_file_exclusions_are_counted_as_its_do_not_list():
+    run = make_run(rejected=[
+        reject("Their Client", "excluded domain theirclient.example"),
+        reject("Their Client EU", "excluded domain eu.theirclient.example (under theirclient.example)"),
+        reject("Rival Staffing", "excluded keyword 'staffing' in name"),
+        reject("Rival Agency", "excluded keyword 'staffing agency' in description"),   # base list, hit first
+        reject("Base Only", "excluded domain base-only.example"),                     # the base playbook's
+        reject("Base Kw", "excluded keyword 'executive search' in name"),
+        reject("Tiny Co", "too small (5 employees, min 20)"),
+    ], counts={"sourced": 10, "with_signal": 8, "qualified": 1, "suppressed_contacts": 2})
+    c = client(exclusions={"domains": ["TheirClient.example"], "keywords": ["Staffing"]})
+    qa = build_qa(c, run, make_pkg(FULL), {"suppressed": 1})
+    assert qa.suppressed == 1 + 4 + 2       # client list + its exclusions + people on the global list
+    assert qa.filtered_out == 7             # they are still "filtered out" (with their own reasons)
+    assert build_qa(client(), run, make_pkg(FULL)).suppressed == 2      # no exclusions: only the people
+    assert build_qa("acme", run, make_pkg(FULL)).suppressed == 2
+
+
 def test_client_can_be_a_plain_object_or_name():
     qa = build_qa(SimpleNamespace(name="beta", leads_per_week=5), make_run(), make_pkg(FULL))
     assert qa.client == "beta" and qa.client_display == "beta" and qa.target == 5

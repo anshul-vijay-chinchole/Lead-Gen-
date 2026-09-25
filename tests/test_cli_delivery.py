@@ -297,6 +297,52 @@ def test_deliver_dry_run_writes_preview_files_and_records_nothing(ws, capsys):
     assert "delivered .................. 3 (target 10)" in capsys.readouterr().out
 
 
+def test_preview_then_delivery_the_folder_to_send_holds_no_preview(ws, capsys):
+    """The documented flow (README): --dry-run, then the real delivery the same day. The
+    preview skips the paid checker, so it ranks differently and can hold a lead the real
+    delivery holds back (not recorded) - the folder the CLI says to send must not hold it."""
+    ws.write_csv("contacts.csv", CONTACT_HEADER, UNCHECKED)
+    ws.playbook(verifier={"type": "millionverifier"})
+    ws.env(MILLIONVERIFIER_API_KEY=MV_KEY)
+    good = {"robin@beta-dlv.example", "casey@acme-dlv.example"}     # the checker confirms only these two
+    ws.http.add("GET", MV_URL, fn=lambda call: {
+        "email": call["params"]["email"], "quality": "good",
+        "result": "ok" if call["params"]["email"] in good else "unknown",
+        "resultcode": 1 if call["params"]["email"] in good else 5, "subresult": "", "free": False,
+        "role": False, "didyoumean": "", "credits": 999, "executiontime": 1, "error": "", "livemode": True})
+    ws.client(leads_per_week=2)
+    assert deliver_cmd(ws, "--dry-run") == 0
+    folder = ws.folder()
+    preview_rows = read_csv(folder / f"acme-hiring-signals-{TODAY}-PREVIEW.csv")
+    capsys.readouterr()
+    assert deliver_cmd(ws) == 0
+    out = capsys.readouterr().out
+    sendable = sorted(p.name for p in folder.iterdir() if p.name != "_internal")
+    assert sendable == sorted(f"acme-hiring-signals-{TODAY}.{ext}" for ext in ("csv", "html", "xlsx"))
+    assert f"Next: send the files in {folder} to Sam Lee" in out
+    delivered = {r["Company"] for r in read_csv(folder / f"acme-hiring-signals-{TODAY}.csv")}
+    # next time: whatever comes was never in a file the client was told to take
+    capsys.readouterr()
+    assert deliver_cmd(ws) in (0, 1)
+    later = {r["Company"] for r in read_csv(ws.folder(suffix="-2") / f"acme-hiring-signals-{TODAY}.csv")}
+    assert not later & delivered
+    assert {r["Company"] for r in preview_rows} != delivered       # the preview really was different
+
+
+def test_deliver_next_line_names_only_this_deliverys_files_when_the_folder_holds_others(ws, capsys):
+    folder = ws.folder()
+    folder.mkdir(parents=True)
+    (folder / "old-list.csv").write_text("company\nSomeone Else\n", encoding="utf-8")
+    (folder / ".DS_Store").write_bytes(b"")
+    assert deliver_cmd(ws) == 0
+    out = capsys.readouterr().out
+    assert (folder / f"acme-hiring-signals-{TODAY}.csv").is_file()
+    assert "Next: send the files in" not in out
+    assert ("Next: send ONLY the 3 files listed above to Sam Lee <sam@acme-staffing-demo.example> at Acme "
+            f"Staffing Ltd. {folder} also holds old-list.csv: not part of this delivery") in out
+    assert ".DS_Store" not in out
+
+
 @pytest.mark.parametrize("flag, calls", [(None, 4), ("1", 1), ("2", 2), ("0", 4)])
 def test_deliver_budget_flag_reaches_the_meter(ws, capsys, flag, calls):
     mv_workspace(ws)
@@ -390,6 +436,41 @@ def test_deliver_without_db_uses_the_client_playbooks_database(ws, capsys):
     assert not ws.db.exists() and not (ws.root / "data" / "leadgen.db").exists()
 
 
+def test_deliver_says_when_db_is_not_the_client_playbooks_database(ws, capsys):
+    # the playbook's own database (storage.path), named with --db: nothing to warn about
+    rel = ws.pb_db.relative_to(ws.root)
+    assert main(["deliver", "--client", "acme", "--out", ws.out(), "--db", str(rel),
+                 "--env-file", str(ws.env_file)]) == 0
+    out = capsys.readouterr().out
+    assert "Next: send the files in" in out and "Careful" not in out
+    # another database: the "Next:" line says whose history and do-not-lists were applied
+    assert main(["deliver", "--client", "acme", "--out", str(ws.root / "other" / "{client}" / "{date}"),
+                 *ws.g()]) == 0
+    out = capsys.readouterr().out
+    assert (f"Careful: this delivery used --db {ws.db}, not {ws.pb_db} (the database of this client's "
+            f"playbook, storage.path)") in out
+    assert "never the files of a rehearsal" in out
+
+
+def test_readme_rehearsal_on_a_copy_of_the_database_applies_the_do_not_lists(ws, capsys):
+    """README step 5: rehearse on a copy of the real database (its do-not-lists + history apply),
+    into a scratch folder; the real ledger records nothing."""
+    env = ["--env-file", str(ws.env_file)]
+    assert main(["suppress", "add", "casey@acme-dlv.example", "--client", "acme", *env]) == 0   # real database
+    assert main(["suppress", "add", "beta-dlv.example", "-p", str(ws.playbook_path), *env]) == 0
+    rehearsal_db = ws.root / "data" / "rehearsal.db"
+    rehearsal_db.write_bytes(ws.pb_db.read_bytes())                                          # cp data/... data/...
+    capsys.readouterr()
+    assert main(["deliver", "--client", "acme", "--db", str(rehearsal_db),
+                 "--out", str(ws.root / "rehearsal" / "{client}" / "{date}"), *env]) == 0
+    out = capsys.readouterr().out
+    rows = read_csv(next((ws.root / "rehearsal" / "acme").glob(f"*/acme-hiring-signals-{TODAY}.csv")))
+    assert "Beta LLC" not in {r["Company"] for r in rows}                   # the global do-not-list
+    assert "casey@acme-dlv.example" not in {r["Email"] for r in rows}     # the client's do-not-list
+    assert "Careful: this delivery used --db" in out and "never the files of a rehearsal" in out
+    assert ledger_summary(ws.pb_db)["items"] == 0                         # the real ledger knows nothing
+
+
 def test_deliver_ignores_p_with_a_warning(ws, capsys):
     assert deliver_cmd(ws, "-p", "playbooks/whatever.yaml") == 0
     assert "-p is ignored by 'deliver'" in capsys.readouterr().err
@@ -449,6 +530,28 @@ def test_clients_list_shows_volume_and_delivery_history(ws, capsys):
     assert re.search(rf"acme\s+Acme Staffing Ltd\s+10\s+1\s+{TODAY}\s+3", out), out
     assert re.search(r"beta\s+Beta Recruiting\s+25\s+0\s+never\s+0", out), out
     assert "leadgen deliver --client <name> --dry-run" in out
+
+
+def test_clients_list_footer_is_true_when_a_client_file_allows_redelivery(ws, capsys):
+    assert main(["clients", *ws.g()]) == 0
+    out = capsys.readouterr().out
+    assert "No client file allows the same company, job or person to be delivered twice." in out
+    # new jobs at known companies: Acme is delivered again, and counted once
+    ws.client(dedupe=["job", "contact"])
+    ws.client("beta", display_name="Beta Recruiting", redelivery_days=90)
+    ws.client("gamma", display_name="Gamma Talent")
+    assert deliver_cmd(ws) == 0
+    ws.write_csv("jobs.csv", JOB_HEADER, job_rows() + [
+        ["Acme Corp", "acme-dlv.example", "Austin, TX", "Software", 120, "job_posting", "Payroll Accountant",
+         ago(1), "https://acme-dlv.example/jobs/3", "a-3"]])
+    assert deliver_cmd(ws) == 0
+    capsys.readouterr()
+    assert main(["clients", *ws.g()]) == 0
+    out = capsys.readouterr().out
+    assert re.search(rf"acme\s+Acme Staffing Ltd\s+10\s+2\s+{TODAY}\s+3", out), out
+    assert "total delivered = distinct companies sent so far (a company sent again is counted once)." in out
+    assert "none of them is ever delivered" not in out
+    assert re.search(r"May get the same company / job / person again \(.*\): acme, beta\. Every other", out), out
 
 
 def test_clients_list_reads_each_clients_playbook_database(ws, capsys):
@@ -707,6 +810,49 @@ def test_suppress_client_unknown_client(ws, capsys):
     assert "The do-not-list of client 'gone'" in capsys.readouterr().out
 
 
+def _case_insensitive_disk(monkeypatch) -> None:
+    """Make file lookups ignore case, like the default macOS (APFS) and Windows (NTFS) disks:
+    'clients/ACME.yaml' opens 'clients/acme.yaml'. Directory listings keep the stored names."""
+    import os
+
+    real_is_file, real_exists, real_read = Path.is_file, Path.exists, Path.read_text
+
+    def on_disk(p: Path) -> Path:
+        try:
+            names = os.listdir(p.parent)
+        except OSError:
+            return p
+        same = [n for n in names if n.casefold() == p.name.casefold()]
+        return p.with_name(same[0]) if p.name not in names and len(same) == 1 else p
+
+    monkeypatch.setattr(Path, "is_file", lambda self: real_is_file(on_disk(self)))
+    monkeypatch.setattr(Path, "exists", lambda self: real_exists(on_disk(self)))
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: real_read(on_disk(self), *a, **k))
+
+
+def test_client_name_typed_in_another_case_is_the_same_client(ws, capsys, monkeypatch):
+    """On a case-insensitive disk `--client ACME` opens clients/acme.yaml: it must be client
+    'acme' - its ledger and do-not-list - not a new client 'ACME' with an empty history."""
+    _case_insensitive_disk(monkeypatch)
+    assert deliver_cmd(ws) == 0
+    capsys.readouterr()
+    assert main(["suppress", "add", "casey@acme-dlv.example", "--client", "ACME", *ws.g()]) == 0
+    assert "do-not-list of client 'acme'" in capsys.readouterr().out
+    assert main(["suppress", "list", "--client", "Acme", *ws.g()]) == 0
+    assert "casey@acme-dlv.example" in capsys.readouterr().out
+    assert main(["deliver", "--client", "ACME", "--out", ws.out(), *ws.g()]) == 1
+    out = capsys.readouterr().out
+    assert "Delivering the Hiring Signal Report for Acme Staffing Ltd (acme)" in out
+    assert "delivered .................. 0 (target 10)" in out           # nothing twice
+    store = Store(str(ws.db))
+    try:
+        ledger = Ledger(store)
+        assert ledger.list_clients_with_history() == ["acme"]
+        assert [r["value"] for r in ledger.list_suppressed("acme")] == ["casey@acme-dlv.example"]
+    finally:
+        store.close()
+
+
 def test_suppress_client_from_a_company_csv(ws, capsys):
     f = ws.root / "their-clients.csv"
     f.write_text("First name,Last name,Company,Email\nJo,Doe,Acme Corp,jo@acme-dlv.example\n"
@@ -838,6 +984,55 @@ def test_run_prints_usage_with_and_without_a_console_notifier(ws, capsys):
     assert "delivery mode" in out and "leadgen deliver --client <name>" in out
 
 
+PAID_PLUGIN = """
+from leadgen import registry
+from leadgen.models import Company, Signal
+from leadgen.sources.base import Source
+
+
+class PaidJobs(Source):
+    \"\"\"A job API that charges per request (README: register it with paid=True).\"\"\"
+
+    name = "paid_jobs"
+    env_key = "PAID_JOBS_KEY"
+
+    def fetch(self):
+        out = []
+        for page in (1, 2, 3):
+            data = self.http.get_json(f"https://jobs-api.example/search/{page}", params={"key": self.secret()})
+            out += [Company(name=j["company"], domain=j["domain"], sources=[self.label],
+                            signals=[Signal(type="job_posting", title=j["title"], source=self.label)])
+                    for j in data.get("jobs", [])]
+        return out
+
+
+registry.register("source", "paid_jobs", "cli_paid_plugin:PaidJobs", paid=True)
+"""
+
+
+def test_plugin_registered_as_paid_is_capped_by_budget(ws, capsys, monkeypatch):
+    """README 'Extending': registry.register(..., paid=True) makes a plugin's requests paid
+    lookups - shown as paid, counted, and stopped by --budget before they reach the network."""
+    from leadgen import registry
+
+    (ws.root / "cli_paid_plugin.py").write_text(PAID_PLUGIN, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(ws.root))
+    ws.env(LEADGEN_PLUGINS="cli_paid_plugin", PAID_JOBS_KEY="k-123")
+    ws.http.add("GET", re.compile(r"^https://jobs-api\.example/search/\d$"), json={"jobs": []})
+    try:
+        assert main(["adapters", *ws.g()]) == 0
+        assert "network (paid)" in _line(capsys.readouterr().out, "paid_jobs")
+        ws.playbook(sources=[{"type": "paid_jobs"}])
+        assert run_cmd(ws, "--budget", "1") == 0
+        out = capsys.readouterr().out
+        assert len(ws.http.calls) == 1                      # the 2nd request never reached the network
+        assert "paid lookups 1/1" in out and "k-123" not in out
+    finally:
+        registry._REGISTRY["source"].pop("paid_jobs", None)
+        registry.register("source", "paid_jobs", "cli_paid_plugin:PaidJobs", paid=False)
+        registry._REGISTRY["source"].pop("paid_jobs", None)
+
+
 def test_run_negative_budget_is_a_usage_error(ws, capsys):
     assert run_cmd(ws, "--budget", "-5") == 2
     assert "--budget must be 0 or more" in capsys.readouterr().err
@@ -945,6 +1140,33 @@ def test_demo_report_after_a_delivery_mode_run(ws, capsys):
     page = (demo_dir / "demo-acme-staffing.html").read_text(encoding="utf-8")
     assert "Acme Corp" in md and "Acme Corp" in page
     assert "Suggested first email" not in md and "Suggested first email" not in page   # no copy in delivery mode
+
+
+def test_demo_report_never_calls_a_guessed_email_verified(ws, capsys):
+    # a paid checker that says "ok" to every address; Gamma's controller has no address in the
+    # contact list, so the pattern finder guesses one - the client file says guessed-unverified
+    mv_workspace(ws)
+    assert run_cmd(ws) == 0
+    capsys.readouterr()
+    demo_dir = ws.root / "demo"
+    for mask in ([], ["--no-mask"]):
+        assert main(["demo", "-p", str(ws.playbook_path), "--top", "0", "--out", str(demo_dir), *mask,
+                     *ws.g()]) == 0
+        md = (demo_dir / "demo.md").read_text(encoding="utf-8")
+        page = (demo_dir / "demo.html").read_text(encoding="utf-8")
+        gamma = next(ln for ln in md.splitlines() if "@gamma-dlv.example" in ln)
+        assert "Pat Numbers" in gamma and gamma.endswith("(guessed-unverified)"), gamma
+        assert "guessed-unverified" in page
+        # Acme / Beta / Zeta come from the list and the checker confirmed them: 3 verified, not 4
+        assert "decision-maker at **4** of them (3 with a verified email)" in md
+        assert md.count("(verified)") == 3
+    # the stored leads are unchanged (only the one-pager's copy is relabelled)
+    store = Store(str(ws.db))
+    try:
+        stored = [ld for ld in store.list_leads(None, limit=100) if ld.contact and "gamma" in ld.contact.email]
+    finally:
+        store.close()
+    assert stored and all(ld.contact.email_status == "valid" for ld in stored)
 
 
 def test_demo_report_still_works_for_an_outbound_run(ws, capsys, monkeypatch):

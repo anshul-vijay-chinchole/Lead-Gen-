@@ -169,6 +169,30 @@ def test_openai_optional_config_passthrough(make_ctx):
     assert ctx.http.timeouts == [30.0]
 
 
+@pytest.mark.parametrize("config", [{}, {"type": "openai_compatible", "base_url": "https://gw.example/v1",
+                                          "model": "cheap-model", "api_key": "k"}])
+def test_openai_extra_body_cannot_replace_the_model_or_the_token_limit(make_ctx, config):
+    # the AI cost caps price every call by client.model and check the caller's max_tokens as
+    # the worst case: extra_body must not swap in a pricier model or a bigger output budget
+    cfg = dict(config)
+    cfg["extra_body"] = {"model": "gpt-5-pro", "max_tokens": 8000, "max_completion_tokens": 8000,
+                         "messages": [{"role": "user", "content": "other"}], "seed": 7}
+    client, ctx = openai_client(make_ctx, cfg)
+    url = client.endpoint
+    ctx.http.add("POST", url, json=openai_payload())
+    client.complete("s", "u", max_tokens=60)
+    client.complete("s", "u", max_tokens=60)
+    for call in ctx.http.calls:
+        body = call["json"]
+        assert body["model"] == client.model and body["model"] != "gpt-5-pro"
+        token_key = "max_tokens" if client.compatible else "max_completion_tokens"
+        assert body[token_key] == 60
+        assert body.get("max_tokens", 60) == 60 and body.get("max_completion_tokens", 60) == 60
+        assert body["messages"][-1] == {"role": "user", "content": "u"}
+        assert body["seed"] == 7  # other provider options still pass through
+    assert ctx.usage.rows()[0]["input_tokens"] == 2 * 812  # priced under the model actually sent
+
+
 def test_openai_content_parts_are_joined(make_ctx):
     client, ctx = openai_client(make_ctx)
     ctx.http.add("POST", OPENAI_URL, json=openai_payload([{"type": "text", "text": "Hel"},
@@ -423,6 +447,23 @@ def test_anthropic_optional_config(make_ctx):
     assert call["json"]["output_config"] == {"effort": "low"}
     assert call["json"]["metadata"] == {"user_id": "run-1"}
     assert "system" not in call["json"]  # empty system prompt omitted
+
+
+def test_anthropic_extra_body_cannot_replace_the_model_or_the_token_limit(make_ctx, caplog):
+    client, ctx = anthropic_client(make_ctx, {"model": "claude-haiku-4-5", "extra_body": {
+        "model": "claude-opus-5", "max_tokens": 8000, "messages": [{"role": "user", "content": "x"}],
+        "metadata": {"user_id": "run-1"}}})
+    ctx.http.add("POST", ANTHROPIC_URL, json=anthropic_payload("ok"))
+    with caplog.at_level("WARNING"):
+        client.complete("s", "u", max_tokens=60)
+        client.complete("s", "u", max_tokens=60)
+    for call in ctx.http.calls:
+        body = call["json"]
+        assert body["model"] == "claude-haiku-4-5" and body["max_tokens"] == 60
+        assert body["messages"] == [{"role": "user", "content": "u"}]
+        assert body["metadata"] == {"user_id": "run-1"}
+    warnings = [r.getMessage() for r in caplog.records if "extra_body" in r.getMessage()]
+    assert len(warnings) == 1 and "max_tokens, messages, model" in warnings[0]
 
 
 @pytest.mark.parametrize("base, expected", [

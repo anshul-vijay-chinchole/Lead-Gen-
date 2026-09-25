@@ -533,6 +533,34 @@ def test_openai_third_party_host_never_gets_the_openai_key(make_ctx):
     assert res.status == MISSING_KEY and "api_key_env" in res.detail and ctx.http.calls == []
 
 
+def test_openai_doctor_url_on_another_host_never_gets_the_implicit_openai_key(make_ctx):
+    # base_url is api.openai.com, so the run would use $OPENAI_API_KEY there - but a doctor_url
+    # on another host must not receive it unless the key was named explicitly (api_key / api_key_env)
+    ctx = ctx_for(make_ctx, env={"OPENAI_API_KEY": "sk-openai-SECRET"},
+                  writer={"provider": "openai", "model": "gpt-5-mini",
+                          "llm": {"doctor_url": "https://mirror.example/v1/models"}})
+    ctx.http.add("GET", "https://mirror.example/v1/models", json=OPENAI_MODEL_LIST)
+    res = Doctor(ctx).writer_llm()
+    assert ctx.http.calls == []
+    assert res.status == MISSING_KEY and "api_key_env" in res.detail and "mirror.example" in res.detail
+    assert "sk-openai-SECRET" not in res.detail
+
+    # named explicitly: the user chose to send that key to the doctor_url host
+    ctx2 = ctx_for(make_ctx, env={"OPENAI_API_KEY": "sk-openai-SECRET"},
+                   writer={"provider": "openai", "model": "gpt-5-mini", "api_key_env": "OPENAI_API_KEY",
+                           "llm": {"doctor_url": "https://mirror.example/v1/models"}})
+    ctx2.http.add("GET", "https://mirror.example/v1/models", json=OPENAI_MODEL_LIST)
+    assert Doctor(ctx2).writer_llm().status == OK
+    assert ctx2.http.calls[0]["headers"]["Authorization"] == "Bearer sk-openai-SECRET"
+
+    # a doctor_url on api.openai.com itself is fine with the implicit key
+    ctx3 = ctx_for(make_ctx, env={"OPENAI_API_KEY": "sk-openai-SECRET"},
+                   writer={"provider": "openai", "model": "gpt-5-mini",
+                           "llm": {"doctor_url": "https://api.openai.com/v1/models?limit=100"}})
+    ctx3.http.add("GET", "https://api.openai.com/v1/models", json=OPENAI_MODEL_LIST)
+    assert Doctor(ctx3).writer_llm().status == OK
+
+
 def test_openai_compatible_config_problem_and_keyless_server(make_ctx):
     ctx = ctx_for(make_ctx, env={}, writer={"provider": "openai_compatible"})
     res = Doctor(ctx).writer_llm()

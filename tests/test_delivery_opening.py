@@ -444,3 +444,91 @@ def test_last_usage_formats():
     assert _usage_tokens(SimpleNamespace(input_tokens=3, output_tokens=4)) == (3, 4)
     assert _usage_tokens({}) is None and _usage_tokens(None) is None
     assert _usage_tokens({"input_tokens": True}) is None
+
+
+# --- the line talks about where the JOB is, not the company's HQ --------------------------
+
+def _hq_lead(company_location: str, job_location: str, **kw: Any) -> Lead:
+    lead = make_lead(location=job_location, **kw)
+    lead.company.location = company_location
+    return lead
+
+
+@pytest.mark.parametrize("hq,job,expected", [
+    # TheirStack: company.location is the HQ, the job is elsewhere
+    ("San Francisco, United States", "Austin, TX",
+     "Saw Acme Corp is hiring a Senior Accountant in Austin, TX (posted 2 days ago)."),
+    # ATS boards: company.location is every job location joined
+    ("New York, NY; Remote; Austin, TX", "Austin, TX",
+     "Saw Acme Corp is hiring a Senior Accountant in Austin, TX (posted 2 days ago)."),
+    # a remote-first company hiring on site: the role is not "remote"
+    ("Remote", "Austin, TX", "Saw Acme Corp is hiring a Senior Accountant in Austin, TX (posted 2 days ago)."),
+    # a remote job at an Austin company
+    ("Austin, TX", "Remote - US", "Saw Acme Corp is hiring a remote Senior Accountant (posted 2 days ago)."),
+    # the job's location is unknown: say nothing about where, never the HQ
+    ("San Francisco, United States", "", "Saw Acme Corp is hiring a Senior Accountant (posted 2 days ago)."),
+])
+def test_opening_line_uses_the_job_location_not_the_company_location(make_ctx, hq, job, expected):
+    lead = _hq_lead(hq, job)
+    rows = [row_for(lead)]
+    assert rows[0]["location"] == hq                     # the Location column stays company-level
+    add_opening_lines(rows, {rows[0]["_lead_id"]: lead}, make_ctx(mode="delivery"), client(ai=False))
+    assert rows[0]["opening_line"] == expected
+    assert template_line(rows[0]) == expected             # reproducible from the row alone
+    assert rows[0]["_job_location"] == job                # internal key, never written to client files
+
+
+def test_ai_prompt_gets_the_job_location_not_the_company_hq(make_ctx):
+    lead = _hq_lead("San Francisco, United States", "Austin, TX")
+    row = row_for(lead)
+    _, user = build_prompt(row, lead)
+    assert "- Location: Austin, TX" in user and "San Francisco" not in user
+    ctx = priced_ctx(make_ctx)
+    llm = UsageLLM(GOOD, usage={"input_tokens": 10, "output_tokens": 10})
+    ctx.llm = llm
+    add_opening_lines([row], {row["_lead_id"]: lead}, ctx, client(ai=True))
+    assert "- Location: Austin, TX" in llm.calls[0]["user"] and "San Francisco" not in llm.calls[0]["user"]
+    # a non-hiring signal is about the company: its location is the company's
+    funding = _hq_lead("San Francisco, United States", "Austin, TX", titles=["Raised $20M"], signal_type="funding")
+    _, user = build_prompt(row_for(funding), funding)
+    assert "- Location: San Francisco, United States" in user
+
+
+# --- non-finite settings never switch the cost cap off or crash ----------------------------
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "nan", "Infinity"])
+def test_non_finite_cost_cap_falls_back_to_the_default_cap(make_ctx, bad):
+    """max_cost_usd = NaN made every 'over the cap?' check False: no cap at all."""
+    ctx = priced_ctx(make_ctx)
+    llm = UsageLLM(*([GOOD] * 40), usage={"input_tokens": 500, "output_tokens": 400})   # $0.10 per call
+    ctx.llm = llm
+    rows, leads = rows_and_leads(40)
+    stats = add_opening_lines(rows, leads, ctx, client(ai=True, max_cost=bad))
+    assert stats.capped and stats.cost_usd <= 0.50 + 1e-9 and len(llm.calls) == 5
+    assert any("max_cost_usd" in n for n in stats.notes)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "nan", 1e400, "lots"])
+def test_non_finite_max_tokens_and_failure_limit_never_raise(make_ctx, bad):
+    ctx = priced_ctx(make_ctx)
+    ctx.playbook.writer["max_llm_failures"] = bad
+    llm = UsageLLM(LLMError("a"), LLMError("b"), LLMError("c"), GOOD, usage={"input_tokens": 1, "output_tokens": 1})
+    ctx.llm = llm
+    rows, leads = rows_and_leads(4)
+    stats = add_opening_lines(rows, leads, ctx, client(ai=True, max_tokens=bad))
+    assert stats.template_lines == 4 and len(llm.calls) == 3            # default limit: 3 failures in a row
+    assert all(c["max_tokens"] == DEFAULT_MAX_TOKENS for c in llm.calls)
+
+
+def test_documented_client_settings_are_accepted_by_client_files():
+    """Every opening_line key the module doc lists as a client setting must load from a client file."""
+    import leadgen.delivery.opening as opening
+    from leadgen.delivery.client import parse_client
+
+    doc = opening.__doc__ or ""
+    section = doc.split("Client settings read", 1)[1].split("Playbook keys read", 1)[0]
+    keys = re.findall(r"^([a-z_]+)\s{2,}", section, re.M)
+    assert {"enabled", "ai", "max_cost_usd"} <= set(keys)
+    samples = {"enabled": True, "ai": True, "max_cost_usd": 0.5}
+    for key in keys:
+        parse_client({"opening_line": {key: samples.get(key, 1)}}, name="doc-check")

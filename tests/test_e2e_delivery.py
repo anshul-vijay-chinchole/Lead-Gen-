@@ -608,3 +608,22 @@ def test_env_example_lists_every_variable_the_code_and_playbooks_read():
     for name, value in listed.items():
         if not name.startswith("SENDER_"):
             assert value == "", f".env.example must not ship a value for {name}"
+
+
+def test_client_data_stays_out_of_git_as_the_docs_say():
+    ignored = {line.strip() for line in (REPO / ".gitignore").read_text(encoding="utf-8").splitlines()}
+    assert {"deliveries/", "output/", ".env", "*.db"} <= ignored
+    plan = (REPO / "PLAN.md").read_text(encoding="utf-8")
+    assert "not in `.gitignore`" not in plan and "are in `.gitignore`" in plan
+    # the README's rehearsal writes client data where git never looks (output/, data/*.db)
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    rehearsal = next(ln for ln in readme.splitlines() if "--db data/rehearsal.db" in ln)
+    assert "--out output/" in rehearsal
+
+
+def test_readme_says_how_a_paid_plugin_is_capped_by_the_budget():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    extending = readme[readme.index("## Extending"):readme.index("## Troubleshooting")]
+    assert 'registry.register(kind, type, "module:Class", paid=True)' in extending
+    assert "not as paid lookups" not in extending
+    assert "paid=True" in (cli.__doc__ or "")

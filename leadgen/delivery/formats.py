@@ -50,13 +50,21 @@ spreadsheet_id        The id from the sheet URL (``/spreadsheets/d/<id>/``) - or
 spreadsheet_url       the full URL. One of the two is required.
 worksheet             Tab name; ``{date}`` (YYYY-MM-DD) and ``{client}`` are
                       replaced (default ``"{date}"``). Created if missing.
+                      A name with ``{date}`` is one tab per delivery and, like
+                      the delivery folder, never overwritten: when that tab
+                      already holds data (a second delivery the same day, or
+                      another client sharing the spreadsheet) the rows go to
+                      ``<name>-2``, ``-3``, ... A fixed name (no ``{date}``)
+                      is a rolling tab that each delivery replaces.
 service_account_file  Path to the service-account JSON key; default: env
                       ``GOOGLE_APPLICATION_CREDENTIALS``.
 service_account_json  Alternatively the key itself (JSON text or mapping), or
                       env ``GOOGLE_SERVICE_ACCOUNT_JSON``.
 
 Values are sent with ``value_input_option=RAW``, so Sheets never evaluates a
-cell as a formula and numbers stay numbers.
+cell as a formula and numbers stay numbers. The new contents are written in
+one request (padded with blanks over the old contents) instead of clearing
+first, so a failed write leaves the tab as it was, never empty.
 """
 from __future__ import annotations
 
@@ -108,6 +116,7 @@ MAX_COL_WIDTH = 60
 MAX_LINK_WIDTH = 45
 XLSX_MAX_CELL = 32767          # Excel's hard limit per cell
 SHEET_TITLE_MAX = 100          # Google Sheets worksheet title limit
+MAX_SHEET_SUFFIX = 50          # "<date>-2" ... "<date>-50" before giving up
 DEFAULT_WORKSHEET = "{date}"
 JSON_ENV = "GOOGLE_SERVICE_ACCOUNT_JSON"
 FILE_ENV = "GOOGLE_APPLICATION_CREDENTIALS"
@@ -164,12 +173,17 @@ def link_target(value: Any) -> str:
     """The http(s) URL to link to for a cell value, or '' when it is not a safe web link.
 
     ``https://...`` / ``http://...`` are used as-is; a bare domain like ``acme.com`` or
-    ``linkedin.com/in/jane`` gets ``https://``. Anything else (``javascript:``, text) -> ''.
+    ``linkedin.com/in/jane`` gets ``https://``. Anything else (``javascript:``, text, a
+    malformed URL such as ``https://acme.com]``) -> ''. Never raises.
     """
     text = _text(value).strip()
     if not text or any(ch.isspace() for ch in text):
         return ""
-    parsed = urlparse(text)
+    try:
+        parsed = urlparse(text)
+        parsed.hostname                  # noqa: B018 - validates a bracketed host (raises ValueError)
+    except ValueError:                   # e.g. "https://acme.com]" / "https://[acme.com]"
+        return ""
     if parsed.scheme.lower() in ("http", "https"):
         return text if parsed.netloc else ""
     if not parsed.scheme and _BARE_DOMAIN_RE.match(text):
@@ -716,11 +730,30 @@ def normalize_formats(formats: Union[str, Iterable[Any], None]) -> List[str]:
 
 def write_all(pkg: DeliveryPackage, folder: Union[str, Path], formats: Union[str, Iterable[Any]],
               *, preview: bool = False) -> Dict[str, Path]:
-    """Write every requested format into ``folder``; returns ``{format: path}`` in request order."""
+    """Write every requested format into ``folder``; returns ``{format: path}`` in request order.
+
+    All or nothing: each file is written under a temporary name and only renamed to its
+    real name once every format succeeded, so a failure never leaves a partial or
+    complete-looking (but unrecorded) client file behind.
+    """
     names = normalize_formats(formats)
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    return {name: WRITERS[name](pkg, folder / file_name(pkg, name, preview)) for name in names}
+    finals = {name: folder / file_name(pkg, name, preview) for name in names}
+    temps = {name: path.with_name(f".partial-{path.name}") for name, path in finals.items()}
+    try:
+        for name in names:
+            WRITERS[name](pkg, temps[name])
+        for name in names:
+            temps[name].replace(finals[name])
+    except BaseException:
+        for tmp in temps.values():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+    return finals
 
 
 # --- Google Sheets --------------------------------------------------------------------
@@ -808,9 +841,61 @@ def _sheet_value(value: Any) -> Any:
     return _text(value)
 
 
-def push_google_sheet(pkg: DeliveryPackage, cfg: Optional[Mapping[str, Any]], ctx: Any) -> str:
-    """Replace one worksheet's contents with the delivery rows; returns the sheet URL.
+def _numbered_title(title: str, n: int) -> str:
+    """``title-n`` within the worksheet title limit."""
+    suffix = f"-{n}"
+    return title[:SHEET_TITLE_MAX - len(suffix)] + suffix
 
+
+def _current_values(ws: Any) -> Optional[List[List[Any]]]:
+    """The worksheet's current values ([] when empty); None when the client cannot read them."""
+    getter = getattr(ws, "get_all_values", None)
+    if not callable(getter):
+        return None
+    return [list(r) if isinstance(r, (list, tuple)) else [r] for r in (getter() or [])]
+
+
+def _has_data(values: Optional[List[List[Any]]]) -> bool:
+    return any(_text(v).strip() for row in values or [] for v in row)
+
+
+def _open_tab(book: Any, gspread: Any, title: str, n_rows: int, n_cols: int) -> Tuple[Any, Optional[List[List[Any]]]]:
+    """(worksheet, its current values) - the worksheet is created (empty) when missing."""
+    try:
+        ws = book.worksheet(title)
+    except Exception as e:  # noqa: BLE001
+        if not _is_exc(e, gspread, "WorksheetNotFound"):
+            raise
+        return book.add_worksheet(title=title, rows=max(n_rows, 100), cols=max(n_cols, 26)), []
+    return ws, _current_values(ws)
+
+
+def _write_tab(ws: Any, values: List[List[Any]], n_cols: int, current: Optional[List[List[Any]]]) -> None:
+    """Replace the worksheet's contents with ``values`` in ONE write, padded with blanks over the
+    old contents, so a failed write leaves the old contents as they were (never an empty tab)."""
+    if current is None:              # a client that cannot read the tab: clear, then write
+        ws.clear()
+        block = values
+    else:
+        width = max([n_cols] + [len(r) for r in current])
+        height = max(len(values), len(current))
+        block = [list(r) + [""] * (width - len(r)) for r in values]
+        block += [[""] * width for _ in range(height - len(values))]
+    width = max((len(r) for r in block), default=n_cols)
+    try:
+        cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)
+    except (AttributeError, TypeError, ValueError):
+        cur_rows, cur_cols = len(block), width
+    if cur_rows < len(block) or cur_cols < width:
+        ws.resize(rows=max(cur_rows, len(block)), cols=max(cur_cols, width))
+    ws.update(range_name="A1", values=block, value_input_option="RAW")
+
+
+def push_google_sheet(pkg: DeliveryPackage, cfg: Optional[Mapping[str, Any]], ctx: Any) -> str:
+    """Write the delivery rows to one worksheet; returns the sheet URL (pointing at that tab).
+
+    A ``{date}`` tab that already holds an earlier delivery is left alone and the rows go
+    to ``<tab>-2`` (``-3``, ...); a fixed tab name is replaced (see the module docstring).
     Returns ``""`` without touching Google in a dry run. Raises ``ValueError`` for missing
     config, ``RuntimeError`` (with an install hint) when gspread is missing and
     ``SheetPushError`` when the sheet cannot be opened or written.
@@ -836,21 +921,25 @@ def push_google_sheet(pkg: DeliveryPackage, cfg: Optional[Mapping[str, Any]], ct
 
     header = [h for _, h in pkg.columns]
     values = [header] + [[_sheet_value(v) for v in row] for row in pkg.public_rows()]
+    # A "{date}" tab holds one delivery: like the delivery folder, it is never overwritten -
+    # a second delivery that day (or another client sharing the sheet) goes to "<date>-2", ...
+    per_delivery = "{date}" in (_text(cfg.get("worksheet")).strip() or DEFAULT_WORKSHEET)
+    wanted = title
     try:
-        try:
-            ws = book.worksheet(title)
-        except Exception as e:  # noqa: BLE001
-            if not _is_exc(e, gspread, "WorksheetNotFound"):
-                raise
-            ws = book.add_worksheet(title=title, rows=max(len(values), 100), cols=max(len(header), 26))
-        ws.clear()
-        try:
-            cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)
-        except (AttributeError, TypeError, ValueError):
-            cur_rows, cur_cols = len(values), len(header)
-        if cur_rows < len(values) or cur_cols < len(header):
-            ws.resize(rows=max(cur_rows, len(values)), cols=max(cur_cols, len(header)))
-        ws.update(range_name="A1", values=values, value_input_option="RAW")
+        ws, current = _open_tab(book, gspread, title, len(values), len(header))
+        n = 1
+        while per_delivery and _has_data(current):
+            n += 1
+            if n > MAX_SHEET_SUFFIX:
+                raise SheetPushError(
+                    f"Google Sheets push: worksheet '{wanted}' and {MAX_SHEET_SUFFIX - 1} numbered copies already "
+                    "hold earlier deliveries - tidy up the spreadsheet (nothing was overwritten)")
+            title = _numbered_title(wanted, n)
+            ws, current = _open_tab(book, gspread, title, len(values), len(header))
+        if title != wanted and log is not None:
+            log.info("google sheet: worksheet '%s' already holds an earlier delivery - writing to '%s' so "
+                     "nothing is overwritten", wanted, title)
+        _write_tab(ws, values, len(header), current)
     except SheetPushError:
         raise
     except Exception as e:  # noqa: BLE001

@@ -459,6 +459,45 @@ def test_link_target():
         assert link_target(bad) == "", bad
 
 
+@pytest.mark.parametrize("bad", ["https://acme.com]", "https://jobs.acme.com]/123", "https://[acme.com]",
+                                 "http://[::1", "https://acme.com[/x", "acme.com]"])
+def test_link_target_never_raises_on_a_malformed_url(bad):
+    # urlparse raises ValueError on an unbalanced / non-IP bracketed host; such a value is shown as text
+    assert link_target(bad) == ""
+
+
+def test_malformed_urls_do_not_crash_any_format(tmp_path):
+    """A stray bracket in a website / job URL / logo URL (sources let these through) must not stop the
+    delivery after the pipeline has run: the value is written as plain text without a link."""
+    leads = [make_lead(website="https://acme.com]"),
+             make_lead("Beta LLC", "beta.example", url="https://jobs.beta.example]/123"),
+             make_lead("Gamma Inc", "gamma.example", website="https://[gamma.example]")]
+    pkg = make_pkg(leads, brand={"logo_url": "https://[logo.example]/logo.png"})
+    out = write_all(pkg, tmp_path, ["csv", "xlsx", "html"])
+    assert set(out) == {"csv", "xlsx", "html"} and all(p.is_file() for p in out.values())
+    ws = openpyxl.load_workbook(out["xlsx"])["Leads"]
+    header = [c.value for c in ws[1]]
+    web, job = header.index("Website") + 1, header.index("Job link") + 1
+    assert ws.cell(row=2, column=web).value == "https://acme.com]" and ws.cell(row=2, column=web).hyperlink is None
+    assert ws.cell(row=3, column=job).value == "https://jobs.beta.example]/123"
+    assert ws.cell(row=3, column=job).hyperlink is None
+    page = out["html"].read_text(encoding="utf-8")
+    assert "<img" not in page and 'href="https://acme.com]"' not in page and "Acme Corp" in page
+
+
+def test_write_all_leaves_no_partial_files_when_a_format_fails(tmp_path, monkeypatch):
+    """A writer failing half-way must not leave a complete-looking (but never recorded) client file."""
+    def boom(pkg, path):
+        Path(path).write_text("half a workbook", encoding="utf-8")
+        raise RuntimeError("disk full")
+
+    monkeypatch.setitem(formats.WRITERS, "xlsx", boom)
+    folder = tmp_path / "2026-09-24"
+    with pytest.raises(RuntimeError, match="disk full"):
+        write_all(make_pkg([make_lead()]), folder, ["csv", "xlsx", "html"])
+    assert list(folder.iterdir()) == []
+
+
 def test_brand_settings_merges_defaults():
     pkg = make_pkg([], brand={"brand_name": "X", "sender_name": " Sam ", "extra": 5})
     b = brand_settings(pkg)
@@ -520,10 +559,33 @@ class FakeWorksheet:
         self.row_count, self.col_count = rows or self.row_count, cols or self.col_count
 
     def update(self, range_name=None, values=None, value_input_option=None, **kw):
+        """Like the Sheets API: writes the block at A1 over the cells it covers, keeps the rest."""
         self.calls.append(("update", range_name, value_input_option))
         if len(values) > self.row_count or max(len(r) for r in values) > self.col_count:
             raise AssertionError("exceeds grid limits")
-        self.values = [list(r) for r in values]
+        assert range_name == "A1"
+        grid = [list(r) for r in self.values]
+        for i, row in enumerate(values):
+            if i >= len(grid):
+                grid.append([])
+            line = grid[i]
+            line.extend([""] * (len(row) - len(line)))
+            line[:len(row)] = list(row)
+        self.values = grid
+
+    def get_all_values(self):
+        self.calls.append(("read",))
+        return [list(r) for r in self.values]
+
+    def shown(self):
+        """What a person sees: the values without trailing empty cells / rows."""
+        rows = [list(r) for r in self.values]
+        for r in rows:
+            while r and r[-1] in ("", None):
+                r.pop()
+        while rows and not rows[-1]:
+            rows.pop()
+        return rows
 
     def freeze(self, rows=None, cols=None):
         self.calls.append(("freeze", rows))
@@ -598,17 +660,19 @@ def sheets(monkeypatch, tmp_path):
 
 
 def test_push_google_sheet_replaces_worksheet(make_ctx, sheets):
+    """A fixed tab name (no {date}) is a rolling tab: each delivery replaces it."""
     ctx = make_ctx(mode="delivery")
-    ws = sheets.book.sheets["2026-09-24"]
+    ws = sheets.book.sheets["Leads"] = FakeWorksheet("Leads", rows=50, cols=10, ws_id=777)
     ws.values = [["old"], ["junk"]]
     pkg = make_pkg(many_leads(60), include_opening=True)
-    url = push_google_sheet(pkg, {"spreadsheet_id": "1AbCdEfG", "worksheet": "{date}",
+    url = push_google_sheet(pkg, {"spreadsheet_id": "1AbCdEfG", "worksheet": "Leads",
                                   "service_account_file": sheets.key_file}, ctx)
     assert url == "https://docs.google.com/spreadsheets/d/1AbCdEfG#gid=777"
     assert sheets.mod.auth_calls == [("file", sheets.key_file)]
     assert sheets.client.opened == [("key", "1AbCdEfG")]
-    # 61 rows x 19 columns > the 50 x 10 grid: grown before writing, RAW values
-    assert [c[0] for c in ws.calls] == ["clear", "resize", "update", "freeze"]
+    assert sheets.book.added == []
+    # 61 rows x 19 columns > the 50 x 10 grid: grown before writing, RAW values; never cleared first
+    assert [c[0] for c in ws.calls] == ["read", "resize", "update", "freeze"]
     assert ws.calls[1] == ("resize", 61, 19) and ws.calls[2] == ("update", "A1", "RAW")
     header = [h for _, h in pkg.columns]
     assert ws.values[0] == header
@@ -638,6 +702,60 @@ def test_push_google_sheet_default_worksheet_and_json_credentials(make_ctx, shee
     push_google_sheet(make_pkg([]), {"spreadsheet_id": "1AbCdEfG"}, ctx)
     assert sheets.mod.auth_calls == [("dict", {"type": "service_account"})]
     assert sheets.book.sheets["2026-09-24"].values == [[h for _, h in make_pkg([]).columns]]
+
+
+def test_push_google_sheet_replacing_a_bigger_tab_blanks_the_leftover_cells(make_ctx, sheets):
+    ctx = make_ctx(mode="delivery", env={"GOOGLE_SERVICE_ACCOUNT_JSON": '{"type": "service_account"}'})
+    ws = sheets.book.sheets["Leads"] = FakeWorksheet("Leads", rows=100, cols=30)
+    ws.values = [[f"old {r}-{c}" for c in range(25)] for r in range(40)]     # last week: 40 rows x 25 cols
+    pkg = make_pkg([make_lead()])
+    push_google_sheet(pkg, {"spreadsheet_id": "1AbCdEfG", "worksheet": "Leads"}, ctx)
+    assert ws.shown() == [[h for _, h in pkg.columns]] + pkg.public_rows()
+    assert "clear" not in [c[0] for c in ws.calls]
+
+
+def test_push_google_sheet_failed_write_keeps_the_old_contents(make_ctx, sheets):
+    """The new values are written in one call before anything is removed: when that call fails,
+    the client's tab still holds what it held (it is never left empty)."""
+    ctx = make_ctx(mode="delivery", env={"GOOGLE_SERVICE_ACCOUNT_JSON": '{"type": "service_account"}'})
+    ws = sheets.book.sheets["Leads"] = FakeWorksheet("Leads", rows=50, cols=30)
+    before = [["Company"], ["Lead delivered last week"]]
+    ws.values = [list(r) for r in before]
+
+    def quota(**kw):
+        raise RuntimeError("quota exceeded")
+
+    ws.update = quota
+    with pytest.raises(SheetPushError, match="quota exceeded"):
+        push_google_sheet(make_pkg([make_lead()]), {"spreadsheet_id": "1AbCdEfG", "worksheet": "Leads"}, ctx)
+    assert ws.values == before
+
+
+def test_push_google_sheet_never_overwrites_an_earlier_delivery_tab(make_ctx, sheets):
+    """A {date} tab is one delivery. A second delivery on the same day (its files go to <folder>-2)
+    or another client using the same spreadsheet must not wipe it: the rows go to '<date>-2'."""
+    ctx = make_ctx(mode="delivery", env={"GOOGLE_SERVICE_ACCOUNT_JSON": '{"type": "service_account"}'})
+    cfg = {"spreadsheet_id": "1AbCdEfG"}                        # default worksheet: "{date}"
+    first = make_pkg([make_lead("First Co", "first.example"), make_lead("Second Co", "second.example")])
+    push_google_sheet(first, cfg, ctx)
+    tab = sheets.book.sheets["2026-09-24"]
+    assert tab.shown() == [[h for _, h in first.columns]] + first.public_rows()
+
+    again = make_pkg([make_lead("Third Co", "third.example")])
+    push_google_sheet(again, cfg, ctx)
+    assert tab.shown() == [[h for _, h in first.columns]] + first.public_rows()     # untouched
+    assert "update" not in [c[0] for c in tab.calls[-2:]]
+    assert sheets.book.sheets["2026-09-24-2"].shown() == [[h for _, h in again.columns]] + again.public_rows()
+
+    third = make_pkg([make_lead("Fourth Co", "fourth.example")], client="other")
+    push_google_sheet(third, cfg, ctx)
+    assert sheets.book.sheets["2026-09-24-3"].shown()[1][0] == "Fourth Co"
+    assert [t for t, _, _ in sheets.book.added] == ["2026-09-24-2", "2026-09-24-3"]
+    # an existing but empty tab for the date is simply used
+    assert formats.worksheet_title("{client} {date}", third) == "other 2026-09-24"
+    sheets.book.sheets["other 2026-09-24"] = empty = FakeWorksheet("other 2026-09-24")
+    push_google_sheet(third, {"spreadsheet_id": "1AbCdEfG", "worksheet": "{client} {date}"}, ctx)
+    assert empty.shown()[1][0] == "Fourth Co" and "other 2026-09-24-2" not in sheets.book.sheets
 
 
 def test_push_google_sheet_errors(make_ctx, sheets, tmp_path):

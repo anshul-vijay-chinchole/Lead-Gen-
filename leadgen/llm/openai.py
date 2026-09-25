@@ -80,6 +80,10 @@ reasoning_effort       Optional ``reasoning_effort`` for OpenAI reasoning models
                        unless set.
 extra_body             Optional dict merged into the request body (provider
                        specific options, e.g. OpenRouter ``provider`` routing).
+                       It cannot replace ``model``, ``messages`` or the
+                       output-token limit (``max_tokens`` /
+                       ``max_completion_tokens``): the cost estimate and the AI
+                       cost caps rely on them. Such keys are ignored (warning).
 extra_headers          Optional dict of extra request headers (e.g. OpenRouter's
                        ``HTTP-Referer`` / ``X-Title``).
 timeout                HTTP timeout in seconds (default 120).
@@ -181,6 +185,25 @@ def clean_headers(extra: Any) -> Dict[str, str]:
     if not isinstance(extra, dict):
         return {}
     return {str(k).strip(): str(v).strip() for k, v in extra.items()}
+
+
+def merge_extra_body(client: LLMClient, body: Dict[str, Any], protected: Tuple[str, ...]) -> None:
+    """Merge the ``extra_body`` config into ``body``, except the ``protected`` keys.
+
+    ``extra_body`` may add provider options but never replace the model (every call
+    is priced by ``client.model`` for the run's cost estimate and the AI cost caps),
+    the output-token limit the caller passed (the worst case those caps check
+    against) or the prompt. Such keys are ignored with one warning per client.
+    """
+    extra = client.config.get("extra_body")
+    if not isinstance(extra, dict):
+        return
+    dropped = sorted(str(k) for k in extra if k in protected)
+    if dropped and not getattr(client, "_warned_extra_body", False):
+        client.log.warning("%s: extra_body may not replace %s - ignored (set writer.model / the call's "
+                           "max_tokens instead)", client.type_name or client.name, ", ".join(dropped))
+        setattr(client, "_warned_extra_body", True)
+    body.update({k: v for k, v in extra.items() if k not in protected})
 
 
 def token_count(value: Any) -> Optional[int]:
@@ -306,18 +329,22 @@ class OpenAIClient(LLMClient):
             raise LLMConfigError(f"{self.kind}: base_url must start with http:// or https:// "
                                  f"(got {self.base_url!r})")
 
-    def api_key(self) -> str:
-        """Resolve the API key (lazily; see module docstring). '' = send no auth header."""
+    def api_key(self, host: Optional[str] = None) -> str:
+        """Resolve the API key (lazily; see module docstring). '' = send no auth header.
+
+        ``host`` is the host the key will be sent to (default: the ``base_url`` host);
+        ``leadgen doctor`` passes its ``doctor_url`` host so the same rule applies there."""
         explicit = bool(self.config.get("api_key") or self.config.get("api_key_env"))
         optional = self.compatible and self.config.get("api_key_required") is False
-        if not explicit and self.host not in OPENAI_HOSTS:
+        target = (self.host if host is None else str(host or "")).lower()
+        if not explicit and target not in OPENAI_HOSTS:
             # Never send OPENAI_API_KEY to a third-party host implicitly - neither for
             # openai_compatible nor for ``type: openai`` with a custom base_url.
             if optional:
                 return ""
             raise MissingCredentialError(
                 f"{self.kind}: missing credential (set writer.api_key_env to the env var "
-                f"holding the API key for {self.host or 'the endpoint'}; OPENAI_API_KEY is only "
+                f"holding the API key for {target or 'the endpoint'}; OPENAI_API_KEY is only "
                 f"sent to api.openai.com unless named explicitly)")
         key = self.secret(required=False) if optional else self.secret()
         return clean_api_key(key, self.kind)
@@ -353,9 +380,7 @@ class OpenAIClient(LLMClient):
             body["temperature"] = temp
         if self.config.get("reasoning_effort"):
             body["reasoning_effort"] = str(self.config["reasoning_effort"])
-        extra_body = self.config.get("extra_body")
-        if isinstance(extra_body, dict):
-            body.update(extra_body)
+        merge_extra_body(self, body, ("model", "messages", token_key, "max_tokens", "max_completion_tokens"))
         return self.endpoint, headers, body
 
     def complete(self, system: str, user: str, *, json_mode: bool = False,
@@ -396,5 +421,5 @@ class OpenAIClient(LLMClient):
 
 
 __all__ = ["OpenAIClient", "LLMConfigError", "LLMTruncatedError", "clean_api_key", "clean_headers",
-           "effective_temperature", "openai_usage", "post_json", "record_usage", "timeout_from",
-           "token_count"]
+           "effective_temperature", "merge_extra_body", "openai_usage", "post_json", "record_usage",
+           "timeout_from", "token_count"]

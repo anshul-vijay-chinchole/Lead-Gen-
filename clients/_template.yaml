@@ -74,7 +74,9 @@ exclusions:
 # How many leads per delivery. The file holds at most this many rows.
 leads_per_week: 25
 
-# Only jobs posted in the last N days.
+# Only jobs posted in the last N days. (The playbook's sources fetch their own
+# date window - Adzuna 30 days, TheirStack 7 in recruitment-delivery.yaml - so
+# for more than that, widen it there too.)
 freshness_days: 7
 
 # Jobs without a posting date: true = keep them, false = leave them out.

@@ -248,7 +248,10 @@ def test_recruitment_delivery_sources_are_filled_in_correctly():
     pb = load_playbook(str(RECRUITMENT_DELIVERY), env={})
     by_type = {s["type"]: s for s in pb.sources}
     assert by_type["adzuna"]["countries"] == ["us"] and by_type["adzuna"]["queries"]
-    assert by_type["adzuna"]["max_days_old"] == pb.signals["max_age_days"] == 7
+    # Adzuna fetches newest first over a window wide enough for any client's freshness_days
+    # (up to 30); signals.max_age_days (7, or the client's freshness_days) decides what counts
+    assert pb.signals["max_age_days"] == 7 and by_type["adzuna"]["max_days_old"] == 30
+    assert by_type["theirstack"]["max_age_days"] >= pb.signals["max_age_days"]
     assert by_type["csv"]["path"] == "data/imports/jobs.csv"
     for ats in ("greenhouse", "lever", "ashby"):
         entries = by_type[ats]["companies"]
@@ -326,13 +329,13 @@ def test_recruitment_delivery_free_run_delivers_company_only_leads(at_repo_root,
     ctx = context_for(pb, store, http, env=env)
     res = Pipeline(ctx, out_dir=tmp_path).run()
     assert res.errors == []
-    # request shape: one search per query, US only, a 7-day window, credentials as query params
+    # request shape: one search per query, US only, a 30-day window (newest first), credentials as query params
     assert len(http.calls) == 3
     assert {c["params"]["what"] for c in http.calls} == {"accountant", "financial controller", "finance manager"}
     for call in http.calls:
         assert call["url"] == "https://api.adzuna.com/v1/api/jobs/us/search/1"
         p = call["params"]
-        assert (p["app_id"], p["app_key"], p["max_days_old"]) == ("app-id-1", "app-key-2", 7)
+        assert (p["app_id"], p["app_key"], p["max_days_old"]) == ("app-id-1", "app-key-2", 30)
         assert p["what_exclude"] == "intern internship" and p["sort_by"] == "date"
     assert ctx.usage.paid_lookups == 0               # Adzuna is free
     by_name = {ld.company.name: ld for ld in res.leads}
@@ -342,6 +345,33 @@ def test_recruitment_delivery_free_run_delivers_company_only_leads(at_repo_root,
     assert [s.title for s in by_name["Metro Clinics"].company.signals] == ["Staff Accountant"]   # intern dropped
     rejected = {r["company"]: r["reason"] for r in res.rejected}
     assert "Lone Star Staffing Agency" in rejected
+
+
+@pytest.mark.parametrize("freshness, expected", [
+    (7, {"Bayside Freight Inc"}),                         # the 12-day-old job is outside a 7-day window
+    (14, {"Bayside Freight Inc", "Metro Clinics"}),       # ...inside a 14-day one: the source must fetch it
+])
+def test_recruitment_delivery_client_freshness_reaches_adzuna(at_repo_root, tmp_path, store, freshness, expected):
+    """A client's freshness_days is what counts; Adzuna's own window (max_days_old) is wide enough
+    for it, so a client with freshness_days: 14 really gets the 8-14-day-old jobs its file promises."""
+    client_file = tmp_path / "wide.yaml"
+    client_file.write_text(f"display_name: Wide Window Staffing\nplaybook: {RECRUITMENT_DELIVERY}\n"
+                           f"roles: [accountant]\nfreshness_days: {freshness}\n", encoding="utf-8")
+    client = load_client(str(client_file))
+    env = {"ADZUNA_APP_ID": "app-id-1", "ADZUNA_APP_KEY": "app-key-2"}
+    pb = client_playbook(client, env=env)
+    assert pb.signals["max_age_days"] == freshness
+    assert all(s["max_days_old"] >= freshness for s in pb.sources if s["type"] == "adzuna")
+    http = FakeHttp()
+    page = {"count": 2, "results": [
+        _adzuna_job("6001", "Senior Accountant", "Bayside Freight Inc", "2026-09-22T10:00:00Z", "Houston, TX"),
+        _adzuna_job("6002", "Staff Accountant", "Metro Clinics", "2026-09-12T08:00:00Z", "Dallas, TX"),
+    ]}
+    http.add("GET", re.compile(r"/jobs/us/search/1$"), json=page)
+    res = Pipeline(context_for(pb, store, http, env=env), out_dir=tmp_path / "out").run()
+    assert res.errors == []
+    assert {c["params"]["max_days_old"] for c in http.calls} == {30}
+    assert {ld.company.name for ld in res.leads} == expected
 
 
 @pytest.mark.parametrize("path", DELIVERY_PLAYBOOKS, ids=lambda p: p.name)

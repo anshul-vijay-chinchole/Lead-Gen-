@@ -105,7 +105,7 @@ client's niche is running dry (many "already delivered to this client" in the QA
 | **Volume** | One free source (Adzuna) may be thin for narrow niches or small regions. Add company job-board watchlists, your own CSV lists, or TheirStack. The QA summary warns when volume is below target. |
 | **Sources don't follow the client's roles** | The source search words (Adzuna `queries`) are set in the playbook, not taken from the client's `roles`. A client in a different niche needs its own copy of the playbook. Worth automating later. |
 | **Ledger safety** | `data/*.db` holds what each client received. Back it up: losing it means re-delivering old leads. |
-| **Client files in git** | `deliveries/` holds client data and is not in `.gitignore` yet: add it before pushing the repo anywhere. |
+| **Client files in git** | `deliveries/` (client data), `output/`, `.env` (keys) and the databases (`*.db`) are in `.gitignore`, so they are never committed. Keep them private: share a delivery only with its client, and back up `data/*.db` (see Ledger safety). |
 | **Not built** | Emailing the report automatically (on purpose: review first), a client portal / dashboard, billing, CRM sync. |
 
 ## 7. Setup checklist

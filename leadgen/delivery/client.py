@@ -87,6 +87,7 @@ from __future__ import annotations
 import collections.abc
 import copy
 import difflib
+import math
 import os
 import re
 import string
@@ -435,10 +436,17 @@ def _whole(value: Any, label: str, default: Optional[int], minimum: int, errors:
 def _money(value: Any, label: str, default: float, errors: List[str]) -> float:
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    amount: Optional[float] = None
+    if not isinstance(value, bool) and isinstance(value, (int, float)):
+        try:
+            amount = float(value)
+        except OverflowError:   # an integer too big for a float
+            amount = None
+    # NaN / infinity (YAML .nan / .inf) would switch the cost cap off without saying so
+    if amount is None or not math.isfinite(amount) or amount < 0:
         errors.append(f"{label} must be an amount in US dollars >= 0, e.g. 0.50 (got {value!r})")
         return default
-    return float(value)
+    return amount
 
 
 def _group(value: Any, label: str, allowed: Optional[Sequence[str]], errors: List[str]) -> Dict[str, Any]:
@@ -646,6 +654,20 @@ def list_clients(clients_dir: str = DEFAULT_CLIENTS_DIR) -> List[str]:
     return sorted(names)
 
 
+def _as_on_disk(path: Path) -> Path:
+    """``path`` with its file name spelled as it is stored. On case-insensitive disks
+    (macOS, Windows) ``clients/Acme.yaml`` opens ``clients/acme.yaml``; the client name
+    (the ledger's key for its history and do-not-list) must come from the real file."""
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return path
+    if path.name in names:
+        return path
+    same = [n for n in names if n.casefold() == path.name.casefold()]
+    return path.with_name(same[0]) if len(same) == 1 else path
+
+
 def _locate(name_or_path: str, clients_dir: str) -> Path:
     raw = str(name_or_path or "").strip()
     if not raw:
@@ -664,7 +686,7 @@ def _locate(name_or_path: str, clients_dir: str) -> Path:
         candidates += [folder / f"{raw}.yaml", folder / f"{raw}.yml", folder / raw]
     for c in candidates:
         if c.is_file():
-            return c
+            return _as_on_disk(c)
     known = list_clients(clients_dir)
     stem = p.stem if is_yaml else p.name
     msg = f"client '{raw}' not found: there is no {candidates[0]}."
@@ -682,7 +704,9 @@ def _locate(name_or_path: str, clients_dir: str) -> Path:
 
 def load_client(name_or_path: str, clients_dir: str = DEFAULT_CLIENTS_DIR) -> Client:
     """Load and validate a client: ``acme``, ``acme.yaml`` (both looked up in
-    ``clients_dir``) or a path to the file. Raises ``ClientError``."""
+    ``clients_dir``) or a path to the file. The client's name is the file's stem as
+    stored on disk (``Acme`` on a case-insensitive disk still loads client ``acme``).
+    Raises ``ClientError``."""
     path = _locate(name_or_path, clients_dir)
     try:
         text = path.read_text(encoding="utf-8-sig")

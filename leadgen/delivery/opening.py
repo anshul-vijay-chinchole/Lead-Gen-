@@ -41,8 +41,20 @@ enabled       Whether the column exists at all - checked by the caller
               (``run.py``); this module fills the lines when it is called.
 ai            true = AI lines (default false = template lines).
 max_cost_usd  Per-run cap on the estimated AI spend in USD (default 0.50;
-              0 = no AI spend at all, i.e. template lines only).
-max_tokens    Optional output budget per AI call (default 400).
+              0 = no AI spend at all, i.e. template lines only). A value
+              that is not a finite number (NaN, infinity, text) never means
+              "no cap": the default cap is used and a QA note says so.
+
+The output budget per AI call is 400 tokens (``DEFAULT_MAX_TOKENS``). It is not
+a client-file setting (client files reject unknown keys); only code that
+builds ``client`` itself (a mapping or object) can set ``opening_line.max_tokens``.
+
+Where the role is: the row's Location column is company-level (the HQ for
+TheirStack, every job location joined for ATS boards), so "hiring ... in
+<place>" uses the job's own location - ``row["_job_location"]``, which
+``add_opening_lines`` fills from the lead's top signal - and leaves the place
+out when the job's location is unknown. It never states the HQ as the job's
+location.
 
 Playbook keys read: ``writer.max_llm_failures`` (and, through ``ctx.llm``, the
 ``writer`` provider / model settings); ``usage.llm_price_per_mtok`` through
@@ -57,6 +69,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from ..context import MissingCredentialError
+from ..models import SignalType
 from ..usage import BudgetExceeded, UsageMeter
 
 DEFAULT_MAX_COST_USD = 0.50
@@ -68,6 +81,9 @@ MAX_TITLE_CHARS = 80
 MAX_LOCATION_CHARS = 60
 MAX_COMPANY_CHARS = 80
 MAX_EXCERPT_CHARS = 400
+
+#: Internal row key: where the job in the line is (set by ``add_opening_lines``).
+JOB_LOCATION_KEY = "_job_location"
 
 REMOTE_WORDS = ("remote", "anywhere", "worldwide", "work from home", "wfh")
 
@@ -183,10 +199,38 @@ def _finish(line: str) -> str:
     return line if line.endswith((".", "!", "?")) else line + "."
 
 
+def _top_signal(lead: Any) -> Any:
+    """The signal the row describes (same pick as ``rows.build_row``: first job posting, else first)."""
+    sigs = list(getattr(getattr(lead, "company", None), "signals", None) or [])
+    jobs = [s for s in sigs if getattr(s, "type", "") == SignalType.JOB_POSTING]
+    pick = jobs or sigs
+    return pick[0] if pick else None
+
+
+def _role_location(row: Mapping[str, Any], lead: Any = None) -> str:
+    """Where the role the line talks about is.
+
+    The row's "Location" column is company-level (the HQ for TheirStack, every job location
+    joined for ATS boards), so a hiring line uses the job's own location: ``row["_job_location"]``
+    (set by ``add_opening_lines``) > the lead's top signal > the row's Location (a plain row
+    with neither, e.g. from an old caller). A known lead whose job has no location -> ''.
+    """
+    if JOB_LOCATION_KEY in row:
+        return _clean(row.get(JOB_LOCATION_KEY), MAX_LOCATION_CHARS)
+    if lead is not None and getattr(lead, "company", None) is not None:
+        top = _top_signal(lead)
+        return _clean(getattr(top, "location", "") if top is not None else "", MAX_LOCATION_CHARS)
+    return _clean(row.get("location"), MAX_LOCATION_CHARS)
+
+
 # --- template ---------------------------------------------------------------------------
 
 def template_line(row: Mapping[str, Any]) -> str:
-    """A free, factual opening line built only from the row (no AI)."""
+    """A free, factual opening line built only from the row (no AI).
+
+    "hiring ... in <place>" uses the job's location (``row["_job_location"]``, see
+    ``_role_location``), never the company's HQ; other lines use the row's Location.
+    """
     company = _clean(row.get("company"), MAX_COMPANY_CHARS)
     signal = _clean(row.get("signal_type"))
     location = _clean(row.get("location"), MAX_LOCATION_CHARS)
@@ -195,6 +239,7 @@ def template_line(row: Mapping[str, Any]) -> str:
     tail = f" ({when})" if when else ""
 
     if signal.lower() == "hiring":
+        location = _role_location(row)
         remote = bool(location) and _is_remote(location)
         subject = f"Saw {company} is hiring" if company else "Saw you are hiring"
         adj = "remote " if remote else ""
@@ -251,7 +296,9 @@ def build_prompt(row: Mapping[str, Any], lead: Any = None) -> Tuple[str, str]:
     else:
         facts.append(("Signal", signal))
         facts.append(("Details", "; ".join(titles)))
-    facts.append(("Location", _clean(row.get("location"), MAX_LOCATION_CHARS)))
+    # hiring: where the job is (never the company's HQ); other signals: where the company is
+    facts.append(("Location", _role_location(row, lead) if signal.lower() == "hiring"
+                  else _clean(row.get("location"), MAX_LOCATION_CHARS)))
     when = _when(row)
     facts.append(("Posted", when))
     facts.append(("Industry", _clean(row.get("industry"))))
@@ -377,11 +424,18 @@ def _setting(client: Any, key: str, default: Any) -> Any:
     return default if value is None else value
 
 
-def _as_float(value: Any, default: float) -> float:
+def _finite(value: Any) -> Optional[float]:
+    """``value`` as a finite float, else None (NaN / infinity would switch the cost cap off)."""
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _as_float(value: Any, default: float) -> float:
+    out = _finite(value)
+    return default if out is None else out
 
 
 def _as_bool(value: Any) -> bool:
@@ -464,16 +518,29 @@ def add_opening_lines(rows: Sequence[MutableMapping[str, Any]], leads_by_id: Opt
                       ctx: Any, client: Any) -> OpeningStats:
     """Fill ``row["opening_line"]`` for every row (template, or AI within the cost cap). Never raises.
 
-    ``leads_by_id`` maps ``row["_lead_id"]`` to its ``Lead`` (optional; adds the job-ad
-    excerpt to the AI prompt). Each row also gets ``row["_opening_source"]`` = "ai" or
-    "template" (internal; never written to client files).
+    ``leads_by_id`` maps ``row["_lead_id"]`` to its ``Lead`` (optional; gives the job's own
+    location and adds the job-ad excerpt to the AI prompt). Each row also gets
+    ``row["_opening_source"]`` = "ai" or "template" and, when its lead is known,
+    ``row["_job_location"]`` (both internal; never written to client files).
     """
     stats = OpeningStats()
     log: logging.Logger = getattr(ctx, "log", None) or logging.getLogger("leadgen")
     leads_by_id = leads_by_id or {}
     want_ai = _as_bool(_setting(client, "ai", False))
-    max_cost = _as_float(_setting(client, "max_cost_usd", DEFAULT_MAX_COST_USD), DEFAULT_MAX_COST_USD)
+    raw_cap = _setting(client, "max_cost_usd", DEFAULT_MAX_COST_USD)
+    max_cost = _finite(raw_cap)
+    if max_cost is None:     # NaN / infinity / text: never "no cap" - the default cap applies
+        max_cost = DEFAULT_MAX_COST_USD
+        if want_ai:
+            stats.notes.append(f"opening_line.max_cost_usd {raw_cap!r} is not a usable amount - the default AI "
+                               f"spending limit of ${DEFAULT_MAX_COST_USD:.2f} was used")
     max_tokens = max(50, int(_as_float(_setting(client, "max_tokens", DEFAULT_MAX_TOKENS), DEFAULT_MAX_TOKENS)))
+
+    for row in rows:         # where each row's job is (the Location column is company-level)
+        lead = leads_by_id.get(str(row.get("_lead_id") or ""))
+        if lead is not None and getattr(lead, "company", None) is not None and JOB_LOCATION_KEY not in row:
+            top = _top_signal(lead)
+            row[JOB_LOCATION_KEY] = str(getattr(top, "location", "") or "") if top is not None else ""
 
     llm = _resolve_llm(ctx, max_cost, stats, log) if (want_ai and rows) else None
     writer_cfg = getattr(getattr(ctx, "playbook", None), "writer", None) or {}
