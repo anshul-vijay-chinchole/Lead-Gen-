@@ -53,6 +53,8 @@ class LLMClient(Adapter):
 
     name = "llm"
     default_model = ""
+    # {"input_tokens": int, "output_tokens": int} of the last successful call (None if unknown)
+    last_usage: Optional[Dict[str, int]] = None
 
     @property
     def model(self) -> str:

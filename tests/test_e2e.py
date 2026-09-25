@@ -312,7 +312,8 @@ def test_every_playbook_path_resolves_from_repo_root():
 
 def test_sample_data_is_fictional():
     """Sample files only use made-up '-demo' domains (never real companies or people)."""
-    for name in ("demo_signals.csv", "demo_contacts.csv", "demo_replies.csv"):
+    for name in ("demo_signals.csv", "demo_contacts.csv", "demo_replies.csv",
+                 "demo_jobs.csv", "demo_delivery_contacts.csv"):
         text = (REPO / "examples" / "data" / name).read_text(encoding="utf-8")
         domains = set(re.findall(r"@([a-z0-9.-]+\.[a-z]{2,})", text)) | \
             set(re.findall(r"https?://([a-z0-9.-]+)", text))

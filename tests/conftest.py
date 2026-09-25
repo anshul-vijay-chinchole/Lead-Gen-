@@ -54,6 +54,7 @@ def today() -> date:
 from pathlib import Path as _Path  # noqa: E402
 
 REPO_ROOT = _Path(__file__).resolve().parent.parent
-SHIPPED_PLAYBOOKS = [REPO_ROOT / "playbooks" / n for n in ("demo-offline.yaml", "my-agency.yaml")] + [
+SHIPPED_PLAYBOOKS = [REPO_ROOT / "playbooks" / n for n in (
+    "demo-offline.yaml", "my-agency.yaml", "recruitment-delivery.yaml", "demo-delivery.yaml")] + [
     REPO_ROOT / "playbooks" / "templates" / f"{n}.yaml"
     for n in ("agency-outreach", "generic", "local-business", "recruitment", "saas-funding")]

@@ -667,14 +667,14 @@ def _locate(name_or_path: str, clients_dir: str) -> Path:
             return c
     known = list_clients(clients_dir)
     stem = p.stem if is_yaml else p.name
-    msg = f"client '{raw}' not found: there is no {candidates[0]}"
+    msg = f"client '{raw}' not found: there is no {candidates[0]}."
     guess = _suggest(stem, known)
     if guess:
-        msg += f". Did you mean '{guess}'?"
+        msg += f" Did you mean '{guess}'?"
     if known:
         msg += f" Clients in {folder}/: {', '.join(known)}."
     else:
-        msg += f". There are no client files in {folder}/ yet."
+        msg += f" There are no client files in {folder}/ yet."
     if CLIENT_NAME_RE.match(stem):
         msg += f" Create it with: leadgen clients new {stem}"
     raise ClientError(msg)

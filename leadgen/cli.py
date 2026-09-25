@@ -1835,7 +1835,7 @@ def cmd_adapters(args: argparse.Namespace) -> int:
                 cls = registry.resolve(kind, name)
                 env = getattr(cls, "env_key", "") or ""
                 where = "offline" if getattr(cls, "offline", False) else "network"
-                if where == "network" and (kind, name) in registry.PAID:
+                if where == "network" and registry.is_paid(kind, name):
                     where = "network (paid)"
                 doc = (cls.__doc__ or "").strip().splitlines()[0] if cls.__doc__ else ""
             except Exception as e:  # noqa: BLE001 - a broken optional adapter must not hide the rest

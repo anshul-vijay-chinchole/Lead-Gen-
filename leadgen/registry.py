@@ -65,6 +65,7 @@ _REGISTRY: Dict[str, Dict[str, str]] = {
 
 
 # Adapter types whose requests cost money / credits ("paid lookups", see usage.py).
+# Plugins add theirs with register(..., paid=True).
 PAID = frozenset({
     ("source", "apollo"), ("source", "theirstack"), ("source", "apify"), ("source", "linkedin_jobs"),
     ("finder", "apollo"), ("finder", "hunter"),
@@ -81,6 +82,11 @@ RISKS = {
     ("source", "linkedin_jobs"): "use at own risk: scrapes LinkedIn via Apify (against LinkedIn's terms)",
 }
 _RISKY_APIFY_PRESETS = {"linkedin_jobs": "LinkedIn", "indeed_jobs": "Indeed"}
+_PLUGIN_PAID: set = set()
+
+
+def is_paid(kind: str, name: str) -> bool:
+    return (kind, name) in PAID or (kind, name) in _PLUGIN_PAID
 
 
 def risk_note(kind: str, name: str, config: Any = None) -> str:
@@ -104,10 +110,16 @@ class UnknownAdapterError(KeyError):
     pass
 
 
-def register(kind: str, name: str, target: str) -> None:
-    """Register (or override) an adapter: register('source', 'mine', 'pkg.mod:Cls')."""
+def register(kind: str, name: str, target: str, paid: bool = False) -> None:
+    """Register (or override) an adapter: register('source', 'mine', 'pkg.mod:Cls').
+
+    ``paid=True`` makes its requests count as paid lookups (capped by --budget)."""
     if kind not in KINDS:
         raise ValueError(f"unknown adapter kind {kind!r}; expected one of {KINDS}")
+    if paid:
+        _PLUGIN_PAID.add((kind, name))
+    else:
+        _PLUGIN_PAID.discard((kind, name))
     _REGISTRY[kind][name] = target
 
 
@@ -133,5 +145,5 @@ def create(kind: str, config: Dict[str, Any], ctx: Any) -> Any:
     cls = resolve(kind, name)
     adapter = cls(dict(config), ctx)
     adapter.adapter_kind, adapter.type_name = kind, name
-    adapter.paid = (kind, name) in PAID
+    adapter.paid = is_paid(kind, name)
     return adapter
