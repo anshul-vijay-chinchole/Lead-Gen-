@@ -1,0 +1,140 @@
+# =============================================================================
+#  CLIENT FILE - one per client of the weekly "Hiring Signal Report"
+# =============================================================================
+#  What this file is: the settings for ONE recruitment / staffing agency that
+#  buys leads from you. Each week `leadgen deliver` finds companies that are
+#  hiring the roles this client fills, removes everything the client already
+#  received, and writes a lead file (CSV / Excel / one-page HTML summary).
+#  We only DELIVER lead files - nothing is ever emailed to anyone.
+#
+#  Make a new client:      leadgen clients new <name>     (copies this file)
+#  Preview (no charges):   leadgen deliver --client <name> --dry-run
+#  Deliver for real:       leadgen deliver --client <name>
+#
+#  The file name (without .yaml) is the client's short name, e.g.
+#  clients/northwind-staffing.yaml -> "northwind-staffing". Use lower-case
+#  letters, digits, "-" and "_".
+#
+#  Every setting below is optional: the value shown is the default. Lines
+#  starting with "#" are comments and are ignored. Lists look like
+#  [first, second]; an empty list is [].
+# =============================================================================
+
+# --- Who the client is ------------------------------------------------------------
+
+# The name printed on the report. Empty = the file name.
+display_name: ""                  # e.g. "Client Staffing Ltd"
+
+# The base playbook: where companies and jobs come from, how people and emails
+# are found and checked, and how leads are scored. The settings in THIS file
+# (roles, locations, ...) are applied on top of it. A relative path is looked
+# up from the folder you run leadgen in, then next to this file.
+playbook: playbooks/recruitment-delivery.yaml
+
+# The client's contact person. For your own records only - never used to send anything.
+contact:
+  name: ""                        # e.g. "Jordan Smith"
+  email: ""                       # e.g. "jordan@client-staffing.example"
+
+# --- What the client wants -----------------------------------------------------------
+
+# FILL THIS IN: the job titles this client fills. A job only counts when its
+# title mentions one of them. Empty = use the list in the base playbook.
+roles: []                         # e.g. [accountant, controller, financial analyst]
+
+# Jobs whose title mentions one of these are ignored (added to the base playbook's list).
+exclude_roles: []                 # e.g. [intern, trainee]
+
+# The decision-makers to name in the file, best first (e.g. the person who owns
+# the hire). Empty = use the base playbook's list.
+buyer_titles: []                  # e.g. [CFO, VP Finance, Controller, Head of Talent]
+
+# Where the companies must be. Empty = anywhere.
+locations: []                     # e.g. [Texas, Oklahoma] or [United Kingdom]
+
+# Places to leave out.
+exclude_locations: []
+
+# Company size (number of employees). Leave a side empty for "no limit".
+company_size:
+  min:                            # e.g. 20
+  max:                            # e.g. 1000
+
+# Only companies in these industries. Empty = any industry.
+industries: []
+
+# The client's own do-not-list, e.g. their existing clients.
+exclusions:
+  companies: []                   # company names, written normally, e.g. ["Existing Client Inc"]
+  domains: []                     # website domains, e.g. [existing-client.example]
+  keywords: []                    # companies mentioning these are left out, e.g. [staffing, recruiting]
+
+# --- How much, how fresh ------------------------------------------------------------------
+
+# How many leads per delivery. The file holds at most this many rows.
+leads_per_week: 25
+
+# Only jobs posted in the last N days.
+freshness_days: 7
+
+# Jobs without a posting date: true = keep them, false = leave them out.
+allow_undated: false
+
+# true = leave out jobs that look re-posted (old ads put up again).
+drop_reposts: true
+
+# Can something be delivered again? Empty = never deliver the same company /
+# job / person twice. A number N = it may be delivered again after N days.
+redelivery_days:
+
+# What must never repeat between deliveries: company, job, contact.
+# Remove "company" to allow NEW jobs at companies the client already received.
+dedupe: [company, job, contact]
+
+# Which urgency levels may be delivered: hot, normal (and skip = low scores).
+tiers: [hot, normal]
+
+# --- Emails ------------------------------------------------------------------------------------
+
+emails:
+  # true  = also deliver emails that are not confirmed (labelled "risky" or
+  #         "guessed-unverified" in the file, so the client knows).
+  # false = only deliver "verified" emails; the others show "not found".
+  include_unverified: true
+
+# --- Optional "Suggested opening line" column -------------------------------------------
+
+opening_line:
+  enabled: false                  # true = add the column
+  ai: false                       # false = free template line; true = written by AI (costs money,
+                                  #   uses the AI provider/model set in the base playbook's writer section)
+  max_cost_usd: 0.50              # most AI spend per delivery (US dollars); after that, template lines
+
+# --- Cost control ----------------------------------------------------------------------------
+
+budget:
+  # Most paid API requests per delivery run. 0 = no extra cap here (a cap in the
+  # base playbook still applies). `leadgen deliver --budget N` overrides both.
+  max_paid_lookups: 0
+
+# --- Output ------------------------------------------------------------------------------------
+
+delivery:
+  formats: [csv, xlsx, html]      # any of: csv, xlsx (Excel), html (one-page summary)
+  # Where the files go. {client} = the client's short name, {date} = the delivery date (YYYY-MM-DD).
+  folder: deliveries/{client}/{date}
+  # Optional: also put the leads in a Google Sheet (needs the gspread package and
+  # a Google service account). Leave spreadsheet_id empty to skip.
+  google_sheet:
+    spreadsheet_id: ""            # the long ID from the sheet's web address
+    worksheet: "{date}"           # tab name; {date} and {client} are filled in
+    service_account_file: ""      # key file; empty = $GOOGLE_APPLICATION_CREDENTIALS
+
+# Optional: change the report's look for this client. Allowed keys: brand_name,
+# brand_color (like "#1f4e79"), sender_name, sender_email, website, logo_url, footer.
+# Empty = the base playbook's "delivery" section.
+branding: {}
+
+# Advanced: change any base playbook section for this client only, written like
+# in a playbook, e.g.  overrides: {scoring: {tiers: {hot: 75, normal: 55}}}
+overrides: {}
