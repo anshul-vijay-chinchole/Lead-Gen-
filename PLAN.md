@@ -8,8 +8,9 @@ for the roles that agency fills. Each row has the job link and date, the person 
 likely to own the hire, their email with an **honest label**, and a 0-100 score (hot
 leads first). A client never receives the same company, job or person twice.
 
-**What we don't do.** We don't email, call or message anyone, for ourselves or for our
-clients. The agency does its own outreach. The engine enforces this: `mode: delivery`
+**What we don't do.** We don't email, call or message anyone on our clients' behalf -
+the agency does its own outreach. (For finding *our own* clients we may use outbound
+mode with `my-agency.yaml`; that is our own prospecting, never a client service.) The engine enforces this: `mode: delivery`
 (the default) stops after scoring and writing files.
 
 **Why an agency pays for it.**

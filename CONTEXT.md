@@ -3847,8 +3847,8 @@ means verified on branch `claude/modest-hopper-lue9ct`.
 > "I help specialised recruitment agencies find new clients faster. Every week I send you a
 > short list of companies in your niche and region that posted a job in the last 7 days:
 > the role, the link, the date, and where I can find them, the person who owns the hire, with
-> every email honestly labelled. Your existing clients, competitors' ads and anything I've
-> sent before are taken out, so every row is new. One placement a year can pay for it more
+> every email honestly labelled. Your existing clients and anything I've sent before are
+> taken out, and other agencies' ads are filtered out as far as possible, so every row is new. One placement a year can pay for it more
 > than once. Can I send you this week's list for your niche, free?"
 
 **One-line version:** "Every Monday: the companies in your niche that posted a job this week,
@@ -4117,7 +4117,7 @@ market research**. Now / Next / Later line up roughly with Stage 0 / Stages 0-1 
 |---|---|---|---|---|
 | **Now** | Business | Pick one niche and one region. Set Adzuna `countries` and `queries` in `playbooks/recruitment-delivery.yaml`, or a copy of it. | The search words decide what is fetched (see 6.7). | A real rehearsal returns relevant jobs. |
 | **Now** | Technical | First live run: free Adzuna key, then `doctor`, dry run, rehearsal on a database copy, spot-check (6.6). | Nothing has been tested live. | Adzuna rows look right; any mapping bug is fixed with a new `FakeHttp` test. |
-| **Now** | Business | Make a sample report for prospects: a real delivery for a made-up client in their niche (`leadgen clients new sample-finance`), or `leadgen demo`. | You need something to show. | One HTML plus Excel file you are happy to send. |
+| **Now** | Business | Make a sample report for prospects: a real delivery for a made-up client in their niche (`leadgen clients new sample-finance`), or `leadgen demo -p PLAYBOOK` after a `leadgen run`. | You need something to show. | One HTML plus Excel file you are happy to send. |
 | **Now** | Business | Rewrite `my-agency.yaml`'s `offer` and `writer.extra_instructions` to pitch the report. Decide whether to prospect with outbound mode (needs paid keys; always use `--budget`) or by hand. | It still pitches the old service. | The offer text in a dry run's `opportunities.csv` (template writer) reads correctly. |
 | **Now** | Business | Read the data-provider terms (reselling) and the privacy rules for your market (`PLAN.md` §6). | Legal risk. Not legal advice. | You know what you may sell. |
 | **Now** | Technical | Set up a backup routine for `data/*.db`. | Losing it means re-delivering old leads. | A dated copy exists after every delivery. |

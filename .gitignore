@@ -12,3 +12,11 @@ data/*.db
 
 # client lead files (contain personal data) - never commit
 deliveries/
+
+# real client files hold client contact details - only the template and the demo are tracked
+clients/*.yaml
+!clients/_template.yaml
+!clients/demo-client.yaml
+# your own imports and logs
+data/imports/
+logs/

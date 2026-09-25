@@ -264,7 +264,7 @@ writer:
   # Whenever a provider is set (even with type: template), the same model also
   # sorts replies when replies.classifier is ai or auto.
   provider: ""          # e.g. anthropic (key: ANTHROPIC_API_KEY) or openai (OPENAI_API_KEY)
-  # Empty = the provider's default: claude-sonnet-5 (anthropic) or gpt-5-mini
+  # Empty = the provider's default: claude-opus-5 (anthropic) or gpt-5-mini
   # (openai). Other Claude models: claude-opus-5-5 (best, costs more) or
   # claude-haiku-4-5 (cheapest). openai_compatible needs a model name.
   model: ""
