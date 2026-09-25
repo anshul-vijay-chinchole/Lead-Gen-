@@ -30,6 +30,17 @@ do not accept an assistant prefill, so ``json_mode`` appends an instruction to
 the system prompt asking for a single JSON object and nothing else;
 ``complete_json`` (base class) then tolerates stray fences / prose.
 
+Token usage: after every answer the API sent back (also a truncated or refused
+one - those tokens are billed too) the client sets ``last_usage =
+{"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}`` and
+adds the tokens to the run's meter via ``ctx.usage.record_llm(kind, type, model,
+input, output)``. Prompt-cache tokens (``cache_creation_input_tokens`` /
+``cache_read_input_tokens``, only non-zero when caching is switched on through
+``extra_body``) are billed input as well, so they are added to ``input_tokens``
+(estimates err on the high side). A response without ``usage`` leaves
+``last_usage`` as None and records nothing; it is reset to None at the start of
+every call.
+
 Credential: ``ANTHROPIC_API_KEY`` (config ``api_key`` / ``api_key_env`` override),
 resolved lazily at the first request; surrounding whitespace is stripped and a key
 with embedded whitespace / control characters raises ``MissingCredentialError``.
@@ -62,7 +73,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..utils import get_path
 from .base import LLMClient, LLMError
 from .openai import (LLMConfigError, LLMTruncatedError, clean_api_key, clean_headers, effective_temperature,
-                     post_json, timeout_from)
+                     post_json, record_usage, timeout_from, token_count)
 
 DEFAULT_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -82,12 +93,31 @@ def messages_url(base_url: str) -> str:
     return url + "/v1/messages"
 
 
+def anthropic_usage(data: Any) -> Optional[Dict[str, int]]:
+    """``{"input_tokens", "output_tokens"}`` from a Messages API ``usage`` object, or None.
+
+    Cache writes / reads are billed input too and are added to ``input_tokens``.
+    """
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    inp, out = token_count(usage.get("input_tokens")), token_count(usage.get("output_tokens"))
+    if inp is None and out is None:
+        return None
+    cached = sum(token_count(usage.get(k)) or 0
+                 for k in ("cache_creation_input_tokens", "cache_read_input_tokens"))
+    return {"input_tokens": (inp or 0) + cached, "output_tokens": out or 0}
+
+
 class AnthropicClient(LLMClient):
     """Claude via the Messages API (see module docstring)."""
 
     name = "anthropic"
     env_key = "ANTHROPIC_API_KEY"
     default_model = "claude-opus-5"
+    # Tokens of the latest answer: {"input_tokens": int, "output_tokens": int}, or None
+    # (no call yet, the call failed, or the API reported no usage).
+    last_usage: Optional[Dict[str, int]] = None
 
     @property
     def endpoint(self) -> str:
@@ -130,9 +160,12 @@ class AnthropicClient(LLMClient):
 
     def complete(self, system: str, user: str, *, json_mode: bool = False,
                  max_tokens: int = 1500, temperature: Optional[float] = None) -> str:
+        self.last_usage = None  # never show the previous call's usage if this one fails
         url, headers, body = self.build_request(system, user, json_mode=json_mode,
                                                 max_tokens=max_tokens, temperature=temperature)
         data = post_json(self, url, headers, body, timeout_from(self.config), self.name)
+        # record before parsing: truncated / refused answers are billed too
+        record_usage(self, anthropic_usage(data))
         return self.parse_response(data)
 
     def parse_response(self, data: Any) -> str:
@@ -162,4 +195,4 @@ class AnthropicClient(LLMClient):
         return text
 
 
-__all__ = ["AnthropicClient", "messages_url"]
+__all__ = ["AnthropicClient", "anthropic_usage", "messages_url"]

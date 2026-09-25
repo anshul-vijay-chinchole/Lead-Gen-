@@ -470,3 +470,195 @@ def test_openai_type_with_custom_base_url_never_sends_openai_key(make_ctx):
     # the default / official host keeps working without extra config
     client3, _ = openai_client(make_ctx, {"base_url": "https://api.openai.com/v1/"})
     assert client3.build_request("s", "u")[1]["Authorization"] == "Bearer sk-test"
+
+
+# --- token usage: last_usage + the run's usage meter ---------------------------------------------
+
+def _llm_row(ctx, type_):
+    rows = [r for r in ctx.usage.rows() if r["kind"] == "llm" and r["type"] == type_]
+    return rows[0] if rows else None
+
+
+def test_openai_usage_is_captured_and_metered(make_ctx):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"})
+    client = registry.create("llm", {"type": "openai", "model": "gpt-5-mini"}, ctx)
+    assert client.last_usage is None
+    ctx.http.add("POST", OPENAI_URL, json=openai_payload("Hi"))
+    assert client.complete("s", "u") == "Hi"
+    assert client.last_usage == {"input_tokens": 812, "output_tokens": 403}
+    row = _llm_row(ctx, "openai")
+    assert row["input_tokens"] == 812 and row["output_tokens"] == 403 and row["paid"]
+    expected = ctx.usage.llm_cost("gpt-5-mini", 812, 403)
+    assert row["estimated_cost_usd"] == pytest.approx(round(expected, 4))
+    client.complete("s", "u")  # a second call adds up
+    assert _llm_row(ctx, "openai")["input_tokens"] == 1624
+    assert client.last_usage == {"input_tokens": 812, "output_tokens": 403}  # per call, not cumulative
+
+
+def test_openai_usage_priced_with_configured_model_price(make_ctx):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"},
+                   usage={"llm_price_per_mtok": {"gpt-5-mini": {"input": 1.0, "output": 2.0}}})
+    client = registry.create("llm", {"type": "openai", "model": "gpt-5-mini"}, ctx)
+    ctx.http.add("POST", OPENAI_URL, json=openai_payload("Hi", usage={"prompt_tokens": 1_000_000,
+                                                                       "completion_tokens": 500_000}))
+    client.complete("s", "u")
+    assert ctx.usage.estimated_cost == pytest.approx(2.0)
+
+
+def test_openai_compatible_usage_recorded_under_its_type(make_ctx):
+    ctx = make_ctx(env={"OPENROUTER_API_KEY": "or-key"})
+    client = registry.create("llm", {"type": "openai_compatible", "model": "meta/llama-4",
+                                     "base_url": "https://openrouter.ai/api/v1",
+                                     "api_key_env": "OPENROUTER_API_KEY"}, ctx)
+    # some compatible servers name the fields input_tokens / output_tokens
+    ctx.http.add("POST", "https://openrouter.ai/api/v1/chat/completions",
+                 json=openai_payload("ok", usage={"input_tokens": 50, "output_tokens": 7}))
+    client.complete("s", "u")
+    assert client.last_usage == {"input_tokens": 50, "output_tokens": 7}
+    assert _llm_row(ctx, "openai_compatible")["output_tokens"] == 7
+    assert _llm_row(ctx, "openai") is None
+
+
+@pytest.mark.parametrize("usage", [None, {}, {"total_tokens": 12}, "n/a", {"prompt_tokens": None}])
+def test_openai_missing_usage_leaves_last_usage_none(make_ctx, usage):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"})
+    client = registry.create("llm", {"type": "openai"}, ctx)
+    payload = openai_payload("ok")
+    if usage is None:
+        del payload["usage"]
+    else:
+        payload["usage"] = usage
+    ctx.http.add("POST", OPENAI_URL, json=payload)
+    assert client.complete("s", "u") == "ok"
+    assert client.last_usage is None
+    row = _llm_row(ctx, "openai")
+    assert row["calls"] == 1 and row["input_tokens"] == 0 and row["output_tokens"] == 0
+
+
+def test_openai_partial_usage_counts_missing_side_as_zero(make_ctx):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"})
+    client = registry.create("llm", {"type": "openai"}, ctx)
+    ctx.http.add("POST", OPENAI_URL, json=openai_payload("ok", usage={"prompt_tokens": "120"}))
+    client.complete("s", "u")
+    assert client.last_usage == {"input_tokens": 120, "output_tokens": 0}
+
+
+def test_openai_failed_call_resets_last_usage(make_ctx):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"})
+    client = registry.create("llm", {"type": "openai"}, ctx)
+    ctx.http.add("POST", OPENAI_URL, json=openai_payload("ok"), times=1)
+    ctx.http.add("POST", OPENAI_URL, status=500, json={"error": {"message": "boom"}})
+    client.complete("s", "u")
+    assert client.last_usage is not None
+    with pytest.raises(HttpError):
+        client.complete("s", "u")
+    assert client.last_usage is None  # never the previous call's numbers
+    assert _llm_row(ctx, "openai")["input_tokens"] == 812  # only the successful call was metered
+
+
+def test_openai_truncated_answer_is_still_metered(make_ctx):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"})
+    client = registry.create("llm", {"type": "openai"}, ctx)
+    ctx.http.add("POST", OPENAI_URL, json=openai_payload("", finish_reason="length",
+                                                         usage={"prompt_tokens": 90, "completion_tokens": 1500}))
+    with pytest.raises(LLMTruncatedError):
+        client.complete("s", "u", max_tokens=1500)
+    assert client.last_usage == {"input_tokens": 90, "output_tokens": 1500}  # billed tokens
+    assert _llm_row(ctx, "openai")["output_tokens"] == 1500
+
+
+def test_openai_temperature_retry_meters_only_the_answer(make_ctx):
+    ctx = make_ctx(env={"OPENAI_API_KEY": "sk-test"})
+    client = registry.create("llm", {"type": "openai", "temperature": 0.7}, ctx)
+    ctx.http.add("POST", OPENAI_URL, status=400, times=1,
+                 json={"error": {"message": "Unsupported value: 'temperature'", "param": "temperature"}})
+    ctx.http.add("POST", OPENAI_URL, json=openai_payload("ok"))
+    client.complete("s", "u")
+    assert _llm_row(ctx, "openai")["input_tokens"] == 812 and len(ctx.http.calls) == 2
+
+
+def test_anthropic_usage_is_captured_and_metered(make_ctx):
+    ctx = make_ctx(env={"ANTHROPIC_API_KEY": "sk-ant-test"})
+    client = registry.create("llm", {"type": "anthropic", "model": "claude-sonnet-5"}, ctx)
+    assert client.last_usage is None
+    ctx.http.add("POST", ANTHROPIC_URL, json=anthropic_payload("Hi"))
+    assert client.complete("s", "u") == "Hi"
+    assert client.last_usage == {"input_tokens": 812, "output_tokens": 403}
+    row = _llm_row(ctx, "anthropic")
+    assert row["input_tokens"] == 812 and row["output_tokens"] == 403
+    # claude-sonnet-5 list price: $2 in / $10 out per million tokens
+    assert row["estimated_cost_usd"] == pytest.approx(round((812 * 2 + 403 * 10) / 1e6, 4))
+    assert row["calls"] == 1 and ctx.usage.paid_lookups == 1  # the request itself is a paid lookup
+
+
+def test_anthropic_cache_tokens_count_as_input(make_ctx):
+    ctx = make_ctx(env={"ANTHROPIC_API_KEY": "k"})
+    client = registry.create("llm", {"type": "anthropic"}, ctx)
+    ctx.http.add("POST", ANTHROPIC_URL, json=anthropic_payload("ok", usage={
+        "input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 1000}))
+    client.complete("s", "u")
+    assert client.last_usage == {"input_tokens": 1110, "output_tokens": 5}
+
+
+@pytest.mark.parametrize("usage", [None, {}, [], {"service_tier": "standard"}])
+def test_anthropic_missing_usage_leaves_last_usage_none(make_ctx, usage):
+    ctx = make_ctx(env={"ANTHROPIC_API_KEY": "k"})
+    client = registry.create("llm", {"type": "anthropic"}, ctx)
+    payload = anthropic_payload("ok")
+    if usage is None:
+        del payload["usage"]
+    else:
+        payload["usage"] = usage
+    ctx.http.add("POST", ANTHROPIC_URL, json=payload)
+    assert client.complete("s", "u") == "ok"
+    assert client.last_usage is None
+    row = _llm_row(ctx, "anthropic")
+    assert row["calls"] == 1 and row["input_tokens"] == 0 and row["output_tokens"] == 0
+
+
+def test_anthropic_truncated_and_failed_calls(make_ctx):
+    ctx = make_ctx(env={"ANTHROPIC_API_KEY": "k"})
+    client = registry.create("llm", {"type": "anthropic"}, ctx)
+    ctx.http.add("POST", ANTHROPIC_URL, times=1, json=anthropic_payload(
+        "cut", stop_reason="max_tokens", usage={"input_tokens": 40, "output_tokens": 300}))
+    ctx.http.add("POST", ANTHROPIC_URL, status=529, json={"type": "error", "error": {"type": "overloaded_error"}})
+    with pytest.raises(LLMTruncatedError):
+        client.complete("s", "u", max_tokens=300)
+    assert client.last_usage == {"input_tokens": 40, "output_tokens": 300}
+    with pytest.raises(HttpError):
+        client.complete("s", "u")
+    assert client.last_usage is None
+    assert _llm_row(ctx, "anthropic")["output_tokens"] == 300
+
+
+def test_hand_built_clients_record_under_llm_and_their_name(make_ctx):
+    client, ctx = anthropic_client(make_ctx)  # built without the registry: no kind / type set
+    ctx.http.add("POST", ANTHROPIC_URL, json=anthropic_payload("ok"))
+    client.complete("s", "u")
+    assert _llm_row(ctx, "anthropic")["input_tokens"] == 812
+    oa, ctx2 = openai_client(make_ctx)
+    ctx2.http.add("POST", OPENAI_URL, json=openai_payload("ok"))
+    oa.complete("s", "u")
+    assert _llm_row(ctx2, "openai")["output_tokens"] == 403
+
+
+def test_usage_capture_without_a_meter(make_ctx):
+    client, ctx = anthropic_client(make_ctx)
+    ctx.usage = None  # e.g. a bare context in a script
+    ctx.http.add("POST", ANTHROPIC_URL, json=anthropic_payload("ok"))
+    assert client.complete("s", "u") == "ok"
+    assert client.last_usage == {"input_tokens": 812, "output_tokens": 403}
+    oa, ctx2 = openai_client(make_ctx)
+    ctx2.usage = None
+    ctx2.http.add("POST", OPENAI_URL, json=openai_payload("ok"))
+    oa.complete("s", "u")
+    assert oa.last_usage == {"input_tokens": 812, "output_tokens": 403}
+
+
+def test_last_usage_is_per_instance(make_ctx):
+    a, ctx = anthropic_client(make_ctx)
+    b = AnthropicClient({"type": "anthropic"}, ctx)
+    ctx.http.add("POST", ANTHROPIC_URL, json=anthropic_payload("ok"))
+    a.complete("s", "u")
+    assert a.last_usage is not None and b.last_usage is None and AnthropicClient.last_usage is None

@@ -12,6 +12,10 @@ Response (documented shape)::
 unknown). A non-empty ``error`` field (invalid API key, insufficient credits,
 ...) raises ``VerifierError``; so does a response without ``result``.
 
+Every response's ``credits`` field (credits left on the account) is passed to
+the run's usage meter (``ctx.usage.note_credits``), also when the response
+carries an error, so the run summary shows "N credits left".
+
 Credential: ``MILLIONVERIFIER_API_KEY`` (or config ``api_key`` / ``api_key_env``),
 sent as the ``api`` query parameter.
 
@@ -25,7 +29,7 @@ extra_disposable_domains, precheck_disposable
 """
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 from ..models import EmailStatus
 from .base import VerificationResult, VerifierError
@@ -58,6 +62,7 @@ class MillionVerifier(ApiVerifier):
         data = self.http.get_json(url, params=params, timeout=smtp_timeout + 10)
         if not isinstance(data, dict):
             raise VerifierError(f"{self.name}: unexpected response for {email}: {data!r:.200}")
+        self._note_credits(data.get("credits"))
         error = data.get("error")
         if error not in (None, "", False):
             raise VerifierError(f"{self.name}: {error}")
@@ -75,6 +80,13 @@ class MillionVerifier(ApiVerifier):
             "free email provider" if data.get("free") is True else "",
             f"did you mean {did_you_mean}" if did_you_mean else "",
         )
+
+    def _note_credits(self, credits: Any) -> None:
+        """Pass the account's remaining credits (when the response has them) to the usage meter."""
+        meter = getattr(self.ctx, "usage", None)
+        if meter is None or credits is None or credits == "" or isinstance(credits, bool):
+            return
+        meter.note_credits(self.adapter_kind or "verifier", self.type_name or self.name, credits)
 
 
 __all__ = ["MillionVerifier", "RESULT_MAP"]

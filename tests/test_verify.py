@@ -467,3 +467,62 @@ def test_verifier_config_api_key_env_override(make_ctx):
     ctx.http.add("GET", HUNTER_URL, json=hunter_payload())
     HunterVerifier({"api_key_env": "MY_HUNTER"}, ctx).verify("jane@acme.com")
     assert ctx.http.calls[0]["params"]["api_key"] == "other-key"
+
+
+# --- MillionVerifier: remaining credits reach the usage meter ---------------------------------------
+
+def _credits(ctx, type_="millionverifier"):
+    rows = [r for r in ctx.usage.rows() if r["kind"] == "verifier" and r["type"] == type_]
+    return rows[0]["credits_remaining"] if rows else None
+
+
+def test_millionverifier_reports_credits_to_usage_meter(make_ctx):
+    ctx = make_ctx(env={"MILLIONVERIFIER_API_KEY": "k"})
+    v = registry.create("verifier", {"type": "millionverifier"}, ctx)
+    ctx.http.add("GET", MV_URL, json=mv_payload("ok", credits=9950), times=1)
+    ctx.http.add("GET", MV_URL, json=mv_payload("ok", credits="9949"))
+    v.verify("jane@acme.com")
+    assert _credits(ctx) == 9950
+    v.verify("john@acme.com")
+    assert _credits(ctx) == 9949  # the latest answer wins (string numbers are accepted)
+    assert any("9949 credits left" in line for line in ctx.usage.summary_lines())
+    assert ctx.usage.paid_lookups == 2
+
+
+def test_millionverifier_credits_recorded_even_when_the_response_is_an_error(make_ctx):
+    ctx = make_ctx(env={"MILLIONVERIFIER_API_KEY": "k"})
+    v = registry.create("verifier", {"type": "millionverifier"}, ctx)
+    ctx.http.add("GET", MV_URL, json={"email": "jane@acme.com", "result": "", "error": "Insufficient credits",
+                                      "credits": 0})
+    with pytest.raises(VerifierError, match="Insufficient credits"):
+        v.verify("jane@acme.com")
+    assert _credits(ctx) == 0
+
+
+@pytest.mark.parametrize("credits", [None, "", "n/a", True])
+def test_millionverifier_missing_or_bad_credits_are_ignored(make_ctx, credits):
+    ctx = make_ctx(env={"MILLIONVERIFIER_API_KEY": "k"})
+    v = registry.create("verifier", {"type": "millionverifier"}, ctx)
+    payload = mv_payload("ok", credits=credits)
+    if credits is None:
+        del payload["credits"]
+    ctx.http.add("GET", MV_URL, json=payload)
+    assert v.verify("jane@acme.com").status == EmailStatus.VALID
+    assert _credits(ctx) is None
+
+
+def test_millionverifier_hand_built_and_without_meter(make_ctx):
+    ctx = make_ctx(env={"MILLIONVERIFIER_API_KEY": "k"})
+    ctx.http.add("GET", MV_URL, json=mv_payload("ok", credits=42))
+    MillionVerifier({}, ctx).verify("jane@acme.com")  # no registry: kind/type fall back
+    assert _credits(ctx) == 42
+    ctx2 = make_ctx(env={"MILLIONVERIFIER_API_KEY": "k"})
+    ctx2.usage = None
+    ctx2.http.add("GET", MV_URL, json=mv_payload("ok", credits=42))
+    assert MillionVerifier({}, ctx2).verify("jane@acme.com").status == EmailStatus.VALID
+
+
+def test_millionverifier_dry_run_records_nothing(make_ctx):
+    ctx = make_ctx(env={"MILLIONVERIFIER_API_KEY": "k"}, dry_run=True)
+    registry.create("verifier", {"type": "millionverifier"}, ctx).verify("jane@acme.com")
+    assert ctx.http.calls == [] and _credits(ctx) is None

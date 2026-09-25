@@ -28,6 +28,18 @@ gpt-5-mini count their hidden reasoning tokens against the budget, so a small
 ``max_tokens`` can come back empty *and* truncated). HTTP failures surface as
 ``leadgen.http.HttpError`` (the shared client already retried 429/5xx).
 
+Token usage
+-----------
+After every answer the server sent back (also a truncated or refused one - those
+tokens are billed too) the client sets ``last_usage = {"input_tokens":
+usage.prompt_tokens, "output_tokens": usage.completion_tokens}`` (``input_tokens`` /
+``output_tokens`` are accepted from compatible servers that use those names) and
+adds the tokens to the run's meter via ``ctx.usage.record_llm(kind, type, model,
+input, output)``, which prices them for the cost estimate. A response without
+``usage`` leaves ``last_usage`` as None and records nothing; ``last_usage`` is
+reset to None at the start of every call, so a failed call never shows the
+previous call's numbers.
+
 Credentials
 -----------
 ``type: openai`` reads ``OPENAI_API_KEY`` (config ``api_key`` / ``api_key_env``
@@ -171,6 +183,56 @@ def clean_headers(extra: Any) -> Dict[str, str]:
     return {str(k).strip(): str(v).strip() for k, v in extra.items()}
 
 
+def token_count(value: Any) -> Optional[int]:
+    """A token count from a JSON value (int, float or digit string), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _first_count(usage: Dict[str, Any], *keys: str) -> Optional[int]:
+    """The first of ``keys`` in ``usage`` that holds a token count."""
+    for key in keys:
+        n = token_count(usage.get(key))
+        if n is not None:
+            return n
+    return None
+
+
+def openai_usage(data: Any) -> Optional[Dict[str, int]]:
+    """``{"input_tokens", "output_tokens"}`` from a Chat Completions ``usage`` object, or None."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    inp = _first_count(usage, "prompt_tokens", "input_tokens")
+    out = _first_count(usage, "completion_tokens", "output_tokens")
+    if inp is None and out is None:
+        return None
+    return {"input_tokens": inp or 0, "output_tokens": out or 0}
+
+
+def record_usage(client: LLMClient, usage: Optional[Dict[str, int]]) -> None:
+    """Remember one call's token usage as ``client.last_usage`` and add it to ``ctx.usage``.
+
+    ``usage`` is ``{"input_tokens": int, "output_tokens": int}`` or None (the provider
+    sent no usage: nothing is recorded). The meter prices the tokens for the run's
+    cost estimate; the usage row is ``(kind, type)`` = the client's registry kind and
+    type (``llm`` / ``openai`` ...), falling back to ``llm`` / the class name.
+    """
+    client.last_usage = usage
+    if usage is None:
+        return
+    meter = getattr(client.ctx, "usage", None)
+    record = getattr(meter, "record_llm", None)
+    if callable(record):
+        record(client.adapter_kind or "llm", client.type_name or client.name, client.model,
+               usage["input_tokens"], usage["output_tokens"])
+
+
 def _join_text(content: Any) -> str:
     """Message content as text: a string, or a list of ``{"type": "text", "text": ...}`` parts."""
     if isinstance(content, str):
@@ -194,6 +256,9 @@ class OpenAIClient(LLMClient):
     name = "openai"
     env_key = "OPENAI_API_KEY"
     default_model = "gpt-5-mini"
+    # Tokens of the latest answer: {"input_tokens": int, "output_tokens": int}, or None
+    # (no call yet, the call failed, or the server reported no usage).
+    last_usage: Optional[Dict[str, int]] = None
 
     # --- configuration -------------------------------------------------------------------
     @property
@@ -295,9 +360,12 @@ class OpenAIClient(LLMClient):
 
     def complete(self, system: str, user: str, *, json_mode: bool = False,
                  max_tokens: int = 1500, temperature: Optional[float] = None) -> str:
+        self.last_usage = None  # never show the previous call's usage if this one fails
         url, headers, body = self.build_request(system, user, json_mode=json_mode,
                                                 max_tokens=max_tokens, temperature=temperature)
         data = post_json(self, url, headers, body, timeout_from(self.config), self.kind)
+        # record before parsing: truncated / refused answers are billed too
+        record_usage(self, openai_usage(data))
         return self.parse_response(data)
 
     # --- response ------------------------------------------------------------------------
@@ -328,4 +396,5 @@ class OpenAIClient(LLMClient):
 
 
 __all__ = ["OpenAIClient", "LLMConfigError", "LLMTruncatedError", "clean_api_key", "clean_headers",
-           "effective_temperature", "post_json", "timeout_from"]
+           "effective_temperature", "openai_usage", "post_json", "record_usage", "timeout_from",
+           "token_count"]
